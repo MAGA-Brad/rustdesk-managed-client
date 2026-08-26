@@ -35,6 +35,11 @@ class OnlineStatusWidget extends StatefulWidget {
 class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
   final _svcStopped = Get.find<RxBool>(tag: 'stop-service');
   final _svcIsUsingPublicServer = true.obs;
+  final _directoryState = ''.obs;
+  final _directoryStatusText = ''.obs;
+  final _reenrollmentRequested = false.obs;
+  final _reenrollmentAuthorized = false.obs;
+  final _reenrollmentRequestBusy = false.obs;
   Timer? _updateTimer;
 
   double get em => 14.0;
@@ -117,18 +122,57 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
               width: 8,
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(4),
-                color: _svcStopped.value ||
-                        stateGlobal.svcStatus.value == SvcStatus.connecting
-                    ? kColorWarn
-                    : (stateGlobal.svcStatus.value == SvcStatus.ready
-                        ? Color.fromARGB(255, 50, 190, 166)
-                        : Color.fromARGB(255, 224, 79, 95)),
+                color: _directoryStatusText.value.isNotEmpty
+                    ? (_directoryState.value == 'ready'
+                        ? const Color.fromARGB(255, 50, 190, 166)
+                        : (_directoryState.value == 'denied' ||
+                                _directoryState.value == 'blocked' ||
+                                _directoryState.value == 'revoked')
+                            ? const Color.fromARGB(255, 224, 79, 95)
+                            : kColorWarn)
+                    : (_svcStopped.value ||
+                            stateGlobal.svcStatus.value == SvcStatus.connecting
+                        ? kColorWarn
+                        : (stateGlobal.svcStatus.value == SvcStatus.ready
+                            ? const Color.fromARGB(255, 50, 190, 166)
+                            : const Color.fromARGB(255, 224, 79, 95))),
               ),
             ).marginSymmetric(horizontal: em),
             Container(
               width: isIncomingOnly ? 226 : null,
               child: _buildConnStatusMsg(),
             ),
+            if (!isIncomingOnly &&
+                ['denied', 'blocked', 'revoked'].contains(_directoryState.value))
+              Obx(() => TextButton.icon(
+                    onPressed: _reenrollmentRequested.value ||
+                            _reenrollmentAuthorized.value ||
+                            _reenrollmentRequestBusy.value
+                        ? null
+                        : () async {
+                            _reenrollmentRequestBusy.value = true;
+                            try {
+                              await bind.mainSetOption(
+                                key: 'managed-request-reenrollment',
+                                value: 'Y',
+                              );
+                            } finally {
+                              await Future<void>.delayed(
+                                  const Duration(milliseconds: 750));
+                              _reenrollmentRequestBusy.value = false;
+                              updateStatus();
+                            }
+                          },
+                    icon: const Icon(Icons.admin_panel_settings_outlined,
+                        size: 16),
+                    label: Text(
+                      _reenrollmentAuthorized.value
+                          ? 'Authorized'
+                          : _reenrollmentRequested.value
+                              ? 'Requested'
+                              : 'Request re-enrollment',
+                    ),
+                  )).marginOnly(left: 8),
             // stop
             if (!isIncomingOnly) startServiceWidget(),
             // ready && public
@@ -155,14 +199,23 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
 
   _buildConnStatusMsg() {
     widget.onSvcStatusChanged?.call();
+
+    final friendlyName =
+        bind.mainGetOptionSync(key: 'preset-device-name').trim();
+    final readyText = friendlyName.isEmpty
+        ? translate('Ready')
+        : 'Ready \u2014 $friendlyName';
+
     return Text(
-      _svcStopped.value
-          ? translate("Service is not running")
-          : stateGlobal.svcStatus.value == SvcStatus.connecting
-              ? translate("connecting_status")
-              : stateGlobal.svcStatus.value == SvcStatus.notReady
-                  ? translate("not_ready_status")
-                  : translate('Ready'),
+      _directoryStatusText.value.isNotEmpty
+          ? _directoryStatusText.value
+          : _svcStopped.value
+              ? translate("Service is not running")
+              : stateGlobal.svcStatus.value == SvcStatus.connecting
+                  ? translate("connecting_status")
+                  : stateGlobal.svcStatus.value == SvcStatus.notReady
+                      ? translate("not_ready_status")
+                      : readyText,
       style: TextStyle(fontSize: em),
     );
   }
@@ -181,6 +234,53 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
       stateGlobal.svcStatus.value = SvcStatus.notReady;
     }
     _svcIsUsingPublicServer.value = await bind.mainIsUsingPublicServer();
+
+    final managedDirectory = bind.mainGetManagedDirectoryStatus();
+
+    if (managedDirectory.isEmpty) {
+      _directoryState.value = '';
+      _directoryStatusText.value = '';
+      _reenrollmentRequested.value = false;
+      _reenrollmentAuthorized.value = false;
+    } else {
+      try {
+        final directory = jsonDecode(managedDirectory) as Map<String, dynamic>;
+
+        _directoryState.value = directory['state'] as String? ?? 'unavailable';
+        _reenrollmentRequested.value =
+            directory['reenrollment_requested'] as bool? ?? false;
+        _reenrollmentAuthorized.value =
+            directory['reenrollment_authorized'] as bool? ?? false;
+
+        final directoryText = directory['text'] as String? ?? '';
+
+        if (directoryText.isNotEmpty) {
+          _directoryStatusText.value = directoryText;
+        } else {
+          final friendlyName = bind
+              .mainGetOptionSync(
+                key: 'preset-device-name',
+              )
+              .trim();
+
+          _directoryStatusText.value =
+              'Directory unavailable \u2014 $friendlyName';
+        }
+      } catch (_) {
+        _directoryState.value = 'unavailable';
+        _reenrollmentRequested.value = false;
+        _reenrollmentAuthorized.value = false;
+
+        final friendlyName = bind
+            .mainGetOptionSync(
+              key: 'preset-device-name',
+            )
+            .trim();
+
+        _directoryStatusText.value =
+            'Directory unavailable \u2014 $friendlyName';
+      }
+    }
     try {
       stateGlobal.videoConnCount.value = status['video_conn_count'] as int;
     } catch (_) {}

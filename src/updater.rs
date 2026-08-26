@@ -173,6 +173,23 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 fn check_update(manually: bool) -> ResultType<()> {
+    #[cfg(target_os = "windows")]
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        if let Some(candidate) =
+            crate::hbbs_http::directory_enrollment::managed_update_check_and_download()?
+        {
+            log::info!(
+                "Verified managed update build {} version {}",
+                candidate.build_number,
+                candidate.version
+            );
+            if has_no_active_conns() {
+                update_new_version(false, &candidate.version, &candidate.file_path);
+            }
+        }
+        return Ok(());
+    }
+
     // On macOS, auto-update is handled by check_update_as_root() in the service process.
     // The shared check_update() path is only used for manual update checks from the GUI.
     #[cfg(target_os = "macos")]

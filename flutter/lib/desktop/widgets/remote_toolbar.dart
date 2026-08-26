@@ -712,11 +712,17 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
 
       final toolbar = Align(
         alignment: _alignmentForEdge(edge, _fraction.value),
-        child: KeyedSubtree(
-          key: _toolbarKey,
-          child: collapse.isFalse
-              ? _buildToolbar(context, edge, isHorizontal)
-              : _buildDraggableCollapse(context, edge, isHorizontal),
+        child: MouseRegion(
+          // The toolbar overlays the remote image. Make only the actual local
+          // control footprint opaque to mouse tracking so the image below gets
+          // PointerExit and releases remote input before toolbar/menu clicks.
+          opaque: true,
+          child: KeyedSubtree(
+            key: _toolbarKey,
+            child: collapse.isFalse
+                ? _buildToolbar(context, edge, isHorizontal)
+                : _buildDraggableCollapse(context, edge, isHorizontal),
+          ),
         ),
       );
 

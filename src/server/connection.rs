@@ -93,13 +93,42 @@ lazy_static::lazy_static! {
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+const SWITCH_SIDES_UUID_TTL: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 lazy_static::lazy_static! {
     static ref SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
-    static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
+    static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid, bool)>>> = Default::default();
 }
 
 #[cfg(target_os = "windows")]
 const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
+
+#[cfg(target_os = "windows")]
+const MANAGED_LOCAL_INPUT_PRIORITY_DEFAULT_MS: u64 = 2000;
+
+// User-configurable via Settings > Security ("Local Input Priority"). Values
+// outside 1000-5000ms fall back to the default rather than being rejected,
+// since a stray/corrupt config value should degrade safely, not disable the
+// local-user-always-wins guarantee entirely.
+#[cfg(target_os = "windows")]
+fn managed_local_input_priority_ms() -> u64 {
+    Config::get_option(keys::OPTION_MANAGED_LOCAL_INPUT_PRIORITY_MS)
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| (1000..=5000).contains(ms))
+        .unwrap_or(MANAGED_LOCAL_INPUT_PRIORITY_DEFAULT_MS)
+}
+
+#[inline]
+#[cfg(target_os = "windows")]
+fn managed_local_input_has_priority() -> bool {
+    option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+        && crate::platform::windows::local_mouse_has_priority(
+            managed_local_input_priority_ms(),
+        )
+}
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -363,6 +392,9 @@ pub struct Connection {
     server_audit_file: String,
     controlled_context: Option<ControlledContext>,
     lr: LoginRequest,
+    // Authentication retries may update credentials, but not the requested session scope.
+    // A digest, so no peer-controlled strings are retained.
+    login_scope: Option<[u8; 32]>,
     peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
@@ -413,6 +445,8 @@ pub struct Connection {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     terminal_user_token: Option<TerminalUserToken>,
     terminal_generic_service: Option<Box<GenericService>>,
+    managed_session_telemetry:
+        Option<crate::hbbs_http::directory_enrollment::ManagedSessionTelemetry>,
 }
 
 impl ConnInner {
@@ -531,13 +565,13 @@ impl Connection {
             authorized: false,
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
-            audio: Self::permission(keys::OPTION_ENABLE_AUDIO, &control_permissions),
+            audio: false,
             // to-do: make sure is the option correct here
             file: Self::permission(keys::OPTION_ENABLE_FILE_TRANSFER, &control_permissions),
             restart: Self::permission(keys::OPTION_ENABLE_REMOTE_RESTART, &control_permissions),
-            recording: Self::permission(keys::OPTION_ENABLE_RECORD_SESSION, &control_permissions),
-            block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions),
-            privacy_mode: Self::permission(keys::OPTION_ENABLE_PRIVACY_MODE, &control_permissions),
+            recording: false,
+            block_input: false,
+            privacy_mode: false,
             control_permissions,
             last_test_delay: None,
             network_delay: 0,
@@ -547,7 +581,7 @@ impl Connection {
             follow_remote_window: false,
             multi_ui_session: false,
             ip: "".to_owned(),
-            disable_audio: false,
+            disable_audio: true,
             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             enable_file_transfer: false,
             disable_clipboard: false,
@@ -560,6 +594,7 @@ impl Connection {
             server_audit_file: "".to_owned(),
             controlled_context,
             lr: Default::default(),
+            login_scope: None,
             peer_argb: 0u32,
             session_last_recv_time: None,
             chat_unanswered: false,
@@ -601,6 +636,7 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal_user_token: None,
             terminal_generic_service: None,
+            managed_session_telemetry: None,
             conn_audit_primary_auth: ConnAuditPrimaryAuth::None,
             conn_audit_two_factor: ConnAuditTwoFactor::None,
         };
@@ -688,6 +724,14 @@ impl Connection {
                         ipc::Data::Authorize => {
                             conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);
                             conn.require_2fa.take();
+                            // Managed attended approval means view-only. Local control must be
+                            // granted separately from the receiving computer after connection.
+                            conn.keyboard = false;
+                            conn.send_permission(Permission::Keyboard, false).await;
+                            conn.send_to_cm(ipc::Data::SwitchPermission {
+                                name: "keyboard".to_owned(),
+                                enabled: false,
+                            });
                             if !conn.send_logon_response_and_keep_alive().await {
                                 break;
                             }
@@ -1067,11 +1111,8 @@ impl Connection {
                     match data {
                         #[cfg(all(target_os = "windows", feature = "flutter"))]
                         ipc::Data::PrinterData(data) => {
-                            if Self::permission(keys::OPTION_ENABLE_REMOTE_PRINTER, &conn.control_permissions) {
-                                conn.send_printer_request(data).await;
-                            } else {
-                                conn.send_remote_printing_disallowed().await;
-                            }
+                            let _ = data;
+                            conn.send_remote_printing_disallowed().await;
                         }
                         _ => {}
                     }
@@ -1445,9 +1486,6 @@ impl Connection {
 
     async fn on_open(&mut self, addr: SocketAddr) -> bool {
         log::debug!("#{} Connection opened from {}.", self.inner.id, addr);
-        if !self.check_whitelist(&addr).await {
-            return false;
-        }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if crate::is_server() && Config::get_option("allow-only-conn-window-open") == "Y" {
             if !crate::check_process("", !crate::platform::is_root()) {
@@ -1784,7 +1822,34 @@ impl Connection {
         if self.authorized {
             return true;
         }
-        if self.require_2fa.is_some() && !self.is_recent_session(true) && !self.from_switch {
+
+        let managed_password_auth = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && matches!(
+                self.conn_audit_primary_auth,
+                ConnAuditPrimaryAuth::TemporaryPassword | ConnAuditPrimaryAuth::PermanentPassword
+            );
+
+        // Managed unattended/password access always requires an actually configured
+        // TOTP factor. A password by itself must never authorize the connection.
+        if managed_password_auth
+            && self.require_2fa.is_none()
+            && self.conn_audit_two_factor != ConnAuditTwoFactor::Totp
+        {
+            log::warn!("Managed password authentication rejected because 2FA is not configured");
+            self.send_login_error("Two-factor authentication is required for unattended access")
+                .await;
+            return false;
+        }
+
+        // Do not reuse a recent-session 2FA result for managed password authentication.
+        // Each new password-authenticated connection must complete TOTP itself.
+        let recent_2fa = if managed_password_auth {
+            false
+        } else {
+            self.is_recent_session(true)
+        };
+        let switch_bypasses_2fa = self.from_switch && !managed_password_auth;
+        if self.require_2fa.is_some() && !recent_2fa && !switch_bypasses_2fa {
             self.require_2fa.as_ref().map(|totp| {
                 let bot = crate::auth_2fa::TelegramBot::get();
                 let bot = match bot {
@@ -1846,6 +1911,25 @@ impl Connection {
             self.tx_from_authed.clone(),
             self.lr.clone(),
         ));
+        let managed_session_type = match auth_conn_type {
+            AuthConnType::Remote => Some("remote_desktop"),
+            AuthConnType::FileTransfer => Some("file_transfer"),
+            _ => None,
+        };
+        if let Some(managed_session_type) = managed_session_type {
+            let managed_session_id = format!(
+                "{}:{}:{}",
+                self.lr.my_id,
+                self.lr.session_id,
+                self.inner.id()
+            );
+            self.managed_session_telemetry =
+                crate::hbbs_http::directory_enrollment::start_managed_session_telemetry(
+                    managed_session_id,
+                    managed_session_type,
+                    Some(self.lr.my_id.clone()),
+                );
+        }
         self.session_last_recv_time = SESSIONS
             .lock()
             .unwrap()
@@ -2105,6 +2189,8 @@ impl Connection {
         msg_out.set_login_response(res);
         self.send(msg_out).await;
         self.update_scoped_login_options().await;
+        #[cfg(target_os = "windows")]
+        self.enforce_managed_mutual_cursor_visibility();
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
             self.keyboard = false;
             let dir = if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
@@ -2150,6 +2236,25 @@ impl Connection {
             && self.port_forward_socket.is_none()
             && !self.view_camera
             && !self.terminal
+    }
+
+    #[cfg(target_os = "windows")]
+    fn enforce_managed_mutual_cursor_visibility(&mut self) {
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() || !self.is_remote() {
+            return;
+        }
+
+        // Apply this only after authentication. This preserves the intentional
+        // password-entry black-screen privacy behavior while ensuring that, once
+        // authorized, both parties can see the other party's cursor even during
+        // the attended view-only phase.
+        self.show_remote_cursor = true;
+        self.show_my_cursor = true;
+        if crate::platform::windows::is_win_10_or_greater() {
+            crate::whiteboard::register_whiteboard(crate::whiteboard::get_key_cursor(
+                self.inner.id,
+            ));
+        }
     }
 
     fn try_sub_monitor_services(&mut self) {
@@ -2565,6 +2670,21 @@ impl Connection {
         control_permissions: &Option<ControlPermissions>,
     ) -> bool {
         use hbb_common::rendezvous_proto::control_permissions::Permission;
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && matches!(
+                enable_prefix_option,
+                keys::OPTION_ENABLE_REMOTE_PRINTER
+                    | keys::OPTION_ENABLE_AUDIO
+                    | keys::OPTION_ENABLE_CAMERA
+                    | keys::OPTION_ENABLE_TERMINAL
+                    | keys::OPTION_ENABLE_TUNNEL
+                    | keys::OPTION_ENABLE_RECORD_SESSION
+                    | keys::OPTION_ENABLE_BLOCK_INPUT
+                    | keys::OPTION_ENABLE_PRIVACY_MODE
+            )
+        {
+            return false;
+        }
         if let Some(control_permissions) = control_permissions {
             let permission = match enable_prefix_option {
                 keys::OPTION_ENABLE_KEYBOARD => Some(Permission::keyboard),
@@ -2607,6 +2727,9 @@ impl Connection {
 
     #[inline]
     fn enable_trusted_devices() -> bool {
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+            return false;
+        }
         config::option2bool(
             keys::OPTION_ENABLE_TRUSTED_DEVICES,
             &Config::get_option(keys::OPTION_ENABLE_TRUSTED_DEVICES),
@@ -2619,6 +2742,90 @@ impl Connection {
         self.terminal = false;
         self.port_forward_address.clear();
         self.terminal_persistent = false;
+    }
+
+    // Approval and whitelist decisions must stay bound to the same controller identity and
+    // session scope across authentication retries.
+    fn login_scope_digest(lr: &LoginRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        // Length-prefixed so adjacent fields cannot alias.
+        let mut push = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        push(lr.my_id.as_bytes());
+        // Payloads are destructured exhaustively: a new field fails to compile until it is
+        // either latched here or deliberately ignored.
+        match lr.union.as_ref() {
+            Some(login_request::Union::FileTransfer(ft)) => {
+                let FileTransfer {
+                    dir,
+                    show_hidden,
+                    special_fields: _,
+                } = ft;
+                push(b"file_transfer");
+                push(dir.as_bytes());
+                push(&[*show_hidden as u8]);
+            }
+            Some(login_request::Union::ViewCamera(vc)) => {
+                let ViewCamera { special_fields: _ } = vc;
+                push(b"view_camera");
+            }
+            Some(login_request::Union::Terminal(t)) => {
+                let Terminal {
+                    service_id,
+                    special_fields: _,
+                } = t;
+                push(b"terminal");
+                push(service_id.as_bytes());
+            }
+            Some(login_request::Union::PortForward(pf)) => {
+                let PortForward {
+                    host,
+                    port,
+                    special_fields: _,
+                } = pf;
+                push(b"port_forward");
+                push(host.as_bytes());
+                push(&port.to_le_bytes());
+            }
+            // Variants this build does not know execute as remote, so they latch as remote.
+            None | Some(_) => push(b"remote"),
+        }
+        hasher.finalize().into()
+    }
+
+    // Logging only; security decisions compare digests.
+    fn login_scope_kind(lr: &LoginRequest) -> &'static str {
+        match lr.union.as_ref() {
+            Some(login_request::Union::FileTransfer(_)) => "file_transfer",
+            Some(login_request::Union::ViewCamera(_)) => "view_camera",
+            Some(login_request::Union::Terminal(_)) => "terminal",
+            Some(login_request::Union::PortForward(_)) => "port_forward",
+            _ => "remote",
+        }
+    }
+
+    async fn check_login_scope(&mut self, lr: &LoginRequest) -> bool {
+        let requested = Self::login_scope_digest(lr);
+        match self.login_scope {
+            Some(initial) if initial != requested => {
+                // self.lr still holds the first accepted request, whose scope is the latched one.
+                log::warn!(
+                    "Rejected login scope change: conn_id={}, initial={}, requested={}",
+                    self.inner.id(),
+                    Self::login_scope_kind(&self.lr),
+                    Self::login_scope_kind(lr),
+                );
+                self.send_login_error("Connection not allowed").await;
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.login_scope = Some(requested);
+                true
+            }
+        }
     }
 
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
@@ -2698,15 +2905,15 @@ impl Connection {
         }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
+            if !self.check_login_scope(&lr).await {
+                return false;
+            }
             self.awaiting_2fa = false;
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
             }
             self.reset_session_scope_for_login();
-            if !self.check_id_whitelist().await {
-                return false;
-            }
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
                     if !Self::permission(
@@ -2721,43 +2928,19 @@ impl Connection {
                     self.file_transfer = Some((ft.dir, ft.show_hidden));
                 }
                 Some(login_request::Union::ViewCamera(_vc)) => {
-                    if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
-                        self.send_login_error("No permission of viewing camera")
-                            .await;
-                        sleep(1.).await;
-                        return false;
-                    }
-                    self.view_camera = true;
+                    self.send_login_error("Camera sessions are disabled by managed policy")
+                        .await;
+                    return false;
                 }
-                Some(login_request::Union::Terminal(terminal)) => {
-                    if !Self::permission(keys::OPTION_ENABLE_TERMINAL, &self.control_permissions) {
-                        self.send_login_error("No permission of terminal").await;
-                        sleep(1.).await;
-                        return false;
-                    }
-                    #[cfg(target_os = "windows")]
-                    if !lr.os_login.username.is_empty() && !crate::platform::is_installed() {
-                        self.send_login_error("Supported only in the installed version.")
-                            .await;
-                        sleep(1.).await;
-                        return false;
-                    }
-
-                    self.terminal = true;
-                    if let Some(o) = self.options_in_login.as_ref() {
-                        self.terminal_persistent =
-                            o.terminal_persistent.enum_value() == Ok(BoolOption::Yes);
-                    }
-                    self.terminal_service_id = terminal.service_id;
+                Some(login_request::Union::Terminal(_terminal)) => {
+                    self.send_login_error("Terminal sessions are disabled by managed policy")
+                        .await;
+                    return false;
                 }
-                Some(login_request::Union::PortForward(mut pf)) => {
-                    if !Self::permission(keys::OPTION_ENABLE_TUNNEL, &self.control_permissions) {
-                        self.send_login_error("No permission of IP tunneling").await;
-                        sleep(1.).await;
-                        return false;
-                    }
-                    let (addr, _is_rdp) = Self::normalize_port_forward_target(&mut pf);
-                    self.port_forward_address = addr;
+                Some(login_request::Union::PortForward(_pf)) => {
+                    self.send_login_error("Tunneling is disabled by managed policy")
+                        .await;
+                    return false;
                 }
                 _ => {
                     if !self.check_privacy_mode_on().await {
@@ -2766,8 +2949,7 @@ impl Connection {
                 }
             }
 
-            if !crate::common::is_direct_ip_access(&lr.username) && lr.username != Config::get_id()
-            {
+            if lr.username != Config::get_id() {
                 self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
                     .await;
                 return false;
@@ -2994,7 +3176,7 @@ impl Connection {
                 SWITCH_SIDES_UUID
                     .lock()
                     .unwrap()
-                    .retain(|_, v| v.0.elapsed() < Duration::from_secs(10));
+                    .retain(|_, v| v.0.elapsed() < SWITCH_SIDES_UUID_TTL);
                 let uuid_old = SWITCH_SIDES_UUID.lock().unwrap().remove(&lr.my_id);
                 if let Ok(uuid) = uuid::Uuid::from_slice(_s.uuid.to_vec().as_ref()) {
                     if let Some((_instant, uuid_old)) = uuid_old {
@@ -3010,9 +3192,6 @@ impl Connection {
                             self.handle_login_request_without_validation(&lr).await;
                             // Switching sides authorizes without a password, so it must not bypass
                             // the whitelist, which can be a locked policy pushed by the server.
-                            if !self.check_id_whitelist().await {
-                                return false;
-                            }
                             self.from_switch = true;
                             self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::SwitchSides);
                             if !self.send_logon_response_and_keep_alive().await {
@@ -3037,6 +3216,11 @@ impl Connection {
                 #[allow(unused_mut)]
                 Some(message::Union::MouseEvent(mut me)) => {
                     if self.is_authed_view_camera_conn() {
+                        return true;
+                    }
+                    #[cfg(target_os = "windows")]
+                    if managed_local_input_has_priority() {
+                        self.update_auto_disconnect_timer();
                         return true;
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -3076,6 +3260,11 @@ impl Connection {
                 }
                 Some(message::Union::PointerDeviceEvent(pde)) => {
                     if self.is_authed_view_camera_conn() {
+                        return true;
+                    }
+                    #[cfg(target_os = "windows")]
+                    if managed_local_input_has_priority() {
+                        self.update_auto_disconnect_timer();
                         return true;
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -3173,6 +3362,16 @@ impl Connection {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 Some(message::Union::KeyEvent(me)) => {
                     if self.is_authed_view_camera_conn() {
+                        return true;
+                    }
+                    #[cfg(target_os = "windows")]
+                    if managed_local_input_has_priority() {
+                        // Local physical mouse movement temporarily owns the complete remote
+                        // input channel. The input-simulation process independently blocks
+                        // queued key events and releases tracked remote keys for this same
+                        // 250 ms quiet window, so every remote KeyEvent is suppressed here.
+                        self.pressed_modifiers.clear();
+                        self.update_auto_disconnect_timer();
                         return true;
                     }
                     if self.peer_keyboard_enabled() {
@@ -3343,13 +3542,6 @@ impl Connection {
                 }
                 Some(message::Union::FileAction(fa)) => {
                     let mut handle_fa = self.file_transfer.is_some();
-                    if !handle_fa {
-                        if let Some(file_action::Union::Send(s)) = fa.union.as_ref() {
-                            if JobType::from_proto(s.file_type) == JobType::Printer {
-                                handle_fa = true;
-                            }
-                        }
-                    }
                     if handle_fa {
                         if self.delayed_read_dir.is_some() {
                             if let Some(file_action::Union::ReadDir(rd)) = fa.union {
@@ -3461,31 +3653,8 @@ impl Connection {
                                         }
                                     }
                                     JobType::Printer => {
-                                        if let Some((_, _, data)) = self
-                                            .printer_data
-                                            .iter()
-                                            .position(|(_, p, _)| *p == path)
-                                            .map(|index| self.printer_data.remove(index))
-                                        {
-                                            let data_source = fs::DataSource::MemoryCursor(
-                                                std::io::Cursor::new(data),
-                                            );
-                                            // Printer jobs don't need file count limit check
-                                            self.create_and_start_read_job(
-                                                id,
-                                                job_type,
-                                                data_source,
-                                                s.file_num,
-                                                s.include_hidden,
-                                                true, // always enable overwrite detection for printer
-                                                path,
-                                                false, // no file count limit for printer
-                                            )
-                                            .await;
-                                        } else {
-                                            // Ignore this message if the printer data is not found
-                                            return true;
-                                        }
+                                        log::debug!("Remote printing job ignored by managed policy");
+                                        return true;
                                     }
                                 }
                                 self.file_transferred = true;
@@ -3651,10 +3820,8 @@ impl Connection {
                             self.toggle_virtual_display(t).await;
                         }
                     }
-                    Some(misc::Union::TogglePrivacyMode(t)) => {
-                        if !self.view_camera {
-                            self.toggle_privacy_mode(t).await;
-                        }
+                    Some(misc::Union::TogglePrivacyMode(_t)) => {
+                        log::debug!("Privacy mode request ignored by managed policy");
                     }
                     Some(misc::Union::ChatMessage(c)) => {
                         self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
@@ -3734,17 +3901,18 @@ impl Connection {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::SwitchSidesRequest(s)) => {
                         if let Ok(uuid) = uuid::Uuid::from_slice(&s.uuid.to_vec()[..]) {
-                            crate::server::insert_pending_switch_sides_uuid(
+                            if crate::server::insert_pending_switch_sides_uuid(
                                 self.lr.my_id.clone(),
                                 uuid.clone(),
-                            );
-                            crate::run_me(vec![
-                                "--connect",
-                                &self.lr.my_id,
-                                "--switch_uuid",
-                                uuid.to_string().as_ref(),
-                            ])
-                            .ok();
+                            ) {
+                                crate::run_me(vec![
+                                    "--connect",
+                                    &self.lr.my_id,
+                                    "--switch_uuid",
+                                    uuid.to_string().as_ref(),
+                                ])
+                                .ok();
+                            }
                             self.on_close("switch sides", false).await;
                             return false;
                         }
@@ -3772,10 +3940,9 @@ impl Connection {
                         .lock()
                         .unwrap()
                         .user_auto_adjust_fps(self.inner.id(), fps),
-                    Some(misc::Union::ClientRecordStatus(status)) => video_service::VIDEO_QOS
-                        .lock()
-                        .unwrap()
-                        .user_record(self.inner.id(), status),
+                    Some(misc::Union::ClientRecordStatus(_status)) => {
+                        log::debug!("Session recording status ignored by managed policy");
+                    },
                     #[cfg(windows)]
                     Some(misc::Union::SelectedSid(sid)) => {
                         if let Some(current_process_sid) =
@@ -3829,12 +3996,7 @@ impl Connection {
                 }
                 Some(message::Union::VoiceCallRequest(request)) => {
                     if request.is_connect {
-                        self.voice_call_request_timestamp = Some(
-                            NonZeroI64::new(request.req_timestamp)
-                                .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
-                        );
-                        // Notify the connection manager.
-                        self.send_to_cm(Data::VoiceCallIncoming);
+                        self.send(new_voice_call_response(request.req_timestamp, false)).await;
                     } else {
                         self.close_voice_call().await;
                     }
@@ -3853,11 +4015,8 @@ impl Connection {
                         self.refresh_video_display(Some(request.display as usize));
                     }
                 }
-                Some(message::Union::TerminalAction(action)) => {
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    allow_err!(self.handle_terminal_action(action).await);
-                    #[cfg(any(target_os = "android", target_os = "ios"))]
-                    log::warn!("Terminal action received but not supported on this platform");
+                Some(message::Union::TerminalAction(_action)) => {
+                    log::debug!("Terminal action ignored by managed policy");
                 }
                 _ => {}
             }
@@ -5037,6 +5196,9 @@ impl Connection {
             return;
         }
         self.closed = true;
+        // Dropping the guard signals the telemetry worker to send an ended
+        // heartbeat. Connection::drop is the fallback for abrupt teardown.
+        self.managed_session_telemetry.take();
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -6048,23 +6210,40 @@ pub fn insert_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn insert_pending_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
+pub fn insert_pending_switch_sides_uuid(id: String, uuid: uuid::Uuid) -> bool {
     let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    uuids.insert(id, (tokio::time::Instant::now(), uuid));
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    if uuids.get(&id).map(|(_, stored_uuid, _)| stored_uuid) == Some(&uuid) {
+        return false;
+    }
+    uuids.insert(id, (tokio::time::Instant::now(), uuid, false));
+    true
 }
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn remove_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
+pub fn has_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
     let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    if uuids.get(id).map(|(_, stored_uuid)| stored_uuid == uuid) == Some(true) {
-        uuids.remove(id);
-        true
-    } else {
-        false
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    uuids
+        .get(id)
+        .map(|(_, stored_uuid, claimed)| stored_uuid == uuid && !*claimed)
+        == Some(true)
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn claim_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
+    let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    // Keep claimed entries until expiry so replaying a request cannot launch another connection.
+    if let Some((_, stored_uuid, claimed)) = uuids.get_mut(id) {
+        if stored_uuid == uuid && !*claimed {
+            *claimed = true;
+            return true;
+        }
     }
+    false
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -7002,6 +7181,79 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 mod test {
     #[allow(unused)]
     use super::*;
+
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn test_pending_switch_sides_uuid_is_claimed_once() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let uuid = uuid::Uuid::new_v4();
+        let other_uuid = uuid::Uuid::new_v4();
+        assert!(insert_pending_switch_sides_uuid(id.clone(), uuid.clone()));
+
+        assert!(!insert_pending_switch_sides_uuid(id.clone(), uuid.clone()));
+        assert!(has_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!has_pending_switch_sides_uuid(&id, &other_uuid));
+        assert!(!claim_pending_switch_sides_uuid("other-peer", &uuid));
+        assert!(!claim_pending_switch_sides_uuid(&id, &other_uuid));
+        assert!(claim_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!has_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!claim_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!insert_pending_switch_sides_uuid(id, uuid));
+    }
+
+    #[test]
+    fn login_scope_latches_session_scope_across_login_retries() {
+        let port_forward = |host: &str| {
+            let mut lr = LoginRequest::new();
+            lr.my_id = "peer".to_owned();
+            lr.set_port_forward(PortForward {
+                host: host.to_owned(),
+                port: 3389,
+                ..Default::default()
+            });
+            lr
+        };
+        let first = port_forward("localhost");
+        let scope = |lr: &LoginRequest| Connection::login_scope_digest(lr);
+
+        // A retry may carry new credentials, profile data, options, and unknown fields.
+        let mut retry = port_forward("localhost");
+        retry.password = "secret".into();
+        retry.hwid = "hwid".into();
+        retry.os_login = Some(OSLogin {
+            username: "admin".to_owned(),
+            ..Default::default()
+        })
+        .into();
+        retry.my_name = "New Display Name".to_owned();
+        retry.avatar = "data:image/png;base64,AAAA".to_owned();
+        retry
+            .special_fields
+            .mut_unknown_fields()
+            .add_varint(9999, 1);
+        assert_eq!(scope(&first), scope(&retry));
+
+        // It may not change the controller identity, move the target, or switch type.
+        let mut rotated_id = first.clone();
+        rotated_id.my_id = "rotated-id".to_owned();
+        assert_ne!(scope(&first), scope(&rotated_id));
+        assert_ne!(scope(&first), scope(&port_forward("10.0.0.5")));
+        let mut moved_port = port_forward("localhost");
+        moved_port.mut_port_forward().port = 22;
+        assert_ne!(scope(&first), scope(&moved_port));
+        let terminal = |service_id: &str| {
+            let mut lr = LoginRequest::new();
+            lr.my_id = "peer".to_owned();
+            lr.set_terminal(Terminal {
+                service_id: service_id.to_owned(),
+                ..Default::default()
+            });
+            lr
+        };
+        assert_ne!(scope(&first), scope(&terminal("")));
+        assert_ne!(scope(&terminal("a")), scope(&terminal("b")));
+    }
 
     #[test]
     fn test_wildcard_match() {

@@ -24,27 +24,22 @@ class PeerTabModel with ChangeNotifier {
   int _currentTab = 0; // index in tabNames
   static const int maxTabCount = 5;
   static const List<String> tabNames = [
-    'Recent sessions',
+    'History',
     'Favorites',
-    'Discovered',
+    'Directory',
     'Address book',
     'Accessible devices',
   ];
   static const List<IconData> icons = [
     Icons.access_time_filled,
     Icons.star,
-    Icons.explore,
+    Icons.menu_book_rounded,
     IconFont.addressBook,
     IconFont.deviceGroupFill,
   ];
-  List<bool> isEnabled = List.from([
-    true,
-    true,
-    !isWeb && bind.mainGetLocalOption(key: "disable-discovery-panel") != "Y",
-    !(bind.isDisableAb() || bind.isDisableAccount()),
-    !(bind.isDisableGroupPanel() || bind.isDisableAccount()),
-  ]);
-  final List<bool> _isVisible = List.filled(maxTabCount, true, growable: false);
+  List<bool> isEnabled = List.from([true, true, true, false, false]);
+  final List<bool> _isVisible =
+      List<bool>.from([true, true, true, false, false], growable: false);
   List<bool> get isVisibleEnabled => () {
         final list = _isVisible.toList();
         for (int i = 0; i < maxTabCount; i++) {
@@ -68,9 +63,12 @@ class PeerTabModel with ChangeNotifier {
   String get lastId => _lastId;
 
   PeerTabModel(this.parent) {
+    final managedDirectory = bind.mainGetManagedDirectoryStatus().isNotEmpty;
     // visible
     try {
-      final option = bind.getLocalFlutterOption(k: kOptionPeerTabVisible);
+      final option = managedDirectory
+          ? ''
+          : bind.getLocalFlutterOption(k: kOptionPeerTabVisible);
       if (option.isNotEmpty) {
         List<dynamic> decodeList = jsonDecode(option);
         if (decodeList.length == _isVisible.length) {
@@ -86,7 +84,9 @@ class PeerTabModel with ChangeNotifier {
     }
     // order
     try {
-      final option = bind.getLocalFlutterOption(k: kOptionPeerTabOrder);
+      final option = managedDirectory
+          ? ''
+          : bind.getLocalFlutterOption(k: kOptionPeerTabOrder);
       if (option.isNotEmpty) {
         List<dynamic> decodeList = jsonDecode(option);
         if (decodeList.length == maxTabCount) {

@@ -173,6 +173,21 @@ lazy_static::lazy_static! {
     static ref CLIENTS: RwLock<HashMap<i32, Client>> = Default::default();
 }
 
+fn update_client_permission_state(client: &mut Client, name: &str, enabled: bool) -> bool {
+    match name {
+        "keyboard" => client.keyboard = enabled,
+        "clipboard" => client.clipboard = enabled,
+        "audio" => client.audio = enabled,
+        "file" => client.file = enabled,
+        "restart" => client.restart = enabled,
+        "recording" => client.recording = enabled,
+        "block_input" => client.block_input = enabled,
+        "privacy_mode" => client.privacy_mode = enabled,
+        _ => return false,
+    }
+    true
+}
+
 static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Clone)]
@@ -412,7 +427,14 @@ pub fn switch_permission(id: i32, name: String, enabled: bool) {
         );
         return;
     }
-    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
+    if let Some(client) = CLIENTS.write().unwrap().get_mut(&id) {
+        if !update_client_permission_state(client, &name, enabled) {
+            log::warn!(
+                "cm switch_permission received unknown permission, conn_id={}, permission={}",
+                id,
+                name
+            );
+        }
         allow_err!(client.tx.send(Data::SwitchPermission { name, enabled }));
     };
 }
@@ -574,23 +596,28 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     self.cm.new_message(self.conn_id, text);
                                 }
                                 Data::SwitchPermission { name, enabled } => {
-                                    // Keep this branch scoped to privacy mode rollback.
-                                    // Other CM permission toggles are updated optimistically by the UI itself.
-                                    // The backend currently sends SwitchPermission back to CM only when
-                                    // privacy-mode turn-off fails and the UI state must be restored.
-                                    if name == "privacy_mode" {
-                                        let client = {
-                                            let mut clients = CLIENTS.write().unwrap();
-                                            clients.get_mut(&self.conn_id).map(|c| {
-                                                c.privacy_mode = enabled;
-                                                c.clone()
-                                            })
-                                        };
-                                        if let Some(client) = client {
-                                            // This reuses add_connection(), and cm.tis only selectively updates
-                                            // existing rows (authorized/privacy_mode) for this fallback path.
-                                            self.cm.ui_handler.add_connection(&client);
-                                        }
+                                    // Backend permission state is authoritative. This path is used both
+                                    // for attended-view-only initialization and for permission rollback.
+                                    // Mirror every supported permission into CLIENTS and publish the updated
+                                    // Client so Flutter cannot display a stale optimistic value.
+                                    let client = {
+                                        let mut clients = CLIENTS.write().unwrap();
+                                        clients.get_mut(&self.conn_id).and_then(|c| {
+                                            if update_client_permission_state(c, &name, enabled) {
+                                                Some(c.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    };
+                                    if let Some(client) = client {
+                                        self.cm.ui_handler.add_connection(&client);
+                                    } else {
+                                        log::warn!(
+                                            "cm received unknown backend permission, conn_id={}, permission={}",
+                                            self.conn_id,
+                                            name
+                                        );
                                     }
                                 }
                                 Data::FS(mut fs) => {

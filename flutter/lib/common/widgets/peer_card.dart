@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -50,6 +51,65 @@ class _PeerCardState extends State<_PeerCard>
   final double _cardRadius = 16;
   final double _tileRadius = 5;
   final double _borderWidth = 2;
+
+  String _managedFriendlyNameForPeer(String peerId) {
+    if (!isWindows ||
+        bind.mainGetManagedDirectoryStatus().isEmpty ||
+        peerId.trim().isEmpty) {
+      return '';
+    }
+
+    try {
+      final decoded = jsonDecode(bind.mainGetManagedDirectoryStatus());
+      if (decoded is! Map<String, dynamic>) return '';
+      final devices = decoded['devices'];
+      if (devices is! List) return '';
+
+      for (final item in devices) {
+        if (item is! Map) continue;
+        if ((item['rustdesk_id'] ?? '').toString().trim() != peerId.trim()) {
+          continue;
+        }
+        return (item['display_name'] ?? '').toString().trim();
+      }
+    } catch (e) {
+      debugPrint('Managed History friendly-name lookup failed for $peerId: $e');
+    }
+
+    return '';
+  }
+
+  ({String primary, String secondary}) _peerDisplayLabels(Peer peer) {
+    final legacyPrimary =
+        peer.alias.isEmpty ? formatID(peer.id) : peer.alias;
+    final legacySecondary = hideUsernameOnCard == true
+        ? peer.hostname
+        : '${peer.username}${peer.username.isNotEmpty && peer.hostname.isNotEmpty ? '@' : ''}${peer.hostname}';
+
+    if (widget.tab != PeerTabIndex.recent) {
+      return (primary: legacyPrimary, secondary: legacySecondary);
+    }
+
+    final rustDeskId = peer.id.trim();
+    final hostname = peer.hostname.trim();
+    final friendlyName = _managedFriendlyNameForPeer(peer.id);
+    final primary = friendlyName.isNotEmpty
+        ? friendlyName
+        : (hostname.isNotEmpty
+            ? hostname
+            : (rustDeskId.isNotEmpty ? rustDeskId : legacyPrimary));
+
+    final secondaryParts = <String>[];
+    if (hostname.isNotEmpty && hostname != primary) {
+      secondaryParts.add(hostname);
+    }
+    if (rustDeskId.isNotEmpty && rustDeskId != primary) {
+      secondaryParts.add(rustDeskId);
+    }
+
+    return (primary: primary, secondary: secondaryParts.join(' • '));
+  }
+
 
   @override
   Widget build(BuildContext context) {
@@ -132,9 +192,7 @@ class _PeerCardState extends State<_PeerCard>
   }
 
   makeChild(bool isPortrait, Peer peer) {
-    final name = hideUsernameOnCard == true
-        ? peer.hostname
-        : '${peer.username}${peer.username.isNotEmpty && peer.hostname.isNotEmpty ? '@' : ''}${peer.hostname}';
+    final labels = _peerDisplayLabels(peer);
     final greyStyle = TextStyle(
         fontSize: 11,
         color: Theme.of(context).textTheme.titleLarge?.color?.withOpacity(0.6));
@@ -186,7 +244,7 @@ class _PeerCardState extends State<_PeerCard>
                         getOnline(isPortrait ? 4 : 8, peer.online),
                         Expanded(
                             child: Text(
-                          peer.alias.isEmpty ? formatID(peer.id) : peer.alias,
+                          labels.primary,
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.titleSmall,
                         )),
@@ -195,12 +253,12 @@ class _PeerCardState extends State<_PeerCard>
                         children: [
                           Flexible(
                             child: Tooltip(
-                              message: name,
+                              message: labels.secondary,
                               waitDuration: const Duration(seconds: 1),
                               child: Align(
                                 alignment: Alignment.centerLeft,
                                 child: Text(
-                                  name,
+                                  labels.secondary,
                                   style: isPortrait ? null : greyStyle,
                                   textAlign: TextAlign.start,
                                   overflow: TextOverflow.ellipsis,
@@ -282,9 +340,7 @@ class _PeerCardState extends State<_PeerCard>
       BuildContext context, Peer peer, Rx<BoxDecoration?> deco) {
     hideUsernameOnCard ??=
         bind.mainGetBuildinOption(key: kHideUsernameOnCard) == 'Y';
-    final name = hideUsernameOnCard == true
-        ? peer.hostname
-        : '${peer.username}${peer.username.isNotEmpty && peer.hostname.isNotEmpty ? '@' : ''}${peer.hostname}';
+    final labels = _peerDisplayLabels(peer);
     final child = Card(
       color: Colors.transparent,
       elevation: 0,
@@ -319,10 +375,10 @@ class _PeerCardState extends State<_PeerCard>
                                 children: [
                                   Expanded(
                                     child: Tooltip(
-                                      message: name,
+                                      message: labels.secondary,
                                       waitDuration: const Duration(seconds: 1),
                                       child: Text(
-                                        name,
+                                        labels.secondary,
                                         style: const TextStyle(
                                             color: Colors.white70,
                                             fontSize: 12),
@@ -368,7 +424,7 @@ class _PeerCardState extends State<_PeerCard>
                         getOnline(8, peer.online),
                         Expanded(
                             child: Text(
-                          peer.alias.isEmpty ? formatID(peer.id) : peer.alias,
+                          labels.primary,
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.titleSmall,
                         )),
@@ -966,51 +1022,17 @@ class RecentPeerCard extends BasePeerCard {
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
-    final List<MenuEntryBase<String>> menuItems = [
+    final favs = (await bind.mainGetFav()).toList();
+    final menuItems = <MenuEntryBase<String>>[
       _connectAction(context),
       _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
+      MenuEntryDivider(),
     ];
-
-    if (peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_terminalRunAsAdminAction(context));
-    }
-
-    final List favs = (await bind.mainGetFav()).toList();
-
-    if (isDesktop && peer.platform != kPeerPlatformAndroid) {
-      menuItems.add(_tcpTunnelingAction(context));
-    }
-    // menuItems.add(await _openNewConnInOptAction(peer.id));
-    if (!isWeb) {
-      menuItems.add(await _forceAlwaysRelayAction(peer.id));
-    }
-    if (isWindows && peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_rdpAction(context, peer.id));
-    }
-    if (isWindows) {
-      menuItems.add(_createShortCutAction(peer.id));
-    }
-    menuItems.add(MenuEntryDivider());
-    if (isMobile || isDesktop || isWebDesktop) {
-      menuItems.add(_renameAction(peer.id));
-    }
-    if (await bind.mainPeerHasPassword(id: peer.id)) {
-      menuItems.add(_unrememberPasswordAction(peer.id));
-    }
-
     if (!favs.contains(peer.id)) {
       menuItems.add(_addFavAction(peer.id));
     } else {
       menuItems.add(_rmFavAction(peer.id, () async {}));
     }
-
-    if (gFFI.userModel.userName.isNotEmpty) {
-      menuItems.add(_addToAb(peer));
-    }
-
-    menuItems.add(MenuEntryDivider());
     menuItems.add(_removeAction(peer.id));
     return menuItems;
   }
@@ -1031,48 +1053,14 @@ class FavoritePeerCard extends BasePeerCard {
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
-    final List<MenuEntryBase<String>> menuItems = [
+    return <MenuEntryBase<String>>[
       _connectAction(context),
       _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
+      MenuEntryDivider(),
+      _rmFavAction(peer.id, () async {
+        await bind.mainLoadFavPeers();
+      }),
     ];
-
-    if (peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_terminalRunAsAdminAction(context));
-    }
-
-    if (isDesktop && peer.platform != kPeerPlatformAndroid) {
-      menuItems.add(_tcpTunnelingAction(context));
-    }
-    // menuItems.add(await _openNewConnInOptAction(peer.id));
-    if (!isWeb) {
-      menuItems.add(await _forceAlwaysRelayAction(peer.id));
-    }
-    if (isWindows && peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_rdpAction(context, peer.id));
-    }
-    if (isWindows) {
-      menuItems.add(_createShortCutAction(peer.id));
-    }
-    menuItems.add(MenuEntryDivider());
-    if (isMobile || isDesktop || isWebDesktop) {
-      menuItems.add(_renameAction(peer.id));
-    }
-    if (await bind.mainPeerHasPassword(id: peer.id)) {
-      menuItems.add(_unrememberPasswordAction(peer.id));
-    }
-    menuItems.add(_rmFavAction(peer.id, () async {
-      await bind.mainLoadFavPeers();
-    }));
-
-    if (gFFI.userModel.userName.isNotEmpty) {
-      menuItems.add(_addToAb(peer));
-    }
-
-    menuItems.add(MenuEntryDivider());
-    menuItems.add(_removeAction(peer.id));
-    return menuItems;
   }
 
   @protected
@@ -1080,8 +1068,8 @@ class FavoritePeerCard extends BasePeerCard {
   void _update() => bind.mainLoadFavPeers();
 }
 
-class DiscoveredPeerCard extends BasePeerCard {
-  DiscoveredPeerCard({required Peer peer, EdgeInsets? menuPadding, Key? key})
+class DirectoryPeerCard extends BasePeerCard {
+  DirectoryPeerCard({required Peer peer, EdgeInsets? menuPadding, Key? key})
       : super(
             peer: peer,
             tab: PeerTabIndex.lan,
@@ -1091,52 +1079,23 @@ class DiscoveredPeerCard extends BasePeerCard {
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
-    final List<MenuEntryBase<String>> menuItems = [
+    final favs = (await bind.mainGetFav()).toList();
+    final menuItems = <MenuEntryBase<String>>[
       _connectAction(context),
       _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
+      MenuEntryDivider(),
     ];
-
-    if (peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_terminalRunAsAdminAction(context));
-    }
-
-    final List favs = (await bind.mainGetFav()).toList();
-
-    if (isDesktop && peer.platform != kPeerPlatformAndroid) {
-      menuItems.add(_tcpTunnelingAction(context));
-    }
-    // menuItems.add(await _openNewConnInOptAction(peer.id));
-    if (!isWeb) {
-      menuItems.add(await _forceAlwaysRelayAction(peer.id));
-    }
-    if (isWindows && peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_rdpAction(context, peer.id));
-    }
-    menuItems.add(_wolAction(peer.id));
-    if (isWindows) {
-      menuItems.add(_createShortCutAction(peer.id));
-    }
-
     if (!favs.contains(peer.id)) {
       menuItems.add(_addFavAction(peer.id));
     } else {
       menuItems.add(_rmFavAction(peer.id, () async {}));
     }
-
-    if (gFFI.userModel.userName.isNotEmpty) {
-      menuItems.add(_addToAb(peer));
-    }
-
-    menuItems.add(MenuEntryDivider());
-    menuItems.add(_removeAction(peer.id));
     return menuItems;
   }
 
   @protected
   @override
-  void _update() => bind.mainLoadLanPeers();
+  void _update() {}
 }
 
 class AddressBookPeerCard extends BasePeerCard {

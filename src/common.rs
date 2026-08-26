@@ -1085,8 +1085,15 @@ fn get_api_server_(api: String, custom: String) -> String {
 
 #[inline]
 pub fn is_public(url: &str) -> bool {
-    let url = url.to_ascii_lowercase();
-    url.contains("rustdesk.com/") || url.ends_with("rustdesk.com")
+    let parsed = url::Url::parse(url)
+        .ok()
+        .filter(|parsed| parsed.has_host())
+        .or_else(|| url::Url::parse(&format!("http://{url}")).ok());
+    let Some(host) = parsed.as_ref().and_then(url::Url::host_str) else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host == "rustdesk.com" || host.ends_with(".rustdesk.com")
 }
 
 pub fn get_udp_punch_enabled() -> bool {
@@ -2132,7 +2139,30 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+fn load_managed_client_defaults() {
+    let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+
+    if let Some(server) = option_env!("RUSTDESK_MANAGED_SERVER")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        defaults
+            .entry("custom-rendezvous-server".to_owned())
+            .or_insert_with(|| server.to_owned());
+    }
+
+    if let Some(key) = option_env!("RUSTDESK_MANAGED_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        defaults
+            .entry("key".to_owned())
+            .or_insert_with(|| key.to_owned());
+    }
+}
+
 pub fn load_custom_client() {
+    load_managed_client_defaults();
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
@@ -2231,6 +2261,7 @@ pub fn get_dst_align_rgba() -> usize {
 }
 
 pub fn read_custom_client(config: &str) {
+    load_managed_client_defaults();
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
         return;
@@ -2876,6 +2907,16 @@ mod tests {
         assert!(!is_public("localhost"));
         assert!(!is_public("https://rustdesk.computer.com"));
         assert!(!is_public("rustdesk.comhello.com"));
+    }
+
+    #[test]
+    fn test_is_public_matches_rustdesk_root_domain() {
+        assert!(is_public("rustdesk.com/"));
+        assert!(is_public("rustdesk.com:21117"));
+        assert!(is_public("api.rustdesk.com:21117"));
+        assert!(!is_public("hello-rustdesk.com"));
+        assert!(!is_public("api.rustdesk.com.evil.test"));
+        assert!(!is_public("https://rustdesk.com@evil.test"));
     }
 
     #[test]

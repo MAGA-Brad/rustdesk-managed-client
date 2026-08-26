@@ -28,6 +28,8 @@ use crate::common::SOFTWARE_UPDATE_URL;
 use crate::hbbs_http::account;
 #[cfg(not(any(target_os = "ios")))]
 use crate::ipc;
+#[cfg(windows)]
+use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 type Message = RendezvousMessage;
 
@@ -113,6 +115,276 @@ pub fn install_me(_options: String, _path: String, _silent: bool, _debug: bool) 
     });
 }
 
+#[cfg(windows)]
+fn handoff_managed_directory_enrollment(
+    enrollment_password: crate::ipc::RedactedSecret,
+) -> hbb_common::ResultType<(bool, Option<String>)> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let (_, _, _, installed_exe) =
+        crate::platform::windows::get_install_info();
+
+    let mut child = Command::new(&installed_exe)
+        .arg("--managed-enrollment-handoff")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            hbb_common::anyhow::anyhow!(
+                "Managed enrollment handoff stdin was unavailable"
+            )
+        })?;
+        stdin.write_all(enrollment_password.as_bytes())?;
+    }
+
+    // The child's own stdout carries the human-readable reason (see
+    // run_managed_directory_enrollment_handoff_from_stdin) - its exit code
+    // alone can't tell "wrong password" from "already enrolled" from a
+    // network timeout.
+    let mut reason = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut reason);
+    }
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        None
+    } else {
+        Some(reason.to_owned())
+    };
+
+    let status = child.wait()?;
+
+    match status.code() {
+        Some(0) => Ok((true, None)),
+        Some(2) => Ok((false, reason)),
+        Some(code) => Err(hbb_common::anyhow::anyhow!(
+            "Managed enrollment handoff process exited with code {}{}",
+            code,
+            reason.map(|r| format!(": {}", r)).unwrap_or_default()
+        )),
+        None => Err(hbb_common::anyhow::anyhow!(
+            "Managed enrollment handoff process terminated unexpectedly"
+        )),
+    }
+}
+
+#[cfg(all(windows, feature = "flutter"))]
+pub(crate) fn run_managed_directory_enrollment_handoff_from_stdin(
+) -> hbb_common::ResultType<bool> {
+    use std::io::Read;
+
+    const MAX_ENROLLMENT_SECRET_BYTES: u64 = 4_096;
+
+    let mut bytes = Vec::new();
+    {
+        let stdin = std::io::stdin();
+        let mut input = stdin
+            .lock()
+            .take(MAX_ENROLLMENT_SECRET_BYTES + 1);
+        input.read_to_end(&mut bytes)?;
+    }
+
+    if bytes.is_empty() {
+        return Err(hbb_common::anyhow::anyhow!(
+            "Managed enrollment handoff received an empty secret"
+        ));
+    }
+
+    if bytes.len() > MAX_ENROLLMENT_SECRET_BYTES as usize {
+        bytes.fill(0);
+        return Err(hbb_common::anyhow::anyhow!(
+            "Managed enrollment handoff secret exceeded the size limit"
+        ));
+    }
+
+    let enrollment_password =
+        crate::ipc::RedactedSecret::from_bytes(bytes);
+
+    let verifier_matches = enrollment_password
+        .as_str()
+        .map(crate::flutter_ffi::managed_installer_auth_matches)
+        .unwrap_or(false);
+
+    if !verifier_matches {
+        println!("Enrollment password was invalid");
+        return Ok(false);
+    }
+
+    // The parent process (install_me_managed) only sees this process's exit
+    // code, so the human-readable reason is relayed over stdout - the parent
+    // reads it back to show the user the real outcome instead of a generic
+    // message.
+    match crate::ipc::send_directory_enrollment_secret(
+        enrollment_password,
+    ) {
+        Ok((true, _)) => Ok(true),
+        Ok((false, reason)) => {
+            println!(
+                "{}",
+                reason.unwrap_or_else(|| {
+                    "Enrollment was not accepted".to_owned()
+                })
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            println!("{}", error);
+            Err(error)
+        }
+    }
+}
+// The spawned thread below calls std::process::exit(0) as soon as its work
+// is done, killing the installer's Flutter/Dart UI before it can display any
+// result. Show a blocking native message box with the real outcome first so
+// a rejected/failed enrollment isn't silently indistinguishable from success.
+#[cfg(windows)]
+fn show_managed_install_error(text: &str) {
+    // Give the installer window time to finish closing on its own before the
+    // error dialog appears, so it doesn't look like it's interrupting a
+    // still-in-progress install.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    let text = text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let caption = "RustDesk"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+pub fn install_me_managed(
+    options: String,
+    path: String,
+    silent: bool,
+    debug: bool,
+    enrollment_password: String,
+) {
+    let enrollment_password =
+        crate::ipc::RedactedSecret::new(
+            enrollment_password,
+        );
+
+    std::thread::spawn(move || {
+        let installed =
+            crate::platform::windows::install_me(
+                &options,
+                path,
+                silent,
+                debug,
+            );
+
+        match installed {
+            Ok(()) => {
+                match handoff_managed_directory_enrollment(
+                    enrollment_password,
+                )
+                {
+                    Ok((true, _)) => {
+                        log::info!(
+                            "Managed directory enrollment submitted"
+                        );
+                    }
+
+                    // "Device is already enrolled" means this machine already
+                    // has valid, approved managed credentials from a prior
+                    // install - re-running the installer (e.g. to pick up a
+                    // newer build) can't and shouldn't re-enroll it, but that
+                    // is the desired end state, not a failure. Treat it the
+                    // same as a successful enrollment: log only, no popup.
+                    Ok((false, reason))
+                        if reason.as_deref() == Some("Device is already enrolled") =>
+                    {
+                        log::info!(
+                            "Managed directory enrollment skipped: device is already enrolled"
+                        );
+
+                        // The contact-email field the user just filled in on
+                        // this screen only reaches the server as part of a
+                        // fresh enrollment request, which never fires here -
+                        // it would otherwise be saved to local config only
+                        // and silently never sent. Push it through the same
+                        // self-service IPC path the Settings page uses.
+                        let contact_email = Config::get_option(OPTION_PRESET_DEVICE_EMAIL);
+                        let contact_email = contact_email.trim();
+                        if !contact_email.is_empty() {
+                            match crate::ipc::update_directory_contact_email(
+                                contact_email.to_owned(),
+                            ) {
+                                Ok(true) => log::info!(
+                                    "Managed contact email updated for already-enrolled device"
+                                ),
+                                Ok(false) => log::warn!(
+                                    "Managed contact email update was not accepted for already-enrolled device"
+                                ),
+                                Err(error) => log::warn!(
+                                    "Managed contact email update IPC failed for already-enrolled device: {}",
+                                    error
+                                ),
+                            }
+                        }
+                    }
+
+                    Ok((false, reason)) => {
+                        let reason = reason.unwrap_or_else(|| {
+                            "No reason was reported.".to_owned()
+                        });
+                        log::error!(
+                            "Managed directory enrollment was not accepted: {}",
+                            reason
+                        );
+                        show_managed_install_error(
+                            &format!(
+                                "RustDesk was installed, but enrollment was not accepted.\n\n{}",
+                                reason
+                            ),
+                        );
+                    }
+
+                    Err(error) => {
+                        log::error!(
+                            "Managed directory enrollment handoff failed: {}",
+                            error
+                        );
+                        show_managed_install_error(
+                            &format!(
+                                "RustDesk was installed, but enrollment could not be completed due to an unexpected error.\n\n{}",
+                                error
+                            ),
+                        );
+                    }
+                }
+            }
+
+            Err(error) => {
+                log::error!(
+                    "Managed client installation failed: {}",
+                    error
+                );
+                show_managed_install_error(
+                    &format!("RustDesk installation failed:\n\n{}", error),
+                );
+            }
+        }
+
+        std::process::exit(0);
+    });
+}
 #[inline]
 pub fn update_me(_path: String) {
     goto_install();
@@ -420,6 +692,33 @@ pub fn set_options(m: HashMap<String, String>) {
 
 #[inline]
 pub fn set_option(key: String, value: String) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if key == "bot" && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        log::warn!("Managed client ignored Telegram bot option write");
+        return;
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if key == "2fa" {
+        match ipc::set_2fa_with_ack(value.clone()) {
+            Ok(true) => {
+                let mut options = OPTIONS.lock().unwrap();
+                if value.is_empty() {
+                    options.remove(&key);
+                } else {
+                    options.insert(key, value);
+                }
+            }
+            Ok(false) => {
+                log::warn!("Dedicated 2FA IPC write was rejected or failed readback");
+            }
+            Err(err) => {
+                log::warn!("Dedicated 2FA IPC write failed: {err}");
+            }
+        }
+        return;
+    }
+
     if &key == "stop-service" {
         #[cfg(target_os = "macos")]
         {
@@ -643,6 +942,13 @@ pub fn is_local_permanent_password_set() -> bool {
 
 pub fn set_permanent_password_with_result(password: String) -> bool {
     if config::Config::is_disable_change_permanent_password() {
+        return false;
+    }
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+        && !password.trim().is_empty()
+        && !has_valid_2fa()
+    {
+        log::warn!("Managed policy rejected permanent password because 2FA is not configured");
         return false;
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -1635,6 +1941,17 @@ pub fn support_remove_wallpaper() -> bool {
 }
 
 pub fn has_valid_2fa() -> bool {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return match crate::ipc::get_2fa_from_daemon() {
+            Ok(raw) => crate::auth_2fa::get_2fa(Some(raw)).is_some(),
+            Err(err) => {
+                log::warn!("Managed 2FA state query failed: {err}");
+                false
+            }
+        };
+    }
+
     let raw = get_option("2fa");
     crate::auth_2fa::get_2fa(Some(raw)).is_some()
 }
@@ -1652,10 +1969,16 @@ pub fn verify2fa(code: String) -> bool {
 }
 
 pub fn has_valid_bot() -> bool {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return false;
+    }
     crate::auth_2fa::TelegramBot::get().map_or(false, |bot| bot.is_some())
 }
 
 pub fn verify_bot(token: String) -> String {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return "Telegram bot integration is disabled for managed clients".to_owned();
+    }
     match crate::auth_2fa::get_chatid_telegram(&token) {
         Err(err) => err.to_string(),
         Ok(None) => {

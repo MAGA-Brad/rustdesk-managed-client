@@ -470,44 +470,6 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
           child: Text(translate('Transfer file')),
           onPressed: () => connectWithToken(isFileTransfer: true)),
     );
-    v.add(
-      TTextMenu(
-          child: Text(translate('View camera')),
-          onPressed: () => connectWithToken(isViewCamera: true)),
-    );
-    v.add(
-      TTextMenu(
-          child: Text('${translate('Terminal')} (beta)'),
-          onPressed: () => connectWithToken(isTerminal: true)),
-    );
-    v.add(
-      TTextMenu(
-          child: Text(translate('TCP tunneling')),
-          onPressed: () => connectWithToken(isTcpTunneling: true)),
-    );
-  }
-  // note
-  if (isDefaultConn && !bind.isDisableAccount()) {
-    v.add(
-      TTextMenu(
-          child: Text(translate('Note')),
-          onPressed: () async {
-            bool isLogin =
-                bind.mainGetLocalOption(key: 'access_token').isNotEmpty;
-            if (!isLogin) {
-              final res = await loginDialog();
-              if (res != true) return;
-              // Desktop: send message to main window to refresh login status
-              // Web: login is required before connection, so no need to refresh
-              // Mobile: same isolate, no need to send message
-              if (isDesktop) {
-                rustDeskWinManager.call(
-                    WindowType.Main, kWindowRefreshCurrentUser, "");
-              }
-            }
-            showAuditDialog(ffi);
-          }),
-    );
   }
   // divider
   if (isDefaultConn && (isDesktop || isWebDesktop)) {
@@ -545,35 +507,6 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
           onPressed: () => bind.sessionLockScreen(sessionId: sessionId)),
     );
   }
-  // blockUserInput
-  if (isDefaultConn &&
-      ffi.ffiModel.keyboard &&
-      ffi.ffiModel.permissions['block_input'] != false &&
-      pi.platform == kPeerPlatformWindows) // privacy-mode != true ??
-  {
-    v.add(TTextMenu(
-        child: Obx(() => Text(translate(
-            '${BlockInputState.find(id).value ? 'Unb' : 'B'}lock user input'))),
-        onPressed: () {
-          RxBool blockInput = BlockInputState.find(id);
-          bind.sessionToggleOption(
-              sessionId: sessionId,
-              value: '${blockInput.value ? 'un' : ''}block-input');
-          blockInput.value = !blockInput.value;
-        }));
-  }
-  // switchSides
-  if (isDefaultConn &&
-      isDesktop &&
-      ffiModel.keyboard &&
-      pi.platform != kPeerPlatformAndroid &&
-      versionCmp(pi.version, '1.2.0') >= 0 &&
-      bind.peerGetSessionsCount(id: id, connType: ffi.connType.index) == 1) {
-    v.add(TTextMenu(
-        child: Text(translate('Switch Sides')),
-        onPressed: () =>
-            showConfirmSwitchSidesDialog(sessionId, id, ffi.dialogManager)));
-  }
   // refresh
   if (pi.version.isNotEmpty) {
     v.add(TTextMenu(
@@ -581,29 +514,6 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       onPressed: () => sessionRefreshVideo(sessionId, pi),
     ));
   }
-  // record
-  if (!(isDesktop || isWeb) &&
-      bind.mainGetLocalOption(key: kOptionHideRecordingButton) != 'Y' &&
-      (ffi.recordingModel.start || (perms["recording"] != false))) {
-    v.add(TTextMenu(
-        child: Row(
-          children: [
-            Text(translate(ffi.recordingModel.start
-                ? 'Stop session recording'
-                : 'Start session recording')),
-            Padding(
-              padding: EdgeInsets.only(left: 12),
-              child: Icon(
-                  ffi.recordingModel.start
-                      ? Icons.pause_circle_filled
-                      : Icons.videocam_outlined,
-                  color: MyTheme.accent),
-            )
-          ],
-        ),
-        onPressed: () => ffi.recordingModel.toggle()));
-  }
-
   // to-do:
   // 1. Web desktop
   // 2. Mobile, copy the image to the clipboard

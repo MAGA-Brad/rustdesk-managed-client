@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 
 import 'package:dynamic_layouts/dynamic_layouts.dart';
 import 'package:flutter/foundation.dart';
@@ -490,25 +491,87 @@ class FavoritePeersView extends BasePeersView {
   }
 }
 
-class DiscoveredPeersView extends BasePeersView {
-  DiscoveredPeersView(
-      {Key? key, EdgeInsets? menuPadding, ScrollController? scrollController})
-      : super(
-          key: key,
-          peerTabIndex: PeerTabIndex.lan,
-          peerCardBuilder: (Peer peer) => DiscoveredPeerCard(
-            peer: peer,
-            menuPadding: menuPadding,
-          ),
-        );
+class DirectoryPeersView extends StatefulWidget {
+  final EdgeInsets? menuPadding;
+
+  const DirectoryPeersView({Key? key, this.menuPadding}) : super(key: key);
+
+  @override
+  State<DirectoryPeersView> createState() => _DirectoryPeersViewState();
+}
+
+class _DirectoryPeersViewState extends State<DirectoryPeersView> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
+    _timer = Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
+  }
+
+  void _refresh() {
+    if (!mounted) return;
+    final raw = bind.mainGetManagedDirectoryStatus();
+    if (raw.isEmpty) {
+      gFFI.lanPeersModel.replacePeers([]);
+      return;
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      final devices = decoded is Map<String, dynamic> && decoded['devices'] is List
+          ? decoded['devices'] as List
+          : const [];
+      final peers = <Peer>[];
+      for (final item in devices) {
+        if (item is! Map) continue;
+        final map = Map<String, dynamic>.from(item);
+        final peer = Peer.fromJson({
+          'id': map['rustdesk_id'] ?? '',
+          'alias': map['display_name'] ?? '',
+          'hostname': map['hostname'] ?? '',
+          'platform': 'Windows',
+          'username': '',
+          'tags': <dynamic>[],
+          'note': map['last_seen_at'] ?? '',
+        });
+        peer.online = map['online'] == true;
+        if (peer.id.isNotEmpty) peers.add(peer);
+      }
+      gFFI.lanPeersModel.replacePeers(peers);
+    } catch (e) {
+      debugPrint('Failed to parse managed directory: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final widget = super.build(context);
-    bind.mainLoadLanPeers();
-    bind.mainDiscover();
-    return widget;
+    return BasePeersViewWidget(
+      peerTabIndex: PeerTabIndex.lan,
+      peerCardBuilder: (Peer peer) => DirectoryPeerCard(
+        peer: peer,
+        menuPadding: widget.menuPadding,
+      ),
+    );
   }
+}
+
+class BasePeersViewWidget extends BasePeersView {
+  const BasePeersViewWidget({
+    Key? key,
+    required PeerTabIndex peerTabIndex,
+    required PeerCardBuilder peerCardBuilder,
+  }) : super(
+          key: key,
+          peerTabIndex: peerTabIndex,
+          peerCardBuilder: peerCardBuilder,
+        );
 }
 
 class AddressBookPeersView extends BasePeersView {

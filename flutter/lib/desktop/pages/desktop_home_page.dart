@@ -25,6 +25,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:window_size/window_size.dart' as window_size;
 import '../widgets/button.dart';
+import '../../common/widgets/dialog.dart' show change2fa;
 
 class DesktopHomePage extends StatefulWidget {
   const DesktopHomePage({Key? key}) : super(key: key);
@@ -49,7 +50,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsInputMonitoring = false;
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
+  bool _managedPolicyApplied = false;
   bool isCardClosed = false;
+  int? _managedOnlineClients;
+  int? _managedActiveSessions;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -147,6 +151,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 Expanded(child: Container())
               ],
             ),
+            buildManagedServerStats(context),
             if (isOutgoingOnly)
               Positioned(
                 bottom: 6,
@@ -213,7 +218,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          translate("ID"),
+                          'RustDesk ID',
                           style: TextStyle(
                               fontSize: 14,
                               color: Theme.of(context)
@@ -430,7 +435,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
-    if (!bind.isCustomClient() &&
+    final managedClient =
+        isWindows && bind.mainGetManagedDirectoryStatus().isNotEmpty;
+    if (!managedClient &&
+        !bind.isCustomClient() &&
         updateUrl.isNotEmpty &&
         !isCardClosed &&
         bind.mainUriPrefixSync().contains('rustdesk')) {
@@ -468,7 +476,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           await rustDeskWinManager.closeAllSubWindows();
           bind.mainGotoInstall();
         });
-      } else if (bind.mainIsInstalledLowerVersion()) {
+      } else if (!managedClient && bind.mainIsInstalledLowerVersion()) {
         return buildInstallCard(
             "Status", "Your installation is lower version.", "Click to upgrade",
             () async {
@@ -694,11 +702,105 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
+  Future<void> _enforceManagedClientPolicy() async {
+    if (_managedPolicyApplied || !isWindows) return;
+    if (bind.mainGetManagedDirectoryStatus().isEmpty) return;
+
+    try {
+      await bind.mainSetLocalOption(key: kOptionD3DRender, value: 'N');
+      await bind.mainSetLocalOption(key: kOptionEnableCheckUpdate, value: 'N');
+      await bind.mainSetOption(key: kOptionAllowAutoUpdate, value: 'N');
+      await bind.mainSetLocalOption(key: kOptionEnableUdpPunch, value: 'N');
+      await bind.mainSetLocalOption(key: kOptionEnableIpv6Punch, value: 'N');
+      await bind.mainSetOption(key: kOptionEnableRemoteRestart, value: 'N');
+      await bind.mainSetUserDefaultOption(key: kOptionPrivacyMode, value: 'N');
+      await bind.mainSetUserDefaultOption(key: kOptionI444, value: 'N');
+
+      _managedPolicyApplied = true;
+      debugPrint('Managed client policy options enforced');
+    } catch (e, st) {
+      debugPrint('Managed client policy enforcement deferred: $e');
+      debugPrintStack(stackTrace: st);
+    }
+  }
+
+  // Server-authoritative counts from the managed Directory response. Reuses
+  // the existing Directory poll (~15s server-side cadence); no new endpoint
+  // or request. Absent/unparsable server_stats leaves the fields as null,
+  // which buildManagedServerStats renders as an explicit unavailable state.
+  void _refreshManagedServerStats() {
+    if (!isWindows) return;
+    final raw = bind.mainGetManagedDirectoryStatus();
+    if (raw.isEmpty) return;
+    int? onlineClients;
+    int? activeSessions;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) {
+        final stats = decoded['server_stats'];
+        if (stats is Map) {
+          onlineClients = (stats['online_clients'] as num?)?.toInt();
+          activeSessions = (stats['active_sessions'] as num?)?.toInt();
+        }
+      }
+    } catch (e) {
+      debugPrint('Managed server_stats parse failed: $e');
+    }
+    if (onlineClients != _managedOnlineClients ||
+        activeSessions != _managedActiveSessions) {
+      setState(() {
+        _managedOnlineClients = onlineClients;
+        _managedActiveSessions = activeSessions;
+      });
+    }
+  }
+
+  Widget buildManagedServerStats(BuildContext context) {
+    if (!isWindows ||
+        bind.isOutgoingOnly() ||
+        bind.mainGetManagedDirectoryStatus().isEmpty) {
+      return const Offstage();
+    }
+    final onlineText = _managedOnlineClients?.toString() ?? '—';
+    final sessionsText = _managedActiveSessions?.toString() ?? '—';
+    final labelStyle = Theme.of(context)
+        .textTheme
+        .bodySmall
+        ?.copyWith(color: Colors.grey.withOpacity(0.8));
+    final valueStyle = Theme.of(context)
+        .textTheme
+        .bodySmall
+        ?.copyWith(fontWeight: FontWeight.w600);
+    return Positioned(
+      bottom: 6,
+      left: 12,
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Text('${translate("Clients online")}: ', style: labelStyle),
+              Text(onlineText, style: valueStyle),
+            ]),
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Text('${translate("Active sessions")}: ', style: labelStyle),
+              Text(sessionsText, style: valueStyle),
+            ]),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
+      await _enforceManagedClientPolicy();
+      _refreshManagedServerStats();
       final error = await bind.mainGetError();
       if (systemError != error) {
         systemError = error;
@@ -907,7 +1009,26 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 }
 
-void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
+void setPasswordDialog({
+  VoidCallback? notEmptyCallback,
+  VoidCallback? managed2FaStateChanged,
+}) async {
+  if (isWindows &&
+      bind.mainGetManagedDirectoryStatus().isNotEmpty &&
+      !bind.mainHasValid2FaSync()) {
+    change2fa(callback: () {
+      Future.microtask(() {
+        if (bind.mainHasValid2FaSync()) {
+          managed2FaStateChanged?.call();
+          setPasswordDialog(
+            notEmptyCallback: notEmptyCallback,
+            managed2FaStateChanged: managed2FaStateChanged,
+          );
+        }
+      });
+    });
+    return;
+  }
   final p0 = TextEditingController(text: "");
   final p1 = TextEditingController(text: "");
   var errMsg0 = "";
@@ -961,6 +1082,16 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
         setState(() {
           errMsg1 =
               '${translate('Prompt')}: ${translate("The confirmation is not identical.")}';
+        });
+        return;
+      }
+      if (pass.isNotEmpty &&
+          isWindows &&
+          bind.mainGetManagedDirectoryStatus().isNotEmpty &&
+          !bind.mainHasValid2FaSync()) {
+        setState(() {
+          errMsg0 =
+              '2FA enrollment is required before saving a permanent password.';
         });
         return;
       }

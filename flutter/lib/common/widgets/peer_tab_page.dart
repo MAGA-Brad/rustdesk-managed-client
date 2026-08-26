@@ -50,7 +50,7 @@ class _PeerTabPageState extends State<PeerTabPage>
     _TabEntry(FavoritePeersView(
       menuPadding: _menuPadding(),
     )),
-    _TabEntry(DiscoveredPeersView(
+    _TabEntry(DirectoryPeersView(
       menuPadding: _menuPadding(),
     )),
     _TabEntry(

@@ -50,6 +50,7 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     } else {
         crate::read_custom_client(custom_client_config);
     }
+
     #[cfg(target_os = "android")]
     {
         // flexi_logger can't work when android_logger initialized.
@@ -974,6 +975,60 @@ pub fn main_show_option(_key: String) -> SyncReturn<bool> {
 }
 
 pub fn main_set_option(key: String, value: String) {
+    if key == "managed-request-reenrollment" {
+        #[cfg(windows)]
+        std::thread::spawn(|| {
+            match crate::ipc::request_directory_reenrollment() {
+                Ok(true) => log::info!("Managed re-enrollment request submitted"),
+                Ok(false) => log::warn!("Managed re-enrollment request was not accepted"),
+                Err(error) => log::warn!(
+                    "Managed re-enrollment request IPC failed: {}",
+                    error
+                ),
+            }
+        });
+        return;
+    }
+    if key == "managed-update-contact-email" {
+        // Unlike reenrollment (a fire-once action with nothing to display),
+        // this value IS shown in the Settings field - fall through to the
+        // generic write below too, so this (GUI) process's own local config
+        // reflects it immediately rather than only the service's cache,
+        // matching how Computer Friendly Name behaves.
+        #[cfg(windows)]
+        {
+            let value_for_service = value.clone();
+            std::thread::spawn(move || {
+                match crate::ipc::update_directory_contact_email(value_for_service) {
+                    Ok(true) => log::info!("Managed contact email updated"),
+                    Ok(false) => log::warn!("Managed contact email update was not accepted"),
+                    Err(error) => log::warn!(
+                        "Managed contact email update IPC failed: {}",
+                        error
+                    ),
+                }
+            });
+        }
+    }
+    // The managed directory worker (heartbeat, enrollment) runs in the Windows
+    // service process, which has its own separate in-memory Config cache from
+    // this GUI process - writing the option here does not make the service see
+    // it. Push the new value over IPC so the service's cache (and thus the next
+    // heartbeat) picks it up without waiting for a service restart.
+    #[cfg(windows)]
+    if key == config::keys::OPTION_PRESET_DEVICE_NAME {
+        let value_for_service = value.clone();
+        std::thread::spawn(move || {
+            if let Err(error) =
+                crate::ipc::notify_directory_friendly_name_changed(value_for_service)
+            {
+                log::warn!(
+                    "Managed friendly name IPC notify failed: {}",
+                    error
+                );
+            }
+        });
+    }
     #[cfg(target_os = "android")]
     {
         let is_permission_option = key.eq(config::keys::OPTION_ENABLE_CLIPBOARD)
@@ -2371,6 +2426,172 @@ fn set_cur_session_id_(session_id: SessionID, _keyboard_mode: &str) {
     crate::keyboard::update_grab_get_key_name(_keyboard_mode);
 }
 
+fn managed_installer_auth_hex<const N: usize>(
+    value: &str,
+) -> Option<[u8; N]> {
+    let value = value.trim();
+
+    if value.len() != N * 2 || !value.is_ascii() {
+        return None;
+    }
+
+    let mut output = [0u8; N];
+
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = match pair[0] {
+            b'0'..=b'9' => pair[0] - b'0',
+            b'a'..=b'f' => pair[0] - b'a' + 10,
+            b'A'..=b'F' => pair[0] - b'A' + 10,
+            _ => return None,
+        };
+
+        let low = match pair[1] {
+            b'0'..=b'9' => pair[1] - b'0',
+            b'a'..=b'f' => pair[1] - b'a' + 10,
+            b'A'..=b'F' => pair[1] - b'A' + 10,
+            _ => return None,
+        };
+
+        output[index] = (high << 4) | low;
+    }
+
+    Some(output)
+}
+
+pub(crate) fn managed_installer_auth_matches(candidate: &str) -> bool {
+    let Some(salt_hex) = option_env!("RUSTDESK_INSTALLER_AUTH_SALT_HEX")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let Some(expected_hex) =
+        option_env!("RUSTDESK_INSTALLER_AUTH_PBKDF2_HEX")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let Some(iterations) =
+        option_env!("RUSTDESK_INSTALLER_AUTH_PBKDF2_ITERATIONS")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value >= 100_000)
+    else {
+        return false;
+    };
+
+    let Some(salt) = managed_installer_auth_hex::<16>(salt_hex) else {
+        return false;
+    };
+
+    let Some(expected) =
+        managed_installer_auth_hex::<32>(expected_hex)
+    else {
+        return false;
+    };
+
+    let mut derived = [0u8; 32];
+
+    pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha256>>(
+        candidate.as_bytes(),
+        &salt,
+        iterations,
+        &mut derived,
+    );
+
+    let mut difference = 0u8;
+
+    for (left, right) in derived.iter().zip(expected.iter()) {
+        difference |= *left ^ *right;
+    }
+
+    derived.fill(0);
+
+    difference == 0
+}
+
+fn apply_managed_client_build_defaults() {
+    if let Some(server) = option_env!("RUSTDESK_MANAGED_SERVER")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config::Config::set_option(
+            "custom-rendezvous-server".to_owned(),
+            server.to_owned(),
+        );
+    }
+
+    if let Some(key) = option_env!("RUSTDESK_MANAGED_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config::Config::set_option(
+            "key".to_owned(),
+            key.to_owned(),
+        );
+    }
+}
+
+pub fn install_validate_authorization_password(
+    password: String,
+) -> SyncReturn<bool> {
+    SyncReturn(managed_installer_auth_matches(&password))
+}
+pub fn main_get_managed_directory_status(
+) -> SyncReturn<String> {
+    let managed = option_env!(
+        "RUSTDESK_MANAGED_DIRECTORY_BASE"
+    )
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .is_some();
+
+    if !managed {
+        return SyncReturn(String::new());
+    }
+
+    #[cfg(windows)]
+    {
+        match crate::ipc::get_directory_status_from_service() {
+            Ok((state, text, snapshot)) => {
+                let mut value = serde_json::json!({
+                    "state": state,
+                    "text": text,
+                    "devices": [],
+                    "client_settings": null,
+                });
+                if !snapshot.is_empty() {
+                    if let Ok(snapshot_value) =
+                        serde_json::from_str::<serde_json::Value>(&snapshot)
+                    {
+                        if let Some(map) = snapshot_value.as_object() {
+                            for (key, item) in map {
+                                value[key] = item.clone();
+                            }
+                        }
+                    }
+                }
+                SyncReturn(value.to_string())
+            }
+
+            Err(_) => SyncReturn(
+                serde_json::json!({
+                    "state": "unavailable",
+                    "text": "",
+                })
+                .to_string(),
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        SyncReturn(String::new())
+    }
+}
+
 pub fn install_show_run_without_install() -> SyncReturn<bool> {
     SyncReturn(show_run_without_install())
 }
@@ -2379,7 +2600,84 @@ pub fn install_run_without_install() {
     run_without_install();
 }
 
-pub fn install_install_me(options: String, path: String) {
+pub fn install_install_me(
+    options: String,
+    path: String,
+    friendly_name: String,
+    contact_email: String,
+    password: String,
+    authorization_password: String,
+    enrollment_password: String,
+) {
+    let friendly_name = friendly_name.trim();
+    let contact_email = contact_email.trim();
+    let password = if password.trim().is_empty() {
+        String::new()
+    } else {
+        password
+    };
+
+    if !managed_installer_auth_matches(&authorization_password) {
+        log::error!("Installer authorization failed");
+        return;
+    }
+
+    if enrollment_password.trim().is_empty() {
+        log::error!("Directory enrollment password is required");
+        return;
+    }
+    if friendly_name.is_empty() {
+        log::error!("Friendly computer name is required");
+        return;
+    }
+    if contact_email.is_empty() {
+        log::error!("Contact email address is required");
+        return;
+    }
+    if !contact_email.contains('@') || contact_email.contains(' ') {
+        log::error!("Contact email address is invalid");
+        return;
+    }
+
+    if !password.is_empty() {
+        if password.chars().count() < 8 {
+            log::error!("Permanent access password must be at least 8 characters");
+            return;
+        }
+
+        if !has_valid_2fa() {
+            log::error!(
+                "Two-factor authentication is required with a permanent access password"
+            );
+            return;
+        }
+    }
+    apply_managed_client_build_defaults();
+
+    config::Config::set_option(
+        config::keys::OPTION_PRESET_DEVICE_NAME.to_string(),
+        friendly_name.to_owned(),
+    );
+    config::Config::set_option(
+        config::keys::OPTION_PRESET_DEVICE_EMAIL.to_string(),
+        contact_email.to_owned(),
+    );
+
+    if !config::Config::set_permanent_password(&password) {
+        log::error!("Failed to store the permanent access password");
+        return;
+    }
+
+    #[cfg(windows)]
+    crate::ui_interface::install_me_managed(
+        options,
+        path,
+        false,
+        false,
+        enrollment_password,
+    );
+
+    #[cfg(not(windows))]
     install_me(options, path, false, false);
 }
 
@@ -2481,14 +2779,23 @@ pub fn is_disable_settings() -> SyncReturn<bool> {
 }
 
 pub fn is_disable_ab() -> SyncReturn<bool> {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return SyncReturn(true);
+    }
     SyncReturn(config::is_disable_ab())
 }
 
 pub fn is_disable_account() -> SyncReturn<bool> {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return SyncReturn(true);
+    }
     SyncReturn(config::is_disable_account())
 }
 
 pub fn is_disable_group_panel() -> SyncReturn<bool> {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return SyncReturn(true);
+    }
     SyncReturn(LocalConfig::get_option("disable-group-panel") == "Y")
 }
 
@@ -2734,6 +3041,38 @@ pub fn main_supported_input_source() -> SyncReturn<String> {
                 .unwrap_or_default(),
         )
     }
+}
+
+// Reinstalling over an already-installed, already-running instance leaves
+// its service (and the "" IPC pipe it owns) alive, which blocks the
+// installer's own listener below from binding and would even reject a
+// connection to the *existing* service's listener (a different executable
+// path than this temp-extracted installer - a legitimate identity check,
+// not a bug). Stop it first so there's nothing left to conflict with.
+#[cfg(windows)]
+pub fn install_stop_running_instance() {
+    crate::platform::windows::stop_running_instance_before_install();
+}
+
+// The installer's own process (runInstallPage in main.dart) never calls
+// start_server(), so it never spawns the "" (main) IPC listener that a
+// normally-running app/service already has. 2FA setup during install goes
+// through verify2fa() -> set_2fa_with_ack(), which requires that listener to
+// durably persist the verified secret - without it, the ack round-trip can
+// never succeed even when the entered code is genuinely correct, and the
+// user just sees a generic "wrong code" error. Start the same listener the
+// normal app uses (ipc::start(""), already sync-callable via its own
+// #[tokio::main]) once, early, before any install-time 2FA prompt.
+pub fn install_ensure_local_ipc() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| {
+            if let Err(err) = crate::ipc::start("") {
+                log::warn!("Installer local IPC listener failed to start: {}", err);
+            }
+        });
+    });
 }
 
 pub fn main_generate2fa() -> String {

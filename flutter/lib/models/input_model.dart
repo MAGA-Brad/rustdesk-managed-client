@@ -444,6 +444,7 @@ class InputModel {
 
   bool _pointerMovedAfterEnter = false;
   bool _pointerInsideImage = false;
+  Timer? _peerControlPriorityTimer;
 
   // mouse
   final isPhysicalMouse = false.obs;
@@ -738,6 +739,10 @@ class InputModel {
   KeyEventResult handleRawKeyEvent(RawKeyEvent e) {
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
+    if (e is RawKeyDownEvent &&
+        (parent.target?.cursorModel.isPeerControlProtected ?? false)) {
+      return KeyEventResult.handled;
+    }
     if (!isInputSourceFlutter) {
       if (isDesktop) {
         return KeyEventResult.handled;
@@ -823,6 +828,10 @@ class InputModel {
   KeyEventResult handleKeyEvent(KeyEvent e) {
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
+    if ((e is KeyDownEvent || e is KeyRepeatEvent) &&
+        (parent.target?.cursorModel.isPeerControlProtected ?? false)) {
+      return KeyEventResult.handled;
+    }
     if (!isInputSourceFlutter) {
       if (isDesktop) {
         return KeyEventResult.handled;
@@ -1135,6 +1144,33 @@ class InputModel {
     await _sendMouseUnchecked(type, button);
   }
 
+  void onPeerMouseActivity() {
+    final firstActivity = _peerControlPriorityTimer == null;
+    _peerControlPriorityTimer?.cancel();
+
+    if (firstActivity) {
+      toReleaseKeys.release(handleKeyEvent);
+      toReleaseRawKeys.release(handleRawKeyEvent);
+      resetModifiers();
+      if (!isInputSourceFlutter) {
+        bind.sessionEnterOrLeave(sessionId: sessionId, enter: false);
+      }
+    }
+
+    _peerControlPriorityTimer =
+        Timer(Duration(milliseconds: kMouseControlTimeoutMSec), () {
+      _peerControlPriorityTimer = null;
+      final cursorModel = parent.target?.cursorModel;
+      if (!_pointerInsideImage ||
+          cursorModel == null ||
+          cursorModel.isPeerControlProtected ||
+          isInputSourceFlutter) {
+        return;
+      }
+      bind.sessionEnterOrLeave(sessionId: sessionId, enter: true);
+    });
+  }
+
   void enterOrLeave(bool enter) {
     toReleaseKeys.release(handleKeyEvent);
     toReleaseRawKeys.release(handleRawKeyEvent);
@@ -1156,7 +1192,10 @@ class InputModel {
     _relativeMouse.onEnterOrLeaveImage(enter);
     _flingTimer?.cancel();
     if (!isInputSourceFlutter) {
-      bind.sessionEnterOrLeave(sessionId: sessionId, enter: enter);
+      final peerProtected =
+          parent.target?.cursorModel.isPeerControlProtected ?? false;
+      bind.sessionEnterOrLeave(
+          sessionId: sessionId, enter: enter && !peerProtected);
     }
     if (!isWeb && enter) {
       bind.setCurSessionId(sessionId: sessionId);
@@ -1264,6 +1303,8 @@ class InputModel {
   }
 
   void disposeRelativeMouseMode() {
+    _peerControlPriorityTimer?.cancel();
+    _peerControlPriorityTimer = null;
     _relativeMouse.dispose();
     onRelativeMouseModeDisabled = null;
     // Cancel the relative mouse mode observer and clean up global state.
@@ -1794,15 +1835,7 @@ class InputModel {
     }
 
     if (!cursorModel.gotMouseControl) {
-      bool selfGetControl =
-          (x - lastMousePos.dx).abs() > kMouseControlDistance ||
-              (y - lastMousePos.dy).abs() > kMouseControlDistance;
-      if (selfGetControl) {
-        cursorModel.gotMouseControl = true;
-      } else {
-        lastMousePos = ui.Offset(x, y);
-        return true;
-      }
+      cursorModel.gotMouseControl = true;
     }
     lastMousePos = ui.Offset(x, y);
     return false;

@@ -342,6 +342,11 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'set_multiple_windows_session') {
         handleMultipleWindowsSession(evt, sessionId, peerId);
       } else if (name == 'peer_info') {
+        if (hasManagedPending2Fa(sessionId)) {
+          await _rejectManagedPasswordWithout2Fa(
+              sessionId, peerId, parent.target!.dialogManager);
+          return;
+        }
         handlePeerInfo(evt, peerId, false);
       } else if (name == 'sync_peer_info') {
         handleSyncPeerInfo(evt, sessionId, peerId);
@@ -895,6 +900,57 @@ class FfiModel with ChangeNotifier {
         type, title, text, dialogManager, sessionId, peerId, sessions);
   }
 
+  String _managedFriendlyNameForPeer(String peerId) {
+    if (!isWindows ||
+        bind.mainGetManagedDirectoryStatus().isEmpty ||
+        peerId.trim().isEmpty) {
+      return '';
+    }
+    try {
+      final decoded = jsonDecode(bind.mainGetManagedDirectoryStatus());
+      if (decoded is! Map<String, dynamic>) return '';
+      final devices = decoded['devices'];
+      if (devices is! List) return '';
+      for (final item in devices) {
+        if (item is! Map) continue;
+        if ((item['rustdesk_id'] ?? '').toString().trim() != peerId.trim()) {
+          continue;
+        }
+        return (item['display_name'] ?? '').toString().trim();
+      }
+    } catch (e) {
+      debugPrint('Managed close-name lookup failed for $peerId: $e');
+    }
+    return '';
+  }
+
+  Future<void> _rejectManagedPasswordWithout2Fa(SessionID sessionId,
+      String peerId, OverlayDialogManager dialogManager) async {
+    clearManagedPending2Fa(sessionId);
+    resetRestartReconnectState();
+    _cancelPendingMonitorRestore();
+    clearPermissions();
+    parent.target?.inputModel.setRelativeMouseMode(false);
+    dialogManager.dismissAll();
+
+    try {
+      await bind.sessionClose(sessionId: sessionId);
+    } catch (e, st) {
+      debugPrint('Managed 2FA fail-closed session close failed for $peerId: $e');
+      debugPrintStack(stackTrace: st);
+    }
+
+    await showMsgBox(
+      sessionId,
+      'error',
+      'Connection blocked',
+      'Managed 2FA required: the remote computer did not request or validate the 2FA code. Update the remote RustDesk client and enroll 2FA before using password access.',
+      '',
+      false,
+      dialogManager,
+    );
+  }
+
   /// Handle the message box event based on [evt] and [id].
   handleMsgBox(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
     if (parent.target == null) return;
@@ -903,6 +959,8 @@ class FfiModel with ChangeNotifier {
     final title = evt['title'];
     final text = evt['text'];
     final link = evt['link'];
+    final peerClosedManually = text is String &&
+        text.trim().toLowerCase() == 'closed manually by the peer';
 
     // Disable relative mouse mode on any error-type message to ensure cursor is released.
     // This includes connection errors, session-ending messages, elevation errors, etc.
@@ -912,12 +970,45 @@ class FfiModel with ChangeNotifier {
         type == 'restarting' ||
         (type is String && type.contains('error'))) {
       parent.target?.inputModel.setRelativeMouseMode(false);
+      clearManagedPending2Fa(sessionId);
+    }
+
+    if (peerClosedManually) {
+      clearManagedPending2Fa(sessionId);
+      resetRestartReconnectState();
+      _cancelPendingMonitorRestore();
+      clearPermissions();
+      parent.target?.inputModel.setRelativeMouseMode(false);
+
+      final managedName = _managedFriendlyNameForPeer(peerId);
+      final alias =
+          bind.mainGetPeerOptionSync(id: peerId, key: 'alias').trim();
+      final hostname = _pi.hostname.trim();
+      final username = _pi.username.trim();
+      final friendlyName = managedName.isNotEmpty
+          ? managedName
+          : (alias.isNotEmpty
+              ? alias
+              : (hostname.isNotEmpty ? hostname : username));
+      final closeText = friendlyName.isNotEmpty
+          ? 'Session with $friendlyName closed'
+          : 'Connection Closed';
+
+      // Preserve original RustDesk disconnect visuals: do not clear, fade,
+      // drop, or dispose the last remote frame before showing the message.
+      dialogManager.dismissAll();
+      showMsgBox(sessionId, 'info-nocancel', 'Connection Closed', closeText,
+          '', false, dialogManager);
+      return;
     }
 
     if (type == 're-input-password') {
+      clearManagedPending2Fa(sessionId);
       wrongPasswordDialog(sessionId, dialogManager, type, title, text);
     } else if (type == 'input-2fa') {
-      enter2FaDialog(sessionId, dialogManager);
+      if (!submitManagedPending2Fa(sessionId, dialogManager)) {
+        enter2FaDialog(sessionId, dialogManager);
+      }
     } else if (type == 'input-password') {
       enterPasswordDialog(sessionId, dialogManager);
     } else if (type == 'session-login' || type == 'session-re-login') {
@@ -2831,7 +2922,7 @@ class CursorData {
     required this.width,
     required this.height,
   })  : hotx = hotxOrigin * scale,
-        hoty = hotxOrigin * scale;
+        hoty = hotyOrigin * scale;
 
   int _doubleToInt(double v) => (v * 10e6).round().toInt();
 
@@ -3470,6 +3561,7 @@ class CursorModel with ChangeNotifier {
     if (!isConnIn2Secs()) {
       gotMouseControl = false;
       _lastPeerMouse = DateTime.now();
+      parent.target?.inputModel.onPeerMouseActivity();
     }
     _x = double.parse(evt['x']);
     _y = double.parse(evt['y']);

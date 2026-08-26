@@ -315,6 +315,9 @@ class ChatModel with ChangeNotifier {
       _isShowCMSidePage = !_isShowCMSidePage;
       notifyListeners();
     }
+    if (gFFI.serverModel.isManagedDirectoryBuild) {
+      gFFI.serverModel.noteManagedCmInteraction();
+    }
     _togglingCMSidePage = false;
   }
 
@@ -326,7 +329,7 @@ class ChatModel with ChangeNotifier {
     } else {
       peerName = parent.target?.serverModel.clients
           .firstWhereOrNull((client) => client.peerId == key.peerId)
-          ?.name;
+          ?.displayName;
     }
     if (!_messages.containsKey(key)) {
       final chatUser = ChatUser(
@@ -412,7 +415,12 @@ class ChatModel with ChangeNotifier {
         return;
       }
       if (isDesktop) {
-        windowOnTop(null);
+        if (session.serverModel.isManagedDirectoryBuild &&
+            session.serverModel.managedCmCollapsed) {
+          unawaited(session.serverModel.expandManagedCmWindow());
+        } else {
+          windowOnTop(null);
+        }
         // disable auto jumpTo other tab when hasFocus, and mark unread message
         final currentSelectedTab =
             session.serverModel.tabController.state.value.selectedTabInfo;
@@ -428,7 +436,7 @@ class ChatModel with ChangeNotifier {
           mobileUpdateUnreadSum();
         }
       }
-      chatUser = ChatUser(id: client.peerId, firstName: client.name);
+      chatUser = ChatUser(id: client.peerId, firstName: client.displayName);
     }
     insertMessage(messagekey,
         ChatMessage(text: text, user: chatUser, createdAt: DateTime.now()));

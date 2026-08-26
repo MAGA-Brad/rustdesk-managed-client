@@ -185,10 +185,23 @@ class _RemotePageState extends State<RemotePage>
     if (!isWeb) bind.pluginSyncUi(syncTo: kAppTypeDesktopRemote);
     _ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     _ffi.dialogManager.loadMobileActionsOverlayVisible();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      // Session option should be set after models.dart/FFI.start
-      _showRemoteCursor.value = bind.sessionGetToggleOptionSync(
-          sessionId: sessionId, arg: 'show-remote-cursor');
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      // Use the exact persisted option behind the existing Show Remote Cursor menu.
+      // Managed clients turn it on once for existing profiles, then read it back from
+      // the same source of truth rather than maintaining a separate UI-only default.
+      const remoteCursorOption = 'show-remote-cursor';
+      var showRemoteCursor = bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: remoteCursorOption);
+      if (isWindows &&
+          bind.mainGetManagedDirectoryStatus().isNotEmpty &&
+          !showRemoteCursor) {
+        await bind.sessionToggleOption(
+            sessionId: sessionId, value: remoteCursorOption);
+        showRemoteCursor = bind.sessionGetToggleOptionSync(
+            sessionId: sessionId, arg: remoteCursorOption);
+      }
+      if (!mounted) return;
+      _showRemoteCursor.value = showRemoteCursor;
       _zoomCursor.value = bind.sessionGetToggleOptionSync(
           sessionId: sessionId, arg: kOptionZoomCursor);
     });
@@ -273,6 +286,12 @@ class _RemotePageState extends State<RemotePage>
         selected < tabState.tabs.length &&
         tabState.tabs[selected].key == widget.id;
   }
+
+  // Every Windows requestFocus() outside enterView()'s own pointer-gated path
+  // must pass this, or a blocking dialog or an inactive tab could hand remote
+  // input to this page.
+  bool get _windowsCanFocusRemoteInput =>
+      _isSelectedTab && _blockableOverlayState.middleBlocked.isFalse;
 
   bool get _isMacOSKeyboardContextActive {
     return stateGlobal.isFocused.value && !_isWindowBlur && _isSelectedTab;
@@ -514,6 +533,16 @@ class _RemotePageState extends State<RemotePage>
       _queueMacOSKeyboardAfterFullScreen(allowHiddenLifecycle: true);
     }
 
+    // Refocus without PointerEnter: the cursor already hovers the image when
+    // focus returns (Alt+Tab, taskbar click), so enterView() never fires again
+    // and its own Windows focus handling never runs.
+    if (isWindows &&
+        _cursorOverImage.value &&
+        _windowsCanFocusRemoteInput &&
+        !_rawKeyFocusNode.hasFocus) {
+      _rawKeyFocusNode.requestFocus();
+    }
+
     // Restore relative mouse mode constraints when window regains focus.
     if (_ffi.inputModel.relativeMouseMode.value) {
       if (isMacOS) {
@@ -524,7 +553,7 @@ class _RemotePageState extends State<RemotePage>
           _cursorOverImage.value = true;
           _macOSLocalFocusLost = false;
         }
-      } else {
+      } else if (!isWindows || _windowsCanFocusRemoteInput) {
         _rawKeyFocusNode.requestFocus();
       }
       _ffi.inputModel.onWindowFocus();
@@ -836,7 +865,21 @@ class _RemotePageState extends State<RemotePage>
       _macOSLocalFocusLost = false;
       stateGlobal.getInputSource(force: true);
       _syncMacOSKeyboardGrab(reassert: true, allowInactiveLifecycle: true);
-    } else if (!isWindows) {
+    } else if (isWindows) {
+      // The remote-image pointer owns managed Windows input only while the
+      // window/tab is active and no blocking overlay is present. Do not rely
+      // on a FocusNode transition to call enterOrLeave(true): after leaving
+      // the image for the local toolbar or window edge, focus restoration may
+      // not emit another onFocusChange event.
+      if (!_isWindowBlur &&
+          _isSelectedTab &&
+          _blockableOverlayState.middleBlocked.isFalse) {
+        if (!_rawKeyFocusNode.hasFocus) {
+          _rawKeyFocusNode.requestFocus();
+        }
+        _ffi.inputModel.enterOrLeave(true);
+      }
+    } else {
       if (!_rawKeyFocusNode.hasFocus) {
         _rawKeyFocusNode.requestFocus();
       }
@@ -864,7 +907,15 @@ class _RemotePageState extends State<RemotePage>
     // See [onWindowBlur].
     if (isMacOS) {
       _syncMacOSKeyboardGrab();
-    } else if (!isWindows) {
+    } else if (isWindows) {
+      // Managed Windows uses the focus-owned input path. Release that ownership
+      // as soon as the pointer leaves the remote image so local toolbar/menu
+      // controls receive mouse buttons instead of the remote session.
+      _ffi.inputModel.enterOrLeave(false);
+      if (_rawKeyFocusNode.hasFocus) {
+        _rawKeyFocusNode.unfocus();
+      }
+    } else {
       _ffi.inputModel.enterOrLeave(false);
     }
   }
@@ -911,6 +962,19 @@ class _RemotePageState extends State<RemotePage>
           stateGlobal.getInputSource(force: true);
           _syncMacOSKeyboardGrab(
               reassert: !isInputSourceFlutter, allowInactiveLifecycle: true);
+        } else if (isWindows) {
+          // Pointer-down is a recovery path if Windows misses a MouseRegion
+          // enter transition while crossing the local toolbar or window edge.
+          // Only the real remote-image region, which has matching enter/exit
+          // callbacks, may take remote input ownership.
+          if (onEnter == null || onExit == null) return;
+          if (!_isSelectedTab || _blockableOverlayState.middleBlocked.isTrue) {
+            return;
+          }
+          if (!_rawKeyFocusNode.hasFocus) {
+            _rawKeyFocusNode.requestFocus();
+          }
+          _ffi.inputModel.enterOrLeave(true);
         } else if (!_rawKeyFocusNode.hasFocus) {
           _rawKeyFocusNode.requestFocus();
         }
@@ -945,6 +1009,7 @@ class _RemotePageState extends State<RemotePage>
                         cursorOverImage: _cursorOverImage,
                         keyboardEnabled: _keyboardEnabled,
                         remoteCursorMoved: _remoteCursorMoved,
+                        showRemoteCursor: _showRemoteCursor,
                         listenerBuilder: (child) =>
                             _buildRawTouchAndPointerRegion(
                                 child, enterView, leaveView),
@@ -1047,6 +1112,7 @@ class ImagePaint extends StatefulWidget {
   final RxBool cursorOverImage;
   final RxBool keyboardEnabled;
   final RxBool remoteCursorMoved;
+  final RxBool showRemoteCursor;
   final Widget Function(Widget)? listenerBuilder;
 
   ImagePaint(
@@ -1057,6 +1123,7 @@ class ImagePaint extends StatefulWidget {
       required this.cursorOverImage,
       required this.keyboardEnabled,
       required this.remoteCursorMoved,
+      required this.showRemoteCursor,
       this.listenerBuilder})
       : super(key: key);
 
@@ -1072,6 +1139,7 @@ class _ImagePaintState extends State<ImagePaint> {
   RxBool get cursorOverImage => widget.cursorOverImage;
   RxBool get keyboardEnabled => widget.keyboardEnabled;
   RxBool get remoteCursorMoved => widget.remoteCursorMoved;
+  RxBool get showRemoteCursor => widget.showRemoteCursor;
   Widget Function(Widget)? get listenerBuilder => widget.listenerBuilder;
 
   @override
@@ -1108,19 +1176,26 @@ class _ImagePaintState extends State<ImagePaint> {
                       : widget.ffi.inputModel.relativeMouseMode.value
                           ? SystemMouseCursors.none
                           : keyboardEnabled.isTrue
-                              ? (() {
-                                  if (remoteCursorMoved.isTrue) {
-                                    _lastRemoteCursorMoved = true;
-                                    return SystemMouseCursors.none;
-                                  } else {
-                                    if (_lastRemoteCursorMoved) {
-                                      _lastRemoteCursorMoved = false;
-                                      _firstEnterImage.value = true;
-                                    }
-                                    return _buildCustomCursor(
-                                        context, getCursorScale());
-                                  }
-                                }())
+                              ? showRemoteCursor.isTrue
+                                  // When the peer cursor is drawn separately by CursorPaint,
+                                  // never hide the initiator's own cursor just because peer
+                                  // cursor motion was received. Local and remote cursors are
+                                  // deliberately independent in this managed-client mode.
+                                  ? _buildCustomCursor(
+                                      context, getCursorScale())
+                                  : (() {
+                                      if (remoteCursorMoved.isTrue) {
+                                        _lastRemoteCursorMoved = true;
+                                        return SystemMouseCursors.none;
+                                      } else {
+                                        if (_lastRemoteCursorMoved) {
+                                          _lastRemoteCursorMoved = false;
+                                          _firstEnterImage.value = true;
+                                        }
+                                        return _buildCustomCursor(
+                                            context, getCursorScale());
+                                      }
+                                    }())
                               : _buildDisabledCursor(context, getCursorScale())
                   : MouseCursor.defer,
               onHover: (evt) {},

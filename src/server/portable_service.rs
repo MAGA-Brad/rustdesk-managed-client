@@ -796,6 +796,11 @@ pub mod server {
                                             crate::input_service::handle_key_(&evt);
                                         }
                                     }
+                                    LocalInputPriorityUntil(until_ms) => {
+                                        crate::input_service::apply_local_input_priority_until(
+                                            until_ms,
+                                        );
+                                    }
                                     _ => {}
                                 },
                                 _ => {}
@@ -1569,6 +1574,17 @@ pub mod client {
             handle_key_(evt).ok();
         } else {
             crate::input_service::handle_key_(evt);
+        }
+    }
+
+    pub fn apply_local_input_priority_until(until_ms: u64) {
+        if RUNNING.lock().unwrap().clone() {
+            ipc_send(Data::DataPortableService(
+                DataPortableService::LocalInputPriorityUntil(until_ms),
+            ))
+            .ok();
+        } else {
+            crate::input_service::apply_local_input_priority_until(until_ms);
         }
     }
 

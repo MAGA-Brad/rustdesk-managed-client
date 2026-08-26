@@ -27,6 +27,9 @@ use std::{
     time::{self, Duration, Instant},
 };
 
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicI64;
+
 #[cfg(windows)]
 use winapi::um::winuser::WHEEL_DELTA;
 
@@ -110,6 +113,9 @@ struct Input {
 }
 
 const KEY_CHAR_START: u64 = 9999;
+
+#[cfg(target_os = "windows")]
+static REMOTE_KEY_INPUT_BLOCK_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
 
 // XKB keycode for Insert key (evdev KEY_INSERT code 110 + 8 for XKB offset)
 #[cfg(target_os = "linux")]
@@ -802,6 +808,29 @@ pub fn fix_key_down_timeout_at_exit() {
     EXITING.store(true, Ordering::SeqCst);
     fix_key_down_timeout(true);
     log::info!("fix_key_down_timeout_at_exit");
+}
+
+#[cfg(target_os = "windows")]
+pub fn apply_local_input_priority_until(until_ms: u64) {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        return;
+    }
+
+    let now = get_time();
+    let until = i64::try_from(until_ms).unwrap_or(i64::MAX);
+    let previous_until = REMOTE_KEY_INPUT_BLOCK_UNTIL_MS.load(Ordering::SeqCst);
+    if until > previous_until {
+        REMOTE_KEY_INPUT_BLOCK_UNTIL_MS.store(until, Ordering::SeqCst);
+    }
+    if now >= previous_until && now < until {
+        fix_key_down_timeout(true);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn local_input_priority_blocks_remote_keys() -> bool {
+    option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+        && get_time() < REMOTE_KEY_INPUT_BLOCK_UNTIL_MS.load(Ordering::SeqCst)
 }
 
 #[inline]
@@ -2253,6 +2282,20 @@ pub fn handle_key_(evt: &KeyEvent) {
     if EXITING.load(Ordering::SeqCst) {
         return;
     }
+    #[cfg(target_os = "windows")]
+    if matches!(
+        evt.union,
+        Some(key_event::Union::ControlKey(ck)) if ck.value() == ControlKey::CtrlAltDel.value()
+    ) {
+        diag_write(&format!(
+            "handle_key_ received CtrlAltDel, priority_block={}",
+            local_input_priority_blocks_remote_keys()
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    if local_input_priority_blocks_remote_keys() {
+        return;
+    }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let mut _lock_mode_handler = None;
@@ -2314,15 +2357,41 @@ async fn lock_screen_2() {
     lock_screen().await;
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn diag_write(msg: &str) {
+    let line = format!("[{:?}] {}\n", std::time::SystemTime::now(), msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\ProgramData\\rustdesk-ctrlaltdel-diag.txt")
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 #[cfg(windows)]
 #[tokio::main(flavor = "current_thread")]
 async fn send_sas() -> ResultType<()> {
-    if crate::platform::is_physical_console_session().unwrap_or(true) {
-        let mut stream = crate::ipc::connect(1000, crate::POSTFIX_SERVICE).await?;
-        timeout(1000, stream.send(&crate::ipc::Data::SAS)).await??;
+    let is_console = crate::platform::is_physical_console_session();
+    #[cfg(target_os = "windows")]
+    diag_write(&format!("send_sas is_physical_console_session={:?}, current_pid={}", is_console, std::process::id()));
+    if is_console.unwrap_or(true) {
+        let connect_result = crate::ipc::connect(1000, crate::POSTFIX_SERVICE).await;
+        #[cfg(target_os = "windows")]
+        diag_write(&format!("send_sas connect to service ok={}", connect_result.is_ok()));
+        let mut stream = connect_result?;
+        let send_result = timeout(1000, stream.send(&crate::ipc::Data::SAS)).await;
+        #[cfg(target_os = "windows")]
+        diag_write(&format!("send_sas via service IPC result={:?}", send_result.is_ok()));
+        send_result??;
     } else {
+        #[cfg(target_os = "windows")]
+        diag_write("send_sas calling platform::send_sas directly");
         crate::platform::send_sas();
     };
+    #[cfg(target_os = "windows")]
+    diag_write("send_sas completed");
     Ok(())
 }
 

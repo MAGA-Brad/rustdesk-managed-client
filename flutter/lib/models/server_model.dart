@@ -32,6 +32,7 @@ class ServerModel with ChangeNotifier {
   bool _clipboardOk = false;
   bool _showElevation = false;
   bool hideCm = false;
+  bool _managedCmCollapsed = false;
   int _connectStatus = 0; // Rendezvous Server status
   String _verificationMethod = "";
   String _temporaryPasswordLength = "";
@@ -125,6 +126,99 @@ class ServerModel with ChangeNotifier {
   TextEditingController get serverPasswd => _serverPasswd;
 
   List<Client> get clients => _clients;
+
+  bool get isManagedDirectoryBuild =>
+      isWindows && bind.mainGetManagedDirectoryStatus().isNotEmpty;
+
+  bool get managedCmCollapsed => _managedCmCollapsed;
+
+  String _managedFriendlyNameForPeer(String peerId) {
+    if (!isManagedDirectoryBuild || peerId.trim().isEmpty) return '';
+    try {
+      final decoded = jsonDecode(bind.mainGetManagedDirectoryStatus());
+      if (decoded is! Map<String, dynamic>) return '';
+      final devices = decoded['devices'];
+      if (devices is! List) return '';
+      for (final item in devices) {
+        if (item is! Map) continue;
+        if ((item['rustdesk_id'] ?? '').toString().trim() != peerId.trim()) {
+          continue;
+        }
+        return (item['display_name'] ?? '').toString().trim();
+      }
+    } catch (e) {
+      debugPrint('Managed friendly-name lookup failed for $peerId: $e');
+    }
+    return '';
+  }
+
+  void _applyManagedFriendlyName(Client client) {
+    final friendly = _managedFriendlyNameForPeer(client.peerId);
+    if (friendly.isNotEmpty) client.managedName = friendly;
+  }
+
+  void scheduleManagedCmCollapse(
+      {Duration delay = const Duration(seconds: 4)}) {
+    if (!isManagedDirectoryBuild ||
+        !isDesktop ||
+        desktopType != DesktopType.cm ||
+        hideCm ||
+        parent.target?.chatModel.isShowCMSidePage == true ||
+        !_clients.any((c) => c.authorized && !c.disconnected)) {
+      return;
+    }
+    cmHiddenTimer?.cancel();
+    cmHiddenTimer = Timer(delay, () {
+      cmHiddenTimer = null;
+      unawaited(collapseManagedCmWindow());
+    });
+  }
+
+  void noteManagedCmInteraction() {
+    if (!isManagedDirectoryBuild || _managedCmCollapsed) return;
+    scheduleManagedCmCollapse(delay: const Duration(seconds: 10));
+  }
+
+  Future<void> collapseManagedCmWindow() async {
+    if (!isManagedDirectoryBuild ||
+        !isDesktop ||
+        desktopType != DesktopType.cm ||
+        hideCm ||
+        parent.target?.chatModel.isShowCMSidePage == true ||
+        !_clients.any((c) => c.authorized && !c.disconnected)) {
+      return;
+    }
+    if (!_managedCmCollapsed) {
+      _managedCmCollapsed = true;
+      notifyListeners();
+    }
+    await windowManager.show();
+    await windowManager.setSizeAlignment(
+        const Size(220, 72), Alignment.topRight);
+  }
+
+  Future<void> expandManagedCmWindow(
+      {bool scheduleRecollapse = true}) async {
+    if (!isManagedDirectoryBuild ||
+        !isDesktop ||
+        desktopType != DesktopType.cm) {
+      return;
+    }
+    cmHiddenTimer?.cancel();
+    cmHiddenTimer = null;
+    if (_managedCmCollapsed) {
+      _managedCmCollapsed = false;
+      notifyListeners();
+    }
+    await windowManager.show();
+    await windowManager.setSizeAlignment(
+        kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
+    await windowManager.focus();
+    await windowOnTop(null);
+    if (scheduleRecollapse) {
+      scheduleManagedCmCollapse(delay: const Duration(seconds: 10));
+    }
+  }
 
   final controller = ScrollController();
 
@@ -521,6 +615,7 @@ class ServerModel with ChangeNotifier {
     for (var clientJson in clientsJson) {
       try {
         final client = Client.fromJson(clientJson);
+        _applyManagedFriendlyName(client);
         _clients.add(client);
         _addTab(client);
       } catch (e) {
@@ -540,9 +635,21 @@ class ServerModel with ChangeNotifier {
     }
   }
 
+  void _syncClientPermissionState(Client current, Client incoming) {
+    current.keyboard = incoming.keyboard;
+    current.clipboard = incoming.clipboard;
+    current.audio = incoming.audio;
+    current.file = incoming.file;
+    current.restart = incoming.restart;
+    current.recording = incoming.recording;
+    current.blockInput = incoming.blockInput;
+    current.privacyMode = incoming.privacyMode;
+  }
+
   void addConnection(Map<String, dynamic> evt) {
     try {
       final client = Client.fromJson(jsonDecode(evt["client"]));
+      _applyManagedFriendlyName(client);
       if (client.authorized) {
         parent.target?.dialogManager.dismissByTag(getLoginDialogTag(client.id));
         final index = _clients.indexWhere((c) => c.id == client.id);
@@ -550,21 +657,36 @@ class ServerModel with ChangeNotifier {
           _clients.add(client);
         } else {
           if (_clients[index].authorized) {
-            _clients[index].privacyMode = client.privacyMode;
+            _syncClientPermissionState(_clients[index], client);
+            if (client.managedName.isNotEmpty) {
+              _clients[index].managedName = client.managedName;
+            }
+            if (isManagedDirectoryBuild && _managedCmCollapsed) {
+              unawaited(expandManagedCmWindow());
+            }
             notifyListeners();
             return;
           }
           _clients[index].authorized = true;
-          _clients[index].privacyMode = client.privacyMode;
+          _clients[index].connectedAt ??= DateTime.now();
+          _syncClientPermissionState(_clients[index], client);
+          if (client.managedName.isNotEmpty) {
+            _clients[index].managedName = client.managedName;
+          }
         }
       } else {
         final index = _clients.indexWhere((c) => c.id == client.id);
         if (index >= 0) {
-          _clients[index].privacyMode = client.privacyMode;
+          _syncClientPermissionState(_clients[index], client);
           notifyListeners();
           return;
         }
         _clients.add(client);
+      }
+      if (isManagedDirectoryBuild &&
+          !client.authorized &&
+          _managedCmCollapsed) {
+        unawaited(expandManagedCmWindow(scheduleRecollapse: false));
       }
       _addTab(client);
       // remove disconnected
@@ -589,19 +711,25 @@ class ServerModel with ChangeNotifier {
   void _addTab(Client client) {
     tabController.add(TabInfo(
         key: client.id.toString(),
-        label: client.name,
+        label: client.displayName,
         closable: false,
         onTap: () {},
         page: desktop.buildConnectionCard(client)));
     Future.delayed(Duration.zero, () async {
       if (!hideCm) windowOnTop(null);
     });
-    // Only do the hidden task when on Desktop.
+    // Preserve upstream minimization for non-managed builds. Managed builds
+    // instead collapse to a small right-edge connection tab that remains
+    // visibly present and can be reopened with one click.
     if (client.authorized && isDesktop) {
-      cmHiddenTimer = Timer(const Duration(seconds: 3), () {
-        if (!hideCm) windowManager.minimize();
-        cmHiddenTimer = null;
-      });
+      if (isManagedDirectoryBuild) {
+        scheduleManagedCmCollapse();
+      } else {
+        cmHiddenTimer = Timer(const Duration(seconds: 3), () {
+          if (!hideCm) windowManager.minimize();
+          cmHiddenTimer = null;
+        });
+      }
     }
     parent.target?.chatModel
         .updateConnIdOfKey(MessageKey(client.peerId, client.id));
@@ -700,7 +828,11 @@ class ServerModel with ChangeNotifier {
       }
       parent.target?.invokeMethod("cancel_notification", client.id);
       client.authorized = true;
+      client.connectedAt ??= DateTime.now();
       notifyListeners();
+      if (isDesktop && isManagedDirectoryBuild) {
+        scheduleManagedCmCollapse();
+      }
     } else {
       bind.cmLoginRes(connId: client.id, res: res);
       parent.target?.invokeMethod("cancel_notification", client.id);
@@ -723,6 +855,9 @@ class ServerModel with ChangeNotifier {
             tabController.remove(index);
           } else {
             _clients[index].disconnected = true;
+            if (isManagedDirectoryBuild && _managedCmCollapsed) {
+              unawaited(expandManagedCmWindow(scheduleRecollapse: false));
+            }
           }
         }
         parent.target?.dialogManager.dismissByTag(getLoginDialogTag(id));
@@ -818,6 +953,8 @@ class Client {
   bool isTerminal = false;
   String portForward = "";
   String name = "";
+  String managedName = "";
+  DateTime? connectedAt;
   String avatar = "";
   String peerId = ""; // peer user's id,show at app
   bool keyboard = false;
@@ -832,6 +969,9 @@ class Client {
   bool fromSwitch = false;
   bool inVoiceCall = false;
   bool incomingVoiceCall = false;
+
+  String get displayName =>
+      managedName.trim().isNotEmpty ? managedName.trim() : name.trim();
 
   RxInt unreadChatMessageCount = 0.obs;
 
@@ -861,6 +1001,7 @@ class Client {
     fromSwitch = json['from_switch'];
     inVoiceCall = json['in_voice_call'];
     incomingVoiceCall = json['incoming_voice_call'];
+    if (authorized) connectedAt = DateTime.now();
   }
 
   Map<String, dynamic> toJson() {

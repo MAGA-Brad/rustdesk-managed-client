@@ -289,9 +289,59 @@ pub enum DataPortableService {
     Mouse((Vec<u8>, i32, String, u32, bool, bool)),
     Pointer((Vec<u8>, i32)),
     Key(Vec<u8>),
+    LocalInputPriorityUntil(u64),
     RequestStart,
     WillClose,
     CmShowElevation(bool),
+}
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RedactedSecret(Vec<u8>);
+
+#[cfg(windows)]
+impl RedactedSecret {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value.into_bytes())
+    }
+
+    pub(crate) fn from_bytes(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn as_str(
+        &self,
+    ) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.0)
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RedactedSecret {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchSidesUuidAction {
+    Check,
+    Consume,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -334,6 +384,26 @@ pub enum Data {
     #[cfg(windows)]
     SAS,
     UserSid(Option<u32>),
+    #[cfg(windows)]
+    DirectoryEnrollment {
+        enrollment_password: RedactedSecret,
+    },
+    #[cfg(windows)]
+    DirectoryEnrollmentResult(bool, Option<String>),
+    #[cfg(windows)]
+    DirectoryStatusQuery,
+    #[cfg(windows)]
+    DirectoryStatusResult((String, String, String)),
+    #[cfg(windows)]
+    DirectoryReenrollmentRequest,
+    #[cfg(windows)]
+    DirectoryReenrollmentResult(bool),
+    #[cfg(windows)]
+    DirectoryFriendlyNameChanged(String),
+    #[cfg(windows)]
+    DirectoryContactEmailUpdateRequest(String),
+    #[cfg(windows)]
+    DirectoryContactEmailUpdateResult(bool),
     OnlineStatus(Option<(i64, bool)>),
     Config((String, Option<String>)),
     Options(Option<HashMap<String, String>>),
@@ -369,7 +439,7 @@ pub enum Data {
     SwitchSidesRequest(String),
     #[cfg(feature = "flutter")]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    SwitchSidesUuid(String, String, Option<bool>),
+    SwitchSidesUuid(String, String, SwitchSidesUuidAction, Option<bool>),
     #[cfg(feature = "flutter")]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     SwitchSidesBack,
@@ -875,6 +945,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = crate::audio_service::get_voice_call_input_device();
                 } else if name == "unlock-pin" {
                     value = Some(Config::get_unlock_pin());
+                } else if name == "2fa" {
+                    value = Some(Config::get_option("2fa"));
                 } else if name == "trusted-devices" {
                     value = Some(Config::get_trusted_devices_json());
                 } else {
@@ -907,6 +979,16 @@ async fn handle(data: Data, stream: &mut Connection) {
                     // reading back any secret.
                     let ack = if updated { "Y" } else { "N" }.to_owned();
                     allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);
+                } else if name == "2fa" {
+                    Config::set_option("2fa".to_owned(), value.clone());
+                    updated = Config::get_option("2fa") == value;
+                    let ack = if updated { "Y" } else { "N" }.to_owned();
+                    allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);
+                    if updated {
+                        log::info!("2FA state updated through dedicated IPC");
+                    } else {
+                        log::warn!("2FA state failed dedicated IPC persistence verification");
+                    }
                 } else if name == "salt" {
                     Config::set_salt(&value);
                 } else if name == "voice-call-input" {
@@ -987,14 +1069,21 @@ async fn handle(data: Data, stream: &mut Connection) {
         }
         #[cfg(feature = "flutter")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        Data::SwitchSidesUuid(uuid, id, None) => {
+        Data::SwitchSidesUuid(uuid, id, action, None) => {
             let allowed = uuid
                 .parse::<uuid::Uuid>()
-                .map(|uuid| crate::server::remove_pending_switch_sides_uuid(&id, &uuid))
+                .map(|uuid| match action {
+                    SwitchSidesUuidAction::Check => {
+                        crate::server::has_pending_switch_sides_uuid(&id, &uuid)
+                    }
+                    SwitchSidesUuidAction::Consume => {
+                        crate::server::claim_pending_switch_sides_uuid(&id, &uuid)
+                    }
+                })
                 .unwrap_or(false);
             allow_err!(
                 stream
-                    .send(&Data::SwitchSidesUuid(uuid, id, Some(allowed)))
+                    .send(&Data::SwitchSidesUuid(uuid, id, action, Some(allowed)))
                     .await
             );
         }
@@ -1779,6 +1868,42 @@ pub async fn get_option_async(key: &str) -> String {
     }
 }
 
+pub fn get_2fa_from_daemon() -> ResultType<String> {
+    let value = get_config("2fa")?.unwrap_or_default();
+    Config::set_option("2fa".to_owned(), value.clone());
+    Ok(value)
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn set_2fa_with_ack(value: String) -> ResultType<bool> {
+    let ms_timeout = 1_000;
+    let mut c = connect(ms_timeout, "").await?;
+    c.send_config("2fa", value.clone()).await?;
+    let acked = matches!(
+        c.next_timeout(ms_timeout).await?,
+        Some(Data::Config((name, Some(ack)))) if name == "2fa" && ack.trim() == "Y"
+    );
+    drop(c);
+    if !acked {
+        return Ok(false);
+    }
+
+    let daemon_value = get_config_async("2fa", ms_timeout)
+        .await?
+        .unwrap_or_default();
+    if daemon_value != value {
+        log::warn!("2FA dedicated IPC ACK did not survive daemon readback");
+        return Ok(false);
+    }
+
+    Config::set_option("2fa".to_owned(), value.clone());
+    if Config::get_option("2fa") != value {
+        log::warn!("2FA daemon state was confirmed but local mirror readback failed");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub fn set_option(key: &str, value: &str) {
     let mut options = get_options();
     if value.is_empty() {
@@ -1921,6 +2046,147 @@ pub fn close_all_instances() -> ResultType<bool> {
 
 #[cfg(windows)]
 #[tokio::main(flavor = "current_thread")]
+pub async fn send_directory_enrollment_secret(
+    enrollment_password: RedactedSecret,
+) -> ResultType<(bool, Option<String>)> {
+    let mut stream = None;
+
+    // Installation has completed, but the SCM service process may
+    // still need a few seconds before its protected IPC listener
+    // is accepting connections.
+    for _ in 0..20 {
+        match crate::ipc::connect_service(1000).await {
+            Ok(connection) => {
+                stream = Some(connection);
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(
+                    std::time::Duration::from_millis(500),
+                )
+                .await;
+            }
+        }
+    }
+
+    let Some(mut stream) = stream else {
+        return Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service IPC is unavailable"
+        ));
+    };
+
+    let message = crate::ipc::Data::DirectoryEnrollment {
+        enrollment_password,
+    };
+
+    stream.send(&message).await?;
+
+    // Zero the sender-side secret as soon as serialization/send
+    // has completed rather than retaining it while awaiting the
+    // service response.
+    drop(message);
+
+    match stream.next_timeout(30_000).await? {
+        Some(
+            crate::ipc::Data::DirectoryEnrollmentResult(
+                accepted,
+                reason,
+            ),
+        ) => Ok((accepted, reason)),
+
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no enrollment result"
+        )),
+    }
+}
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_directory_status_from_service(
+) -> ResultType<(String, String, String)> {
+    let mut stream =
+        crate::ipc::connect_service(1000).await?;
+
+    stream
+        .send(
+            &crate::ipc::Data::DirectoryStatusQuery,
+        )
+        .await?;
+
+    match stream.next_timeout(2_000).await? {
+        Some(
+            crate::ipc::Data::DirectoryStatusResult(
+                status,
+            ),
+        ) => Ok(status),
+
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no status"
+        )),
+    }
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn request_directory_reenrollment() -> ResultType<bool> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::DirectoryReenrollmentRequest)
+        .await?;
+    match stream.next_timeout(10_000).await? {
+        Some(crate::ipc::Data::DirectoryReenrollmentResult(accepted)) => {
+            Ok(accepted)
+        }
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no re-enrollment result"
+        )),
+    }
+}
+
+// Unlike friendly-name, contact-email is not synced via the heartbeat, so the
+// service must make an actual authenticated API call and report back whether
+// the server accepted it - not just a best-effort local cache refresh.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn update_directory_contact_email(
+    email: String,
+) -> ResultType<bool> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(
+            &crate::ipc::Data::DirectoryContactEmailUpdateRequest(
+                email,
+            ),
+        )
+        .await?;
+    match stream.next_timeout(10_000).await? {
+        Some(
+            crate::ipc::Data::DirectoryContactEmailUpdateResult(
+                accepted,
+            ),
+        ) => Ok(accepted),
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no email update result"
+        )),
+    }
+}
+
+// Best-effort: refreshes the service's own cached Config so its next managed
+// heartbeat picks up a friendly-name change made from this (GUI) process
+// without waiting for a service restart. No response is expected.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn notify_directory_friendly_name_changed(
+    name: String,
+) -> ResultType<()> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::DirectoryFriendlyNameChanged(name))
+        .await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
 pub async fn connect_to_user_session(usid: Option<u32>) -> ResultType<()> {
     let mut stream = crate::ipc::connect_service(1000).await?;
     timeout(1000, stream.send(&crate::ipc::Data::UserSid(usid))).await??;
@@ -2057,7 +2323,7 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
         let connect_result = timeout(timeout_ms, Endpoint::connect(&socket_path))
             .await
             .map_err(|err| {
-                anyhow::anyhow!(
+                hbb_common::anyhow::anyhow!(
                     "Timeout connecting to terminal ipc at {}: {}",
                     socket_path,
                     err
@@ -2066,7 +2332,7 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
         let connection = match connect_result {
             Ok(Ok(connection)) => connection,
             Ok(Err(err)) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Failed to connect to terminal ipc at {}: {}",
                     socket_path,
                     err
@@ -2080,7 +2346,7 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
         };
         let mut ipc_conn = ConnectionTmpl::new(connection);
         if let Err(err) = ipc_conn.send(&Data::TerminalSessionCount(0)).await {
-            last_err = Some(anyhow::anyhow!(
+            last_err = Some(hbb_common::anyhow::anyhow!(
                 "Failed to request terminal session count via ipc at {}: {}",
                 socket_path,
                 err
@@ -2092,20 +2358,20 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
                 return Ok(session_count);
             }
             Ok(None) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Invalid response when requesting terminal session count via ipc at {}",
                     socket_path
                 ));
             }
             Ok(other) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Unexpected response when requesting terminal session count via ipc at {}: {:?}",
                     socket_path,
                     other.map(|v| std::mem::discriminant(&v))
                 ));
             }
             Err(err) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Failed to read terminal session count via ipc at {}: {}",
                     socket_path,
                     err

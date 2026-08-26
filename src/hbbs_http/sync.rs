@@ -37,8 +37,10 @@ pub fn signal_receiver() -> broadcast::Receiver<Vec<i32>> {
 #[cfg(not(any(target_os = "ios")))]
 fn start_hbbs_sync() -> broadcast::Sender<Vec<i32>> {
     let (tx, _rx) = broadcast::channel::<Vec<i32>>(16);
-    std::thread::spawn(move || start_hbbs_sync_async());
-    return tx;
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        std::thread::spawn(move || start_hbbs_sync_async());
+    }
+    tx
 }
 
 #[derive(Debug, Serialize, Deserialize)]

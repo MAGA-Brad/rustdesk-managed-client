@@ -40,6 +40,7 @@ pub fn core_main() -> Option<Vec<String>> {
     }
     let mut args = Vec::new();
     let mut flutter_args = Vec::new();
+    let managed_client = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some();
     let mut i = 0;
     let mut _is_elevate = false;
     let mut _is_run_as_system = false;
@@ -51,6 +52,13 @@ pub fn core_main() -> Option<Vec<String>> {
         if i == 0 {
             arg_exe = arg;
         } else if i > 0 {
+            if managed_client
+                && ["--view-camera", "--port-forward", "--terminal", "--rdp"]
+                    .contains(&arg.as_str())
+            {
+                log::warn!("Managed policy rejected unsupported launch mode: {}", arg);
+                return None;
+            }
             #[cfg(feature = "flutter")]
             if [
                 "--connect",
@@ -260,6 +268,30 @@ pub fn core_main() -> Option<Vec<String>> {
                     log::error!("Failed to after-install: {}", err);
                 }
                 return None;
+            } else if args[0] == "--managed-enrollment-handoff" {
+                #[cfg(feature = "flutter")]
+                {
+                    let exit_code =
+                        match crate::ui_interface::
+                            run_managed_directory_enrollment_handoff_from_stdin()
+                        {
+                            Ok(true) => 0,
+                            Ok(false) => 2,
+                            Err(err) => {
+                                log::error!(
+                                    "Managed enrollment handoff process failed: {}",
+                                    err
+                                );
+                                3
+                            }
+                        };
+                    std::process::exit(exit_code);
+                }
+
+                #[cfg(not(feature = "flutter"))]
+                {
+                    return None;
+                }
             } else if args[0] == "--before-uninstall" {
                 if let Err(err) = platform::run_before_uninstall() {
                     log::error!("Failed to before-uninstall: {}", err);
@@ -702,6 +734,10 @@ pub fn core_main() -> Option<Vec<String>> {
             crate::ipc::hwcodec_process();
             return None;
         } else if args[0] == "--terminal-helper" {
+            if managed_client {
+                log::warn!("Managed policy rejected terminal helper launch");
+                return None;
+            }
             // Terminal helper process - runs as user to create ConPTY
             // This is needed because ConPTY has compatibility issues with CreateProcessAsUserW
             #[cfg(target_os = "windows")]

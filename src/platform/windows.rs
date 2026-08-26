@@ -100,7 +100,15 @@ use winreg::{enums::*, RegKey};
 mod acl;
 mod installer_handoff;
 mod installer_shell;
-pub(crate) use acl::current_process_user_sid_string;
+mod local_input_guard;
+mod protected_storage;
+pub(crate) use acl::{
+    create_machine_secret_directory,
+    current_process_user_sid_string,
+    set_path_permission_for_machine_secret,
+};
+pub(crate) use protected_storage::{protect_machine_scope, unprotect_machine_scope};
+pub(crate) use local_input_guard::local_mouse_has_priority;
 pub use acl::{
     set_path_permission, set_path_permission_for_portable_service_shmem_dir,
     set_path_permission_for_portable_service_shmem_file,
@@ -112,6 +120,11 @@ use installer_shell::{
     shortcut_bytes, validate_install_value,
 };
 
+pub(crate) fn get_program_data_dir() -> ResultType<PathBuf> {
+    installer_shell::get_known_folder(
+        &windows::Win32::UI::Shell::FOLDERID_ProgramData,
+    )
+}
 pub const FLUTTER_RUNNER_WIN32_WINDOW_CLASS: &'static str = "FLUTTER_RUNNER_WIN32_WINDOW"; // main window, install window
 pub const EXPLORER_EXE: &'static str = "explorer.exe";
 pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
@@ -690,6 +703,9 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     // Tell the system that the service is running now
     status_handle.set_service_status(next_status)?;
 
+    // Machine-scoped managed-directory state belongs to the Windows service.
+    crate::hbbs_http::directory_enrollment::start();
+
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
     let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
@@ -733,6 +749,109 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             }
                             ipc::Data::SAS => {
                                 send_sas();
+                            }
+                            ipc::Data::DirectoryEnrollment {
+                                enrollment_password,
+                            } => {
+                                let (accepted, reason) =
+                                    match enrollment_password.as_str() {
+                                        Ok(password) => {
+                                            match crate::hbbs_http::directory_enrollment::enroll_once(
+                                                password,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => (true, None),
+                                                Err(error) => {
+                                                    log::warn!(
+                                                        "Managed directory enrollment failed: {}",
+                                                        error
+                                                    );
+                                                    (false, Some(error.to_string()))
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "Managed directory enrollment secret was invalid"
+                                            );
+                                            (false, Some("Enrollment password was invalid".to_owned()))
+                                        }
+                                    };
+
+                                let _ = stream
+                                    .send(
+                                        &ipc::Data::DirectoryEnrollmentResult(
+                                            accepted,
+                                            reason,
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            ipc::Data::DirectoryReenrollmentRequest => {
+                                let accepted = match crate::hbbs_http::directory_enrollment::request_reenrollment_once().await {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Managed re-enrollment request failed: {}",
+                                            error
+                                        );
+                                        false
+                                    }
+                                };
+                                let _ = stream
+                                    .send(&ipc::Data::DirectoryReenrollmentResult(accepted))
+                                    .await;
+                            }
+                            ipc::Data::DirectoryFriendlyNameChanged(name) => {
+                                // This service process has its own Config
+                                // cache, separate from the GUI process that
+                                // sent this - refresh it so the next managed
+                                // heartbeat (built from this cache) carries
+                                // the new name.
+                                Config::set_option(
+                                    "preset-device-name".into(),
+                                    name,
+                                );
+                            }
+                            ipc::Data::DirectoryContactEmailUpdateRequest(email) => {
+                                let accepted = match crate::hbbs_http::directory_enrollment::update_contact_email_once(&email).await {
+                                    Ok(()) => {
+                                        Config::set_option(
+                                            "preset-device-email".into(),
+                                            email,
+                                        );
+                                        true
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Managed contact email update failed: {}",
+                                            error
+                                        );
+                                        false
+                                    }
+                                };
+                                let _ = stream
+                                    .send(&ipc::Data::DirectoryContactEmailUpdateResult(accepted))
+                                    .await;
+                            }
+                            ipc::Data::DirectoryStatusQuery => {
+                                let state =
+                                    crate::hbbs_http::directory_enrollment::state_key()
+                                        .to_owned();
+
+                                let text =
+                                    crate::hbbs_http::directory_enrollment::status_text();
+                                let snapshot =
+                                    crate::hbbs_http::directory_enrollment::snapshot_json();
+
+                                let _ = stream
+                                    .send(
+                                        &ipc::Data::DirectoryStatusResult(
+                                            (state, text, snapshot),
+                                        ),
+                                    )
+                                    .await;
                             }
                             ipc::Data::UserSid(usid) => {
                                 if let Some(usid) = usid {
@@ -946,6 +1065,11 @@ pub fn send_sas() {
     }
     unsafe {
         log::info!("SAS received");
+        crate::server::input_service::diag_write(&format!(
+            "platform::send_sas entered, current_pid={}, session_id={:?}",
+            std::process::id(),
+            get_current_process_session_id()
+        ));
 
         // Check and temporarily set SoftwareSASGeneration if needed
         let mut original_value: Option<u32> = None;
@@ -990,7 +1114,9 @@ pub fn send_sas() {
         }
 
         // Send SAS
+        crate::server::input_service::diag_write("calling SendSAS(FALSE) now");
         SendSAS(FALSE);
+        crate::server::input_service::diag_write("SendSAS(FALSE) call returned");
 
         // Restore original value if we changed it
         if let Some(original) = original_value {
@@ -1651,7 +1777,11 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
         );
         reg_value_start_menu_shortcuts = "1".to_owned();
     }
-    let install_printer = options.contains("printer") && is_win_10_or_greater();
+    let install_printer = if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        false
+    } else {
+        options.contains("printer") && is_win_10_or_greater()
+    };
     if install_printer {
         reg_value_printer = "1".to_owned();
     }
@@ -3585,6 +3715,60 @@ fn kill_process_by_pids(name: &str, pids: Vec<Pid>) -> ResultType<()> {
         }
     }
     Ok(())
+}
+
+// Reinstalling/upgrading over an already-installed, already-running instance
+// leaves its Windows service (and the "" main IPC pipe it owns) alive while
+// the installer is still deciding what to do - which blocks the installer's
+// own local IPC listener (used for install-time 2FA verification) from
+// binding at all, and even if it could reach the *existing* service's
+// listener instead, that service correctly refuses the connection since the
+// installer runs from a temp-extracted copy, a different executable path
+// than the already-installed one. Stopping the old service/processes first
+// removes the conflict at the source instead of working around it. Filters
+// out this process's own pid defensively - a bare double-click launch has no
+// real OS-level argv difference from the already-running main window's, so
+// the image-name+argv match below could otherwise catch the installer itself.
+pub fn stop_running_instance_before_install() {
+    // Gate on whether the service is actually running before doing anything
+    // privileged: on a genuinely fresh machine (the common case - most
+    // installs are first-time) there's nothing to stop, and this function
+    // must not trigger an extra UAC prompt for no reason.
+    if !is_self_service_running() {
+        log::info!("stop_running_instance_before_install: service is not running, nothing to do");
+        return;
+    }
+
+    // A direct, unelevated `sc stop`/process-kill from this process has no
+    // real rights against a SYSTEM-owned service or its `--service` process
+    // (confirmed empirically: `sc stop` itself returned ERROR_ACCESS_DENIED,
+    // and process enumeration couldn't even read that process's command
+    // line to find it) - this installer's main UI process is not elevated,
+    // matching how the real install step below also has to go through
+    // `run_cmds`'s UAC-elevated `runas` relaunch rather than a plain
+    // `std::process::Command`. Reuse that same established, working
+    // mechanism instead of trying to do this directly.
+    let app_name = crate::get_app_name();
+    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    let cmds = format!(
+        "
+    chcp 65001
+    sc stop {app_name}
+    taskkill /F /IM {broker_exe}
+    taskkill /F /IM {app_name}.exe{filter}
+    ",
+        broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+    );
+    if let Err(err) = run_cmds(cmds, false, "stop_running_instance") {
+        log::warn!(
+            "stop_running_instance_before_install: elevated stop failed or was declined: {}",
+            err
+        );
+    }
+
+    // Give the OS a moment to actually release the service's named pipe and
+    // any file handles before the installer tries to bind its own listener.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 pub fn handle_custom_client_staging_dir_before_update(

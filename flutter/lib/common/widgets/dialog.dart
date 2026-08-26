@@ -32,6 +32,33 @@ void clientClose(SessionID sessionId, FFI ffi) async {
   }
 }
 
+final Map<SessionID, String> _managedPending2FaCodes = <SessionID, String>{};
+
+void clearManagedPending2Fa(SessionID sessionId) {
+  _managedPending2FaCodes.remove(sessionId);
+}
+
+bool hasManagedPending2Fa(SessionID sessionId) {
+  final code = _managedPending2FaCodes[sessionId];
+  return code != null && code.isNotEmpty;
+}
+
+bool submitManagedPending2Fa(
+    SessionID sessionId, OverlayDialogManager dialogManager) {
+  final code = _managedPending2FaCodes.remove(sessionId);
+  if (code == null || code.isEmpty) {
+    return false;
+  }
+
+  gFFI.send2FA(sessionId, code, false);
+  dialogManager.dismissAll();
+  dialogManager.showLoading(
+    translate('Logging in...'),
+    onCancel: closeConnection,
+  );
+  return true;
+}
+
 abstract class ValidationRule {
   String get name;
   bool validate(String value);
@@ -977,6 +1004,16 @@ _connectDialog(
   bool canRememberAccount = true,
 }) async {
   final errUsername = ''.obs;
+  final useManagedCombined2Fa = isWindows &&
+      bind.mainGetManagedDirectoryStatus().isNotEmpty &&
+      passwordController != null &&
+      osUsernameController == null;
+  final managed2FaController =
+      useManagedCombined2Fa ? TextEditingController() : null;
+  String? managed2FaError;
+  if (useManagedCombined2Fa) {
+    clearManagedPending2Fa(sessionId);
+  }
   var rememberPassword = false;
   if (passwordController != null) {
     rememberPassword =
@@ -998,6 +1035,9 @@ _connectDialog(
   dialogManager.dismissAll();
   dialogManager.show((setState, close, context) {
     cancel() {
+      if (useManagedCombined2Fa) {
+        clearManagedPending2Fa(sessionId);
+      }
       close();
       closeConnection();
     }
@@ -1014,6 +1054,16 @@ _connectDialog(
       final osPassword = osPasswordController?.text.trim() ?? '';
       final password = passwordController?.text.trim() ?? '';
       if (passwordController != null && password.isEmpty) return;
+      if (useManagedCombined2Fa) {
+        final code = managed2FaController!.text.trim();
+        if (!RegExp(r'^\d{6}$').hasMatch(code)) {
+          setState(() {
+            managed2FaError = translate('2FA code must be 6 digits.');
+          });
+          return;
+        }
+        _managedPending2FaCodes[sessionId] = code;
+      }
       if (rememberAccount) {
         bind.sessionPeerOption(
             sessionId: sessionId, name: 'os-username', value: osUsername);
@@ -1121,6 +1171,18 @@ _connectDialog(
             controller: passwordController,
             autoFocus: osUsernameController == null,
           ),
+          if (useManagedCombined2Fa)
+            Dialog2FaField(
+              controller: managed2FaController!,
+              autoFocus: false,
+              title: translate('2FA code'),
+              errorText: managed2FaError,
+              onChanged: () {
+                if (managed2FaError != null) {
+                  setState(() => managed2FaError = null);
+                }
+              },
+            ),
           rememberWidget(
             translate('Remember password'),
             rememberPassword,
@@ -2322,6 +2384,13 @@ void change2fa({Function()? callback}) async {
   gFFI.dialogManager.show((setState, close, context) {
     onVerify() async {
       if (await bind.mainVerify2Fa(code: controller.text.trim())) {
+        if (!bind.mainHasValid2FaSync()) {
+          setState(() {
+            errorText =
+                '2FA enrollment could not be saved. Please try again.';
+          });
+          return;
+        }
         callback?.call();
         close();
       } else {
@@ -2374,6 +2443,121 @@ void change2fa({Function()? callback}) async {
   });
 }
 
+Future<bool> enroll2faForInstall() async {
+  // Verifying a 2FA code during install needs a background IPC listener
+  // that the installer's own process doesn't start on its own (unlike the
+  // normal running app/service) - without it, a correctly-typed code can
+  // never verify. Start it before generating the QR/secret.
+  await bind.installEnsureLocalIpc();
+  final new2fa = await bind.mainGenerate2Fa();
+  if (new2fa.isEmpty) {
+    return false;
+  }
+
+  final secretRegex = RegExp(r'secret=([^&]+)');
+  final secret = secretRegex.firstMatch(new2fa)?.group(1);
+  final controller = TextEditingController();
+  final completer = Completer<bool>();
+  String? errorText;
+
+  void complete(bool result) {
+    if (!completer.isCompleted) {
+      completer.complete(result);
+    }
+  }
+
+  gFFI.dialogManager.show((setState, close, context) {
+    void cancel() {
+      complete(false);
+      close();
+    }
+
+    Future<void> onVerify() async {
+      final code = controller.text.trim();
+
+      if (!RegExp(r'^\d{6}$').hasMatch(code)) {
+        setState(
+          () => errorText = translate('2FA code must be 6 digits.'),
+        );
+        return;
+      }
+
+      if (await bind.mainVerify2Fa(code: code)) {
+        if (!bind.mainHasValid2FaSync()) {
+          setState(
+            () => errorText =
+                '2FA enrollment could not be saved. Please try again.',
+          );
+          return;
+        }
+        complete(true);
+        close();
+      } else {
+        setState(() => errorText = translate('wrong-2fa-code'));
+      }
+    }
+
+    final codeField = Dialog2FaField(
+      controller: controller,
+      errorText: errorText,
+      onChanged: () => setState(() => errorText = null),
+      title: translate('Verification code'),
+      readyCallback: () {
+        onVerify();
+        setState(() {});
+      },
+    );
+
+    VoidCallback? getOnSubmit() {
+      return codeField.isReady ? onVerify : null;
+    }
+
+    return CustomAlertDialog(
+      title: const Text('Set up two-factor authentication'),
+      content: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SelectableText(
+            'Scan this QR code with Microsoft Authenticator, Google '
+            'Authenticator, Authy, or another TOTP app. Then enter the '
+            'current 6-digit code to continue installation.',
+            style: TextStyle(fontSize: 12),
+          ).marginOnly(bottom: 12),
+          SizedBox(
+            width: 180,
+            height: 180,
+            child: QrImageView(
+              backgroundColor: Colors.white,
+              data: new2fa,
+              version: QrVersions.auto,
+              size: 180,
+              gapless: false,
+            ),
+          ).marginOnly(bottom: 8),
+          const Text(
+            'Manual setup key:',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+          ),
+          SelectableText(
+            secret ?? '',
+            style: const TextStyle(fontSize: 12),
+          ).marginOnly(bottom: 12),
+          Row(children: [Expanded(child: codeField)]),
+        ],
+      ),
+      actions: [
+        dialogButton('Cancel', onPressed: cancel, isOutline: true),
+        dialogButton('Verify and continue', onPressed: getOnSubmit()),
+      ],
+      onCancel: cancel,
+    );
+  });
+
+  final result = await completer.future;
+  controller.dispose();
+  return result;
+}
+
 void enter2FaDialog(
     SessionID sessionId, OverlayDialogManager dialogManager) async {
   final controller = TextEditingController();
@@ -2419,7 +2603,8 @@ void enter2FaDialog(
         content: Column(
           children: [
             codeField,
-            if (bind.sessionGetEnableTrustedDevices(sessionId: sessionId))
+            if (bind.mainGetManagedDirectoryStatus().isEmpty &&
+                bind.sessionGetEnableTrustedDevices(sessionId: sessionId))
               trustField,
           ],
         ),

@@ -82,6 +82,14 @@ class _DesktopServerPageState extends State<DesktopServerPage>
       ],
       child: Consumer<ServerModel>(
         builder: (context, serverModel, child) {
+          if (serverModel.isManagedDirectoryBuild &&
+              serverModel.managedCmCollapsed &&
+              serverModel.clients.isNotEmpty) {
+            return Scaffold(
+              backgroundColor: Colors.transparent,
+              body: _ManagedCmCollapsedPill(serverModel: serverModel),
+            );
+          }
           final body = Scaffold(
             backgroundColor: Theme.of(context).colorScheme.background,
             body: ConnectionManager(),
@@ -103,6 +111,112 @@ class _DesktopServerPageState extends State<DesktopServerPage>
 
   @override
   bool get wantKeepAlive => true;
+}
+
+class _ManagedCmCollapsedPill extends StatelessWidget {
+  final ServerModel serverModel;
+
+  const _ManagedCmCollapsedPill({required this.serverModel});
+
+  @override
+  Widget build(BuildContext context) {
+    final client = serverModel.clients.firstWhereOrNull(
+            (c) => c.authorized && !c.disconnected) ??
+        serverModel.clients.first;
+    final name = client.displayName.isNotEmpty ? client.displayName : client.peerId;
+
+    return Padding(
+      padding: const EdgeInsets.all(5),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(18),
+          onTap: () => unawaited(serverModel.expandManagedCmWindow()),
+          child: Container(
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surface.withOpacity(0.88),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                  color: Theme.of(context).colorScheme.outline.withOpacity(0.45)),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.20),
+                  blurRadius: 6,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+            child: Row(
+              children: [
+                Container(
+                  width: 9,
+                  height: 9,
+                  decoration: const BoxDecoration(
+                    color: Colors.green,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Incoming from $name',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
+                      StreamBuilder<int>(
+                        stream: Stream<int>.periodic(
+                            const Duration(seconds: 1), (value) => value),
+                        builder: (context, snapshot) {
+                          final connectedAt =
+                              client.connectedAt ?? DateTime.now();
+                          final elapsed = DateTime.now().difference(connectedAt);
+                          return Text(
+                            '${client.peerId}  |  ${formatDurationToTime(elapsed)}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant,
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                Tooltip(
+                  message: translate('Disconnect'),
+                  child: IconButton(
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints.tightFor(
+                        width: 30, height: 30),
+                    icon: const Icon(Icons.link_off_rounded,
+                        color: Colors.redAccent, size: 19),
+                    onPressed: () {
+                      unawaited(serverModel.expandManagedCmWindow(
+                          scheduleRecollapse: false));
+                      bind.cmCloseConnection(connId: client.id);
+                    },
+                  ),
+                ),
+                const Icon(Icons.chevron_left_rounded, size: 19),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class ConnectionManager extends StatefulWidget {
@@ -152,6 +266,11 @@ class ConnectionManagerState extends State<ConnectionManager>
   void initState() {
     gFFI.serverModel.updateClientState();
     WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await windowManager.setAlwaysOnTop(true);
+      await windowManager.show();
+      await windowManager.focus();
+    });
     super.initState();
   }
 
@@ -165,6 +284,10 @@ class ConnectionManagerState extends State<ConnectionManager>
   Widget build(BuildContext context) {
     final serverModel = Provider.of<ServerModel>(context);
     pointerHandler(PointerEvent e) {
+      if (serverModel.isManagedDirectoryBuild) {
+        serverModel.noteManagedCmInteraction();
+        return;
+      }
       if (serverModel.cmHiddenTimer != null) {
         serverModel.cmHiddenTimer!.cancel();
         serverModel.cmHiddenTimer = null;
@@ -366,7 +489,7 @@ Widget buildConnectionCard(Client client) {
           ),
         )
       ],
-    ).paddingSymmetric(vertical: 4.0, horizontal: 8.0),
+    ).paddingSymmetric(vertical: 2.0, horizontal: 6.0),
   );
 }
 
@@ -452,17 +575,17 @@ class _CmHeaderState extends State<_CmHeader>
           ],
         ),
       ),
-      margin: EdgeInsets.symmetric(horizontal: 5.0, vertical: 10.0),
+      margin: EdgeInsets.symmetric(horizontal: 3.0, vertical: 5.0),
       padding: EdgeInsets.only(
-        top: 10.0,
-        bottom: 10.0,
-        left: 10.0,
-        right: 5.0,
+        top: 6.0,
+        bottom: 6.0,
+        left: 6.0,
+        right: 3.0,
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _buildClientAvatar().marginOnly(right: 10.0),
+          _buildClientAvatar().marginOnly(right: 6.0),
           Expanded(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.start,
@@ -470,11 +593,11 @@ class _CmHeaderState extends State<_CmHeader>
               children: [
                 FittedBox(
                     child: Text(
-                  client.name,
+                  'Incoming from ${client.displayName}',
                   style: TextStyle(
                     color: Colors.white,
                     fontWeight: FontWeight.bold,
-                    fontSize: 20,
+                    fontSize: 16,
                     overflow: TextOverflow.ellipsis,
                   ),
                   maxLines: 1,
@@ -482,7 +605,7 @@ class _CmHeaderState extends State<_CmHeader>
                 FittedBox(
                   child: Text(
                     "(${client.peerId})",
-                    style: TextStyle(color: Colors.white, fontSize: 14),
+                    style: TextStyle(color: Colors.white, fontSize: 12),
                   ),
                 ),
                 if (client.type_() == ClientType.terminal)
@@ -513,7 +636,7 @@ class _CmHeaderState extends State<_CmHeader>
                       style: TextStyle(color: Colors.white70, fontSize: 12),
                     ),
                   ),
-                SizedBox(height: 10.0),
+                SizedBox(height: 4.0),
                 FittedBox(
                     child: Row(
                   children: [
@@ -523,7 +646,7 @@ class _CmHeaderState extends State<_CmHeader>
                               ? translate("Disconnected")
                               : translate("Connected")
                           : "${translate("Request access to your device")}...",
-                      style: TextStyle(color: Colors.white),
+                      style: TextStyle(color: Colors.white, fontSize: 12),
                     ).marginOnly(right: 8.0),
                     if (client.authorized)
                       Obx(
@@ -531,7 +654,7 @@ class _CmHeaderState extends State<_CmHeader>
                           formatDurationToTime(
                             Duration(seconds: _time.value),
                           ),
-                          style: TextStyle(color: Colors.white),
+                          style: TextStyle(color: Colors.white, fontSize: 12),
                         ),
                       )
                   ],
@@ -570,8 +693,8 @@ class _CmHeaderState extends State<_CmHeader>
   Widget _buildClientAvatar() {
     return buildAvatarWidget(
           avatar: client.avatar,
-          size: 70,
-          borderRadius: 15,
+          size: 48,
+          borderRadius: 10,
           fallback: _buildInitialAvatar(),
         ) ??
         _buildInitialAvatar();
@@ -579,19 +702,19 @@ class _CmHeaderState extends State<_CmHeader>
 
   Widget _buildInitialAvatar() {
     return Container(
-      width: 70,
-      height: 70,
+      width: 48,
+      height: 48,
       alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: str2color(client.name),
-        borderRadius: BorderRadius.circular(15.0),
+        color: str2color(client.displayName),
+        borderRadius: BorderRadius.circular(10.0),
       ),
       child: Text(
-        client.name.isNotEmpty ? client.name[0] : '?',
+        client.displayName.isNotEmpty ? client.displayName[0] : '?',
         style: TextStyle(
           fontWeight: FontWeight.bold,
           color: Colors.white,
-          fontSize: 55,
+          fontSize: 34,
         ),
       ),
     );
@@ -620,9 +743,9 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
           color: enabled
               ? (canModify ? MyTheme.accent : MyTheme.accent.withOpacity(0.6))
               : Colors.grey[700],
-          borderRadius: BorderRadius.circular(10.0),
+          borderRadius: BorderRadius.circular(8.0),
         ),
-        padding: EdgeInsets.all(8.0),
+        padding: EdgeInsets.all(5.0),
         child: InkWell(
           onTap: canModify
               ? () =>
@@ -646,16 +769,17 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
 
   @override
   Widget build(BuildContext context) {
-    final crossAxisCount = 4;
-    final spacing = 10.0;
+    final managed = gFFI.serverModel.isManagedDirectoryBuild;
+    final crossAxisCount = managed ? 3 : 4;
+    final spacing = 6.0;
     final canModifyPermission =
         bind.mainGetBuildinOption(key: kOptionEnablePermChangeInAcceptWindow) !=
             'N';
     return Container(
       width: double.infinity,
-      height: 160.0,
-      margin: EdgeInsets.all(5.0),
-      padding: EdgeInsets.all(5.0),
+      height: 112.0,
+      margin: EdgeInsets.all(3.0),
+      padding: EdgeInsets.all(4.0),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(10.0),
         color: Theme.of(context).colorScheme.background,
@@ -673,173 +797,62 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
         children: [
           Text(
             translate("Permissions"),
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
             textAlign: TextAlign.center,
-          ).marginOnly(left: 4.0, bottom: 8.0),
+          ).marginOnly(left: 2.0, bottom: 4.0),
           Expanded(
             child: GridView.count(
               crossAxisCount: crossAxisCount,
               padding: EdgeInsets.symmetric(horizontal: spacing),
               mainAxisSpacing: spacing,
               crossAxisSpacing: spacing,
-              children: client.type_() == ClientType.camera
-                  ? [
-                      buildPermissionIcon(
-                        client.audio,
-                        Icons.volume_up_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "audio",
-                              enabled: enabled);
-                          setState(() {
-                            client.audio = enabled;
-                          });
-                        },
-                        translate('Enable audio'),
-                        canModify: canModifyPermission,
-                      ),
-                      buildPermissionIcon(
-                        client.recording,
-                        Icons.videocam_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "recording",
-                              enabled: enabled);
-                          setState(() {
-                            client.recording = enabled;
-                          });
-                        },
-                        translate('Enable recording session'),
-                        canModify: canModifyPermission,
-                      ),
-                    ]
-                  : [
-                      buildPermissionIcon(
-                        client.keyboard,
-                        Icons.keyboard,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "keyboard",
-                              enabled: enabled);
-                          setState(() {
-                            client.keyboard = enabled;
-                          });
-                        },
-                        translate('Enable keyboard/mouse'),
-                        canModify: canModifyPermission,
-                      ),
-                      buildPermissionIcon(
-                        client.clipboard,
-                        Icons.assignment_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "clipboard",
-                              enabled: enabled);
-                          setState(() {
-                            client.clipboard = enabled;
-                          });
-                        },
-                        translate('Enable clipboard'),
-                        canModify: canModifyPermission,
-                      ),
-                      buildPermissionIcon(
-                        client.audio,
-                        Icons.volume_up_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "audio",
-                              enabled: enabled);
-                          setState(() {
-                            client.audio = enabled;
-                          });
-                        },
-                        translate('Enable audio'),
-                        canModify: canModifyPermission,
-                      ),
-                      buildPermissionIcon(
-                        client.file,
-                        Icons.upload_file_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "file",
-                              enabled: enabled);
-                          setState(() {
-                            client.file = enabled;
-                          });
-                        },
-                        translate('Enable file copy and paste'),
-                        canModify: canModifyPermission,
-                      ),
-                      buildPermissionIcon(
-                        client.restart,
-                        Icons.restart_alt_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "restart",
-                              enabled: enabled);
-                          setState(() {
-                            client.restart = enabled;
-                          });
-                        },
-                        translate('Enable remote restart'),
-                        canModify: canModifyPermission,
-                      ),
-                      buildPermissionIcon(
-                        client.recording,
-                        Icons.videocam_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "recording",
-                              enabled: enabled);
-                          setState(() {
-                            client.recording = enabled;
-                          });
-                        },
-                        translate('Enable recording session'),
-                        canModify: canModifyPermission,
-                      ),
-                      // only windows support block input
-                      if (isWindows)
-                        buildPermissionIcon(
-                          client.blockInput,
-                          Icons.block,
-                          (enabled) {
-                            bind.cmSwitchPermission(
-                                connId: client.id,
-                                name: "block_input",
-                                enabled: enabled);
-                            setState(() {
-                              client.blockInput = enabled;
-                            });
-                          },
-                          translate('Enable blocking user input'),
-                          canModify: canModifyPermission,
-                        ),
-                      if (bind.mainSupportedPrivacyModeImpls() != '[]')
-                        buildPermissionIcon(
-                          client.privacyMode,
-                          Icons.visibility_off,
-                          (enabled) {
-                            bind.cmSwitchPermission(
-                                connId: client.id,
-                                name: "privacy_mode",
-                                enabled: enabled);
-                            setState(() {
-                              client.privacyMode = enabled;
-                            });
-                          },
-                          translate('Enable privacy mode'),
-                          canModify: canModifyPermission,
-                        )
-                    ],
+              children: [
+                buildPermissionIcon(
+                  client.keyboard,
+                  Icons.keyboard,
+                  (enabled) {
+                    bind.cmSwitchPermission(
+                        connId: client.id, name: "keyboard", enabled: enabled);
+                    setState(() => client.keyboard = enabled);
+                  },
+                  translate('Enable keyboard/mouse'),
+                  canModify: canModifyPermission,
+                ),
+                buildPermissionIcon(
+                  client.clipboard,
+                  Icons.assignment_rounded,
+                  (enabled) {
+                    bind.cmSwitchPermission(
+                        connId: client.id, name: "clipboard", enabled: enabled);
+                    setState(() => client.clipboard = enabled);
+                  },
+                  translate('Enable clipboard'),
+                  canModify: canModifyPermission,
+                ),
+                buildPermissionIcon(
+                  client.file,
+                  Icons.upload_file_rounded,
+                  (enabled) {
+                    bind.cmSwitchPermission(
+                        connId: client.id, name: "file", enabled: enabled);
+                    setState(() => client.file = enabled);
+                  },
+                  translate('Enable file copy and paste'),
+                  canModify: canModifyPermission,
+                ),
+                if (!managed)
+                  buildPermissionIcon(
+                    client.restart,
+                    Icons.restart_alt_rounded,
+                    (enabled) {
+                      bind.cmSwitchPermission(
+                          connId: client.id, name: "restart", enabled: enabled);
+                      setState(() => client.restart = enabled);
+                    },
+                    translate('Enable remote restart'),
+                    canModify: canModifyPermission,
+                  ),
+              ],
             ),
           ),
         ],
@@ -874,7 +887,7 @@ class _CmControlPanel extends StatelessWidget {
       mainAxisAlignment: MainAxisAlignment.end,
       children: [
         Offstage(
-          offstage: !client.inVoiceCall,
+          offstage: true,
           child: Row(
             children: [
               Expanded(
@@ -960,7 +973,7 @@ class _CmControlPanel extends StatelessWidget {
           ),
         ),
         Offstage(
-          offstage: !client.incomingVoiceCall,
+          offstage: true,
           child: Row(
             children: [
               Expanded(
@@ -1008,7 +1021,6 @@ class _CmControlPanel extends StatelessWidget {
             color: MyTheme.accent,
             onClick: () {
               handleElevate(context);
-              windowManager.minimize();
             },
             icon: Icon(
               Icons.security_rounded,
@@ -1068,7 +1080,6 @@ class _CmControlPanel extends StatelessWidget {
           child: buildButton(context, color: Colors.green[700], onClick: () {
             handleAccept(context);
             handleElevate(context);
-            windowManager.minimize();
           },
               text: 'Accept and Elevate',
               icon: Icon(
@@ -1091,8 +1102,7 @@ class _CmControlPanel extends StatelessWidget {
                       color: MyTheme.accent,
                       onClick: () {
                         handleAccept(context);
-                        windowManager.minimize();
-                      },
+                                },
                       text: 'Accept',
                       textColor: Colors.white,
                     ),
@@ -1225,8 +1235,7 @@ void checkClickTime(int id, Function() callback) async {
 }
 
 bool allowRemoteCMModification() {
-  return option2bool(kOptionAllowRemoteCmModification,
-      bind.mainGetLocalOption(key: kOptionAllowRemoteCmModification));
+  return false;
 }
 
 class _FileTransferLogPage extends StatefulWidget {

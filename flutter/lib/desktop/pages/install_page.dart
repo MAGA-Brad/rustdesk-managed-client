@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -53,6 +54,20 @@ class _InstallPageState extends State<InstallPage> {
   }
 }
 
+class _InstallSetupData {
+  const _InstallSetupData({
+    required this.serverEnrollmentPassword,
+    required this.friendlyName,
+    required this.contactEmail,
+    required this.password,
+  });
+
+  final String serverEnrollmentPassword;
+  final String friendlyName;
+  final String contactEmail;
+  final String password;
+}
+
 class _InstallPageBody extends StatefulWidget {
   const _InstallPageBody({Key? key}) : super(key: key);
 
@@ -92,6 +107,7 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   @override
   void dispose() {
     windowManager.removeListener(this);
+    controller.dispose();
     super.dispose();
   }
 
@@ -250,18 +266,232 @@ class _InstallPageBodyState extends State<_InstallPageBody>
         ));
   }
 
-  void install() {
-    do_install() {
-      btnEnabled.value = false;
-      showProgress.value = true;
-      String args = '';
-      if (startmenu.value) args += ' startmenu';
-      if (desktopicon.value) args += ' desktopicon';
-      if (printer.value) args += ' printer';
-      bind.installInstallMe(options: args, path: controller.text);
+  Future<_InstallSetupData?> _showInstallSetupDialog() async {
+    final serverEnrollmentPasswordController = TextEditingController();
+    final friendlyNameController = TextEditingController();
+    final contactEmailController = TextEditingController();
+    final passwordController = TextEditingController();
+    final confirmPasswordController = TextEditingController();
+    final emailRegex = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+    String? errorText;
+
+    final result = await showDialog<_InstallSetupData>(
+      context: this.context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            void clearError() {
+              if (errorText != null) {
+                setDialogState(() => errorText = null);
+              }
+            }
+
+            void submit() {
+              final serverEnrollmentPassword =
+                  serverEnrollmentPasswordController.text;
+              final friendlyName = friendlyNameController.text.trim();
+              final contactEmail = contactEmailController.text.trim();
+              final password = passwordController.text;
+              final confirmPassword = confirmPasswordController.text;
+
+              String? validationError;
+
+              if (serverEnrollmentPassword.isEmpty) {
+                validationError = 'Server Enrollment Password is required.';
+              } else if (!bind.installValidateAuthorizationPassword(
+                password: serverEnrollmentPassword,
+              )) {
+                validationError =
+                    'The Server Enrollment Password is incorrect.';
+              } else if (friendlyName.isEmpty) {
+                validationError = 'A friendly computer name is required.';
+              } else if (contactEmail.isEmpty) {
+                validationError = 'An email address is required.';
+              } else if (!emailRegex.hasMatch(contactEmail)) {
+                validationError = 'Enter a valid email address.';
+              } else if (password.isEmpty != confirmPassword.isEmpty) {
+                validationError =
+                    'Enter the local access password in both fields, or leave both blank.';
+              } else if (password.isNotEmpty && password.length < 8) {
+                validationError =
+                    'The local access password must be at least 8 characters.';
+              } else if (password != confirmPassword) {
+                validationError = 'The local access passwords do not match.';
+              }
+
+              if (validationError != null) {
+                setDialogState(() => errorText = validationError);
+                return;
+              }
+
+              Navigator.of(dialogContext).pop(
+                _InstallSetupData(
+                  serverEnrollmentPassword: serverEnrollmentPassword,
+                  friendlyName: friendlyName,
+                  contactEmail: contactEmail,
+                  password: password,
+                ),
+              );
+            }
+
+            return AlertDialog(
+              title: const Text('Computer setup'),
+              content: SizedBox(
+                width: 460,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextField(
+                        controller: serverEnrollmentPasswordController,
+                        obscureText: true,
+                        autofocus: true,
+                        textInputAction: TextInputAction.next,
+                        onChanged: (_) => clearError(),
+                        decoration: const InputDecoration(
+                          labelText: 'Server Enrollment Password',
+                          helperText:
+                              'Authorizes this installer and enrolls this computer with the managed server.',
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: friendlyNameController,
+                        textInputAction: TextInputAction.next,
+                        onChanged: (_) => clearError(),
+                        decoration: const InputDecoration(
+                          labelText: 'Friendly computer name',
+                          hintText: 'Example: Office-PC-01',
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: contactEmailController,
+                        textInputAction: TextInputAction.next,
+                        onChanged: (_) => clearError(),
+                        decoration: const InputDecoration(
+                          labelText: 'Email address',
+                          hintText: 'Example: you@company.com',
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: passwordController,
+                        obscureText: true,
+                        textInputAction: TextInputAction.next,
+                        onChanged: (_) => clearError(),
+                        decoration: const InputDecoration(
+                          labelText: 'Local access password  optional',
+                          helperText:
+                              'Minimum 8 characters. A password requires 2FA setup.',
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: confirmPasswordController,
+                        obscureText: true,
+                        textInputAction: TextInputAction.done,
+                        onChanged: (_) => clearError(),
+                        onSubmitted: (_) => submit(),
+                        decoration: const InputDecoration(
+                          labelText: 'Confirm local access password',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Leave both local password fields blank to require local approval for connections.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                      if (errorText != null) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          errorText!,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: submit,
+                  child: const Text('Continue'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    serverEnrollmentPasswordController.dispose();
+    friendlyNameController.dispose();
+    contactEmailController.dispose();
+    passwordController.dispose();
+    confirmPasswordController.dispose();
+
+    return result;
+  }
+
+  Future<void> install() async {
+    final setup = await _showInstallSetupDialog();
+    if (setup == null) {
+      return;
     }
 
-    do_install();
+    // Close any already-installed/running instance first - besides being
+    // needed for a clean file copy on reinstall, this also frees up the
+    // local IPC channel that install-time 2FA verification (below) needs;
+    // an old instance left running would otherwise still own it.
+    await bind.installStopRunningInstance();
+
+    if (setup.password.isNotEmpty) {
+      // Set the friendly name locally now (installInstallMe below sets the
+      // same value again once the actual install runs) so the 2FA QR code
+      // generated next labels itself with it instead of the numeric ID.
+      await bind.mainSetOption(
+        key: 'preset-device-name',
+        value: setup.friendlyName,
+      );
+      final enrolled = await enroll2faForInstall();
+      if (!enrolled) {
+        showToast(
+          'Two-factor authentication was not verified. Installation did not start.',
+        );
+        return;
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    btnEnabled.value = false;
+    showProgress.value = true;
+
+    String args = '';
+    if (startmenu.value) args += ' startmenu';
+    if (desktopicon.value) args += ' desktopicon';
+    if (printer.value) args += ' printer';
+
+    await bind.installInstallMe(
+      options: args,
+      path: controller.text,
+      friendlyName: setup.friendlyName,
+      contactEmail: setup.contactEmail,
+      password: setup.password,
+      authorizationPassword: setup.serverEnrollmentPassword,
+      enrollmentPassword: setup.serverEnrollmentPassword,
+    );
   }
 
   void selectInstallPath() async {

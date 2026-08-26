@@ -54,6 +54,8 @@ serde_repr = "0.1"
 cfg-if = "1.0"
 lazy_static = "1.4"
 sha2 = "0.10"
+pbkdf2 = "0.11"
+hmac = "0.12"
 repng = "0.2"
 parity-tokio-ipc = { git = "https://github.com/rustdesk-org/parity-tokio-ipc" }
 magnum-opus = { git = "https://github.com/rustdesk-org/magnum-opus" }
@@ -105,6 +107,10 @@ qrcode-generator = "4.1"
 winapi = { version = "0.3", features = [
     "winuser",
     "wincrypt",
+    "dpapi",
+    "sddl",
+    "minwinbase",
+    "fileapi",
     "shellscalingapi",
     "pdh",
     "synchapi",

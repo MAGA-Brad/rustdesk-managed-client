@@ -65,21 +65,8 @@ class DesktopSettingPage extends StatefulWidget {
   final SettingsTabKey initialTabkey;
   static final List<SettingsTabKey> tabKeys = [
     SettingsTabKey.general,
-    if (!isWeb &&
-        !bind.isOutgoingOnly() &&
-        !bind.isDisableSettings() &&
-        bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) != 'Y')
-      SettingsTabKey.safety,
-    if (!bind.isDisableSettings() &&
-        bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) != 'Y')
-      SettingsTabKey.network,
-    if (!bind.isIncomingOnly()) SettingsTabKey.display,
-    if (!isWeb && !bind.isIncomingOnly() && bind.pluginFeatureIsEnabled())
-      SettingsTabKey.plugin,
-    if (!bind.isDisableAccount()) SettingsTabKey.account,
-    if (isWindows &&
-        bind.mainGetBuildinOption(key: kOptionHideRemotePrinterSetting) != 'Y')
-      SettingsTabKey.printer,
+    SettingsTabKey.safety,
+    SettingsTabKey.display,
     SettingsTabKey.about,
   ];
 
@@ -419,8 +406,6 @@ class _GeneralState extends State<_General> {
         theme(),
         _Card(title: 'Language', children: [language()]),
         if (!isWeb) hwcodec(),
-        if (!isWeb) audio(context),
-        if (!isWeb) record(context),
         if (!isWeb) WaylandCard(),
         other()
       ],
@@ -485,8 +470,6 @@ class _GeneralState extends State<_General> {
   Widget other() {
     final incomingOnly = bind.isIncomingOnly();
     final outgoingOnly = bind.isOutgoingOnly();
-    final showAutoUpdate = (isWindows && bind.mainIsInstalled()) ||
-    (isMacOS && bind.mainIsInstalled() && bind.mainIsInstalledDaemon(prompt: false) && !bind.isCustomClient());
     final children = <Widget>[
       if (!isWeb && !incomingOnly)
         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
@@ -534,51 +517,13 @@ class _GeneralState extends State<_General> {
                   await bind.mainSetLocalOption(key: k, value: v ? 'Y' : 'N'),
             ),
           ),
-        if (isWindows)
-          Tooltip(
-            message: translate('d3d_render_tip'),
-            child: _OptionCheckBox(
-              context,
-              "Use D3D rendering",
-              kOptionD3DRender,
-              isServer: false,
-            ),
-          ),
       ],
-      if (!isWeb && !bind.isCustomClient())
-        _OptionCheckBox(
-          context,
-          'Check for software update on startup',
-          kOptionEnableCheckUpdate,
-          isServer: false,
-        ),
-      if (showAutoUpdate)
-        _OptionCheckBox(
-          context,
-          'Auto update',
-          kOptionAllowAutoUpdate,
-          isServer: true,
-        ),
       if (isWindows && !outgoingOnly)
         _OptionCheckBox(
           context,
           'Capture screen using DirectX',
           kOptionDirectxCapture,
         ),
-      if (!isWeb && !incomingOnly) ...[
-        _OptionCheckBox(
-          context,
-          'Enable UDP hole punching',
-          kOptionEnableUdpPunch,
-          isServer: false,
-        ),
-        _OptionCheckBox(
-          context,
-          'Enable IPv6 P2P connection',
-          kOptionEnableIpv6Punch,
-          isServer: false,
-        ),
-      ],
     ];
 
     // Add client-side wakelock option for desktop platforms
@@ -900,7 +845,21 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                 permissions(context),
                 password(context),
                 _Card(title: '2FA', children: [tfa()]),
-                if (!isChangeIdDisabled())
+                if (isWindows &&
+                    bind.mainGetManagedDirectoryStatus().isNotEmpty)
+                  _Card(
+                      title: 'Computer Friendly Name',
+                      children: [friendlyName()]),
+                if (isWindows &&
+                    bind.mainGetManagedDirectoryStatus().isNotEmpty)
+                  _Card(
+                      title: 'Contact Email', children: [contactEmail()]),
+                if (isWindows &&
+                    bind.mainGetManagedDirectoryStatus().isNotEmpty)
+                  _Card(
+                      title: 'Local Input Priority',
+                      children: [localInputPriority()]),
+                if (!isWindows && !isChangeIdDisabled())
                   _Card(title: 'ID', children: [changeId()]),
                 more(context),
               ]),
@@ -913,8 +872,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     bool enabled = !locked;
     // Simple temp wrapper for PR check
     tmpWrapper() {
+      final managedClient = bind.mainGetManagedDirectoryStatus().isNotEmpty;
       RxBool has2fa = bind.mainHasValid2FaSync().obs;
-      RxBool hasBot = bind.mainHasValidBotSync().obs;
       update() async {
         has2fa.value = bind.mainHasValid2FaSync();
         setState(() {});
@@ -944,7 +903,20 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                     translate('enable-2fa-title'),
                     style:
                         TextStyle(color: disabledTextColor(context, enabled)),
-                  ))
+                  )),
+                  if (bind.mainGetManagedDirectoryStatus().isNotEmpty)
+                    Text(
+                      has2fa.value
+                          ? 'Enrolled'
+                          : 'Required before permanent password',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: has2fa.value
+                            ? Colors.green[700]
+                            : Colors.orange[800],
+                      ),
+                    )
                 ],
               )),
         ),
@@ -952,9 +924,10 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           onChanged(!has2fa.value);
         },
       ).marginOnly(left: _kCheckBoxLeftMargin);
-      if (!has2fa.value) {
+      if (!has2fa.value || managedClient) {
         return tfa;
       }
+      RxBool hasBot = bind.mainHasValidBotSync().obs;
       updateBot() async {
         hasBot.value = bind.mainHasValidBotSync();
         setState(() {});
@@ -1021,7 +994,11 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       ).marginOnly(left: 30);
 
       return Column(
-        children: [tfa, bot, trust],
+        children: [
+          tfa,
+          bot,
+          if (bind.mainGetManagedDirectoryStatus().isEmpty) trust,
+        ],
       );
     }
 
@@ -1068,63 +1045,16 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       }
 
       return _Card(title: 'Permissions', children: [
-        ComboBox(
-            keys: [
-              defaultOptionAccessMode,
-              'full',
-              'view',
-            ],
-            values: [
-              translate('Custom'),
-              translate('Full Access'),
-              translate('Screen Share'),
-            ],
-            enabled: enabled && !isOptionFixed(kOptionAccessMode),
-            initialKey: initialKey,
-            onChanged: (mode) async {
-              await bind.mainSetOption(key: kOptionAccessMode, value: mode);
-              setState(() {});
-            }).marginOnly(left: _kContentHMargin),
         Column(
           children: [
             _OptionCheckBox(
                 context, 'Enable keyboard/mouse', kOptionEnableKeyboard,
-                enabled: enabled, fakeValue: fakeValue),
-            if (isWindows)
-              _OptionCheckBox(
-                  context, 'Enable remote printer', kOptionEnableRemotePrinter,
-                  enabled: enabled, fakeValue: fakeValue),
+                enabled: enabled),
             _OptionCheckBox(context, 'Enable clipboard', kOptionEnableClipboard,
-                enabled: enabled, fakeValue: fakeValue),
+                enabled: enabled),
             _OptionCheckBox(
                 context, 'Enable file transfer', kOptionEnableFileTransfer,
-                enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(context, 'Enable audio', kOptionEnableAudio,
-                enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(context, 'Enable camera', kOptionEnableCamera,
-                enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
-                enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(
-                context, 'Enable TCP tunneling', kOptionEnableTunnel,
-                enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(
-                context, 'Enable remote restart', kOptionEnableRemoteRestart,
-                enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(
-                context, 'Enable recording session', kOptionEnableRecordSession,
-                enabled: enabled, fakeValue: fakeValue),
-            if (isWindows)
-              _OptionCheckBox(context, 'Enable blocking user input',
-                  kOptionEnableBlockInput,
-                  enabled: enabled, fakeValue: fakeValue),
-            if (bind.mainSupportedPrivacyModeImpls() != '[]')
-              _OptionCheckBox(
-                  context, 'Enable privacy mode', kOptionEnablePrivacyMode,
-                  enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(context, 'Enable remote configuration modification',
-                kOptionAllowRemoteConfigModification,
-                enabled: enabled, fakeValue: fakeValue),
+                enabled: enabled),
           ],
         ),
       ]);
@@ -1176,7 +1106,10 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                                 await callback();
                                 return;
                               }
-                              setPasswordDialog(notEmptyCallback: callback);
+                              setPasswordDialog(
+                                notEmptyCallback: callback,
+                                managed2FaStateChanged: () => setState(() {}),
+                              );
                             } else {
                               await callback();
                             }
@@ -1281,8 +1214,13 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             if (usePassword) numericOneTimePassword,
             if (usePassword) radios[1],
             if (usePassword && !isChangePermanentPasswordDisabled())
-              _SubButton('Set permanent password', setPasswordDialog,
-                  permEnabled && !locked),
+              _SubButton(
+                'Set permanent password',
+                () => setPasswordDialog(
+                  managed2FaStateChanged: () => setState(() {}),
+                ),
+                permEnabled && !locked,
+              ),
             // if (usePassword)
             //   hide_cm(!locked).marginOnly(left: _kContentHSubMargin - 6),
             if (usePassword) radios[2],
@@ -1293,20 +1231,10 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   Widget more(BuildContext context) {
     bool enabled = !locked;
     return _Card(title: 'Security', children: [
-      shareRdp(context, enabled),
-      _OptionCheckBox(context, 'Deny LAN discovery', 'enable-lan-discovery',
-          reverse: true, enabled: enabled),
-      ...directIp(context),
-      whitelist(),
-      idWhitelist(),
       ...autoDisconnect(context),
       _OptionCheckBox(context, 'keep-awake-during-incoming-sessions-label',
           kOptionKeepAwakeDuringIncomingSessions,
           reverse: false, enabled: enabled),
-      if (bind.mainIsInstalled())
-        _OptionCheckBox(context, 'allow-only-conn-window-open-tip',
-            'allow-only-conn-window-open',
-            reverse: false, enabled: enabled),
       if (bind.mainIsInstalled() && !isUnlockPinDisabled()) unlockPin()
     ]);
   }
@@ -1335,6 +1263,126 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             ],
           ).marginOnly(left: _kCheckBoxLeftMargin),
           onTap: enabled ? () => onChanged(!value) : null),
+    );
+  }
+
+  Widget friendlyName() {
+    bool enabled = !locked;
+    TextEditingController controller = TextEditingController();
+    RxBool applyEnabled = false.obs;
+    controller.text = bind.mainGetOptionSync(key: 'preset-device-name');
+    return _SubLabeledWidget(
+      context,
+      'Computer Name',
+      Row(children: [
+        SizedBox(
+          width: 200,
+          child: TextField(
+            controller: controller,
+            enabled: enabled,
+            onChanged: (_) => applyEnabled.value = true,
+            decoration: const InputDecoration(
+              contentPadding:
+                  EdgeInsets.symmetric(vertical: 12, horizontal: 12),
+            ),
+          ).workaroundFreezeLinuxMint().marginOnly(right: 15),
+        ),
+        Obx(() => ElevatedButton(
+              onPressed: applyEnabled.value && enabled
+                  ? () async {
+                      final name = controller.text.trim();
+                      if (name.isEmpty) return;
+                      applyEnabled.value = false;
+                      // Local write only; the already-running managed heartbeat
+                      // picks this up and syncs it to the server's directory
+                      // within its next cycle (~1s while approved) - no direct
+                      // network call needed here.
+                      await bind.mainSetOption(
+                          key: 'preset-device-name', value: name);
+                    }
+                  : null,
+              child: Text(translate('Apply')),
+            )),
+      ]),
+      enabled: enabled,
+    );
+  }
+
+  Widget contactEmail() {
+    bool enabled = !locked;
+    TextEditingController controller = TextEditingController();
+    RxBool applyEnabled = false.obs;
+    RxBool applying = false.obs;
+    final emailRegex = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+    controller.text = bind.mainGetOptionSync(key: 'preset-device-email');
+    return _SubLabeledWidget(
+      context,
+      'Email',
+      Row(children: [
+        SizedBox(
+          width: 200,
+          child: TextField(
+            controller: controller,
+            enabled: enabled,
+            onChanged: (_) => applyEnabled.value = true,
+            decoration: const InputDecoration(
+              contentPadding:
+                  EdgeInsets.symmetric(vertical: 12, horizontal: 12),
+            ),
+          ).workaroundFreezeLinuxMint().marginOnly(right: 15),
+        ),
+        Obx(() => ElevatedButton(
+              onPressed: applyEnabled.value && enabled && !applying.value
+                  ? () async {
+                      final email = controller.text.trim();
+                      if (email.isEmpty || !emailRegex.hasMatch(email)) {
+                        showToast('Enter a valid email address.');
+                        return;
+                      }
+                      applyEnabled.value = false;
+                      applying.value = true;
+                      // Unlike Computer Friendly Name, contact email is not
+                      // synced via the heartbeat - this makes a direct,
+                      // authenticated call to the server and waits for it
+                      // to confirm the change was accepted.
+                      await bind.mainSetOption(
+                          key: 'managed-update-contact-email', value: email);
+                      applying.value = false;
+                    }
+                  : null,
+              child: Text(translate('Apply')),
+            )),
+      ]),
+      enabled: enabled,
+    );
+  }
+
+  Widget localInputPriority() {
+    bool enabled = !locked;
+    const optionKey = 'managed-local-input-priority-ms';
+    const defaultMs = '2000';
+    final keys = ['1000', '2000', '3000', '4000', '5000'];
+    final values = ['1 second', '2 seconds', '3 seconds', '4 seconds', '5 seconds'];
+    String currentValue = bind.mainGetOptionSync(key: optionKey);
+    if (!keys.contains(currentValue)) {
+      currentValue = defaultMs;
+    }
+    return _SubLabeledWidget(
+      context,
+      'Local input priority delay',
+      SizedBox(
+        width: 200,
+        child: ComboBox(
+          keys: keys,
+          values: values,
+          initialKey: currentValue,
+          onChanged: (key) async {
+            await bind.mainSetOption(key: optionKey, value: key);
+          },
+          enabled: enabled,
+        ),
+      ).marginOnly(right: 15),
+      enabled: enabled,
     );
   }
 
@@ -1853,7 +1901,6 @@ class _DisplayState extends State<_Display> {
       imageQuality(context),
       codec(context),
       if (isDesktop) trackpadSpeed(context),
-      if (!isWeb) privacyModeImpl(context),
       other(context),
     ]).marginOnly(bottom: _kListViewBottomMargin);
   }
@@ -2105,8 +2152,11 @@ class _DisplayState extends State<_Display> {
   }
 
   Widget other(BuildContext context) {
-    final children =
-        otherDefaultSettings().map((e) => otherRow(e.$1, e.$2)).toList();
+    final children = otherDefaultSettings()
+        .where((e) => !(isWindows &&
+            (e.$2 == kOptionPrivacyMode || e.$2 == kOptionI444)))
+        .map((e) => otherRow(e.$1, e.$2))
+        .toList();
     return _Card(title: 'Other Default Options', children: children);
   }
 }
