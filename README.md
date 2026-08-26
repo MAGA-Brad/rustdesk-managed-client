@@ -1,3 +1,15 @@
+> **This is a fork of [rustdesk/rustdesk](https://github.com/rustdesk/rustdesk)**, the open-source
+> RustDesk remote desktop client (AGPL-3.0). Full credit for the base client goes to the RustDesk
+> team and its contributors — this fork adds a managed-fleet layer on top: server-managed device
+> enrollment/directory sync, mandatory 2FA for the admin/management API, a local-input-priority
+> guard so a physically-present user always wins over a remote session, and Windows
+> installer/service hardening. It also depends on a sanitized fork of
+> [rustdesk/hbb_common](https://github.com/MAGA-Brad/hbb_common) as a submodule.
+>
+> Everything below this notice is the upstream RustDesk project's own README, unmodified.
+
+---
+
 <p align="center">
   <img src="res/logo-header.svg" alt="RustDesk - Your remote desktop"><br>
   <a href="#raw-steps-to-build">Build</a> •
