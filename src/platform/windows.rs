@@ -631,37 +631,6 @@ fn resolve_expected_active_session_id_for_service(session_id: u32) -> Option<u32
     }
 }
 
-#[inline]
-fn authorize_service_scoped_ipc_connection(
-    stream: &ipc::Connection,
-    expected_active_session_id: Option<u32>,
-) -> bool {
-    let (authorized, peer_pid, peer_session_id, peer_is_system) =
-        stream.service_authorization_status_for_session(expected_active_session_id);
-    if !authorized {
-        ipc::log_rejected_windows_ipc_connection(
-            crate::POSTFIX_SERVICE,
-            peer_pid,
-            peer_session_id,
-            expected_active_session_id,
-            peer_is_system,
-            None,
-        );
-        return false;
-    }
-    if let Err(err) =
-        ipc::ensure_peer_executable_matches_current_by_pid_opt(peer_pid, crate::POSTFIX_SERVICE)
-    {
-        log::warn!(
-                "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
-                crate::POSTFIX_SERVICE,
-                peer_pid,
-                err
-            );
-        return false;
-    }
-    true
-}
 
 extern "system" {
     fn BlockInput(v: BOOL) -> BOOL;
@@ -737,11 +706,40 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                     // session_id after awaiting incoming.next().
                     let expected_active_session_id =
                         resolve_expected_active_session_id_for_service(session_id);
-                    if !authorize_service_scoped_ipc_connection(&stream, expected_active_session_id)
-                    {
+                    let (session_authorized, peer_pid, peer_session_id, peer_is_system) =
+                        stream.service_authorization_status_for_session(expected_active_session_id);
+                    if !session_authorized {
+                        ipc::log_rejected_windows_ipc_connection(
+                            crate::POSTFIX_SERVICE,
+                            peer_pid,
+                            peer_session_id,
+                            expected_active_session_id,
+                            peer_is_system,
+                            None,
+                        );
                         continue;
                     }
                     if let Ok(Some(data)) = stream.next_timeout(1000).await {
+                        // DirectoryStatusQuery is read-only status information the client UI
+                        // already surfaces; allow it on session-scope trust alone so a
+                        // not-yet-installed executable (e.g. checking readiness during a
+                        // silent managed upgrade, before its own exe path matches the
+                        // installed one) can still ask. Every other message on this channel
+                        // keeps the stricter peer-executable match.
+                        if !matches!(data, ipc::Data::DirectoryStatusQuery) {
+                            if let Err(err) = ipc::ensure_peer_executable_matches_current_by_pid_opt(
+                                peer_pid,
+                                crate::POSTFIX_SERVICE,
+                            ) {
+                                log::warn!(
+                                    "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
+                                    crate::POSTFIX_SERVICE,
+                                    peer_pid,
+                                    err
+                                );
+                                continue;
+                            }
+                        }
                         match data {
                             ipc::Data::Close => {
                                 log::info!("close received");
@@ -1453,19 +1451,58 @@ pub fn get_install_options() -> String {
     let subkey = format!(".{}", app_name.to_lowercase());
     let mut opts = HashMap::new();
 
-    let desktop_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_DESKTOPSHORTCUTS);
-    if let Some(desktop_shortcuts) = desktop_shortcuts {
-        opts.insert(REG_NAME_INSTALL_DESKTOPSHORTCUTS, desktop_shortcuts);
-    }
-    let start_menu_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_STARTMENUSHORTCUTS);
-    if let Some(start_menu_shortcuts) = start_menu_shortcuts {
-        opts.insert(REG_NAME_INSTALL_STARTMENUSHORTCUTS, start_menu_shortcuts);
+    // A managed client's very first install is a fully automated/silent
+    // deployment, not a user clicking through the wizard - so a "0" already
+    // sitting in the registry for these two never reflects an actual user
+    // choice to remember. Leaving them out of the map here makes the
+    // checkboxes (and the silent-upgrade flag conversion below) fall back
+    // to their sensible default of checked, instead of staying unchecked
+    // forever because of that first silent deployment.
+    let is_managed_client = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some();
+    if !is_managed_client {
+        let desktop_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_DESKTOPSHORTCUTS);
+        if let Some(desktop_shortcuts) = desktop_shortcuts {
+            opts.insert(REG_NAME_INSTALL_DESKTOPSHORTCUTS, desktop_shortcuts);
+        }
+        let start_menu_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_STARTMENUSHORTCUTS);
+        if let Some(start_menu_shortcuts) = start_menu_shortcuts {
+            opts.insert(REG_NAME_INSTALL_STARTMENUSHORTCUTS, start_menu_shortcuts);
+        }
     }
     let printer = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_PRINTER);
     if let Some(printer) = printer {
         opts.insert(REG_NAME_INSTALL_PRINTER, printer);
     }
     serde_json::to_string(&opts).unwrap_or("{}".to_owned())
+}
+
+// get_install_options() returns a JSON object of registry keys (for
+// populating the install-page checkboxes), but install_me()'s `options`
+// parameter is a completely different, unrelated format: a plain string
+// checked with `.contains("desktopicon")` / `.contains("startmenu")` /
+// `.contains("printer")` - the same flat word list the install-page UI
+// itself builds by hand before calling install_me. Passing the JSON string
+// straight through (as raw JSON keys like "DESKTOPSHORTCUTS" don't contain
+// the word "desktopicon") would make install_me silently skip every
+// checkbox it's supposed to honor. Mirrors install_page.dart's own
+// `!= '0'` (default-on) / `== '1'` (default-off) semantics exactly, so a
+// managed silent upgrade preserves the same defaults the visible install
+// page would show for the same registry state.
+pub fn install_options_json_to_flags(options_json: &str) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(options_json).unwrap_or(serde_json::Value::Null);
+    let value_of = |key: &str| parsed.get(key).and_then(|v| v.as_str());
+    let mut flags = Vec::new();
+    if value_of(REG_NAME_INSTALL_STARTMENUSHORTCUTS) != Some("0") {
+        flags.push("startmenu");
+    }
+    if value_of(REG_NAME_INSTALL_DESKTOPSHORTCUTS) != Some("0") {
+        flags.push("desktopicon");
+    }
+    if value_of(REG_NAME_INSTALL_PRINTER) == Some("1") {
+        flags.push("printer");
+    }
+    flags.join(" ")
 }
 
 pub fn get_silent_install_options(printer_override: Option<bool>) -> &'static str {

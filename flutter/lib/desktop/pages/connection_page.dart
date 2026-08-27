@@ -40,10 +40,20 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
   final _reenrollmentRequested = false.obs;
   final _reenrollmentAuthorized = false.obs;
   final _reenrollmentRequestBusy = false.obs;
+  final RxnInt _managedOnlineClients = RxnInt();
+  final RxnInt _managedActiveSessions = RxnInt();
   Timer? _updateTimer;
 
+  // Managed clients auto-enroll into the directory, so the manual
+  // "Control Remote Desktop" ID field is hidden and this status area
+  // gets the freed-up space instead of its usual compact height.
+  bool get _isManagedClient =>
+      bind.mainGetManagedDirectoryStatus().isNotEmpty;
+
   double get em => 14.0;
-  double? get height => bind.isIncomingOnly() ? null : em * 3;
+  double? get height => bind.isIncomingOnly()
+      ? null
+      : (_isManagedClient ? em * 10 : em * 3);
 
   void onUsePublicServerGuide() {
     const url = "https://rustdesk.com/pricing";
@@ -114,7 +124,28 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
           ),
         );
 
-    basicWidget() => Row(
+    statsRow() => (!isIncomingOnly &&
+            (_managedOnlineClients.value != null ||
+                _managedActiveSessions.value != null))
+        ? Row(
+            children: [
+              Text(
+                '${translate("Clients online")}: ${_managedOnlineClients.value?.toString() ?? '—'}',
+                style: TextStyle(
+                    fontSize: em - 1,
+                    color: Theme.of(context).textTheme.bodySmall?.color),
+              ).marginOnly(right: 16),
+              Text(
+                '${translate("Active sessions")}: ${_managedActiveSessions.value?.toString() ?? '—'}',
+                style: TextStyle(
+                    fontSize: em - 1,
+                    color: Theme.of(context).textTheme.bodySmall?.color),
+              ),
+            ],
+          ).marginOnly(top: 4, left: em + 8)
+        : const Offstage();
+
+    statusRow() => Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             Container(
@@ -181,8 +212,20 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
           ],
         );
 
+    basicWidget() => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            statusRow(),
+            statsRow(),
+          ],
+        );
+
     return Container(
       height: height,
+      alignment: (!isIncomingOnly && _isManagedClient)
+          ? Alignment.centerLeft
+          : null,
       child: Obx(() => isIncomingOnly
           ? Column(
               children: [
@@ -242,6 +285,8 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
       _directoryStatusText.value = '';
       _reenrollmentRequested.value = false;
       _reenrollmentAuthorized.value = false;
+      _managedOnlineClients.value = null;
+      _managedActiveSessions.value = null;
     } else {
       try {
         final directory = jsonDecode(managedDirectory) as Map<String, dynamic>;
@@ -251,6 +296,17 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
             directory['reenrollment_requested'] as bool? ?? false;
         _reenrollmentAuthorized.value =
             directory['reenrollment_authorized'] as bool? ?? false;
+
+        final serverStats = directory['server_stats'];
+        if (serverStats is Map) {
+          _managedOnlineClients.value =
+              (serverStats['online_clients'] as num?)?.toInt();
+          _managedActiveSessions.value =
+              (serverStats['active_sessions'] as num?)?.toInt();
+        } else {
+          _managedOnlineClients.value = null;
+          _managedActiveSessions.value = null;
+        }
 
         final directoryText = directory['text'] as String? ?? '';
 
@@ -270,6 +326,8 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
         _directoryState.value = 'unavailable';
         _reenrollmentRequested.value = false;
         _reenrollmentAuthorized.value = false;
+        _managedOnlineClients.value = null;
+        _managedActiveSessions.value = null;
 
         final friendlyName = bind
             .mainGetOptionSync(
@@ -404,17 +462,21 @@ class _ConnectionPageState extends State<ConnectionPage>
   @override
   Widget build(BuildContext context) {
     final isOutgoingOnly = bind.isOutgoingOnly();
+    // Managed clients auto-enroll into the directory below, so the manual
+    // "Control Remote Desktop" ID field isn't needed and is hidden.
+    final isManagedClient = bind.mainGetManagedDirectoryStatus().isNotEmpty;
     return Column(
       children: [
         Expanded(
             child: Column(
           children: [
-            Row(
-              children: [
-                Flexible(child: _buildRemoteIDTextField(context)),
-              ],
-            ).marginOnly(top: 22),
-            SizedBox(height: 12),
+            if (!isManagedClient)
+              Row(
+                children: [
+                  Flexible(child: _buildRemoteIDTextField(context)),
+                ],
+              ).marginOnly(top: 22),
+            if (!isManagedClient) SizedBox(height: 12),
             Divider().paddingOnly(right: 12),
             Expanded(child: PeerTabPage()),
           ],

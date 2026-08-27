@@ -6,7 +6,7 @@ use crate::platform::breakdown_callback;
 #[cfg(not(debug_assertions))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::platform::register_breakdown_handler;
-use hbb_common::{config, log};
+use hbb_common::{config, log, tokio};
 #[cfg(windows)]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
@@ -20,6 +20,142 @@ macro_rules! my_println{
             &format!("{}", format_args!($($arg)*))
         );
     };
+}
+
+// A managed client that's already installed and already enrolled doesn't
+// need the full install flow (authorization password, enrollment password,
+// friendly name, contact email) - it just needs its files brought up to
+// date. Re-running the installer this way is the normal path for pushing
+// out an updated build to a machine that's already part of the fleet.
+// Step-by-step-traced stand-in for crate::ipc::get_directory_status_from_service,
+// used only while diagnosing why that call fails this early in the process
+// lifecycle on some machines ("reset by the peer") when it works fine once
+// the app is fully running. Same connect -> send -> receive shape, just with
+// a diag_write between each step so a failure's exact location is visible.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+async fn query_directory_status_traced() -> hbb_common::ResultType<(String, String, String)> {
+    use crate::server::input_service::diag_write;
+
+    diag_write("query_directory_status_traced: connecting to service IPC");
+    let connect_result = crate::ipc::connect_service(1000).await;
+    diag_write(&format!(
+        "query_directory_status_traced: connect result ok={} err={:?}",
+        connect_result.is_ok(),
+        connect_result.as_ref().err()
+    ));
+    let mut stream = connect_result?;
+
+    diag_write("query_directory_status_traced: sending DirectoryStatusQuery");
+    let send_result = stream.send(&crate::ipc::Data::DirectoryStatusQuery).await;
+    diag_write(&format!(
+        "query_directory_status_traced: send result ok={} err={:?}",
+        send_result.is_ok(),
+        send_result.as_ref().err()
+    ));
+    send_result?;
+
+    diag_write("query_directory_status_traced: waiting for response");
+    let next_result = stream.next_timeout(2_000).await;
+    diag_write(&format!(
+        "query_directory_status_traced: receive result ok={} err={:?}",
+        next_result.is_ok(),
+        next_result.as_ref().err()
+    ));
+    match next_result? {
+        Some(crate::ipc::Data::DirectoryStatusResult(status)) => {
+            diag_write("query_directory_status_traced: got DirectoryStatusResult");
+            Ok(status)
+        }
+        other => {
+            diag_write(&format!(
+                "query_directory_status_traced: unexpected response variant: {}",
+                other.is_some()
+            ));
+            Err(hbb_common::anyhow::anyhow!(
+                "Managed directory service returned no status"
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_silent_managed_upgrade(managed_client: bool) -> bool {
+    // log::* is a no-op this early - global_init() does not set up logging on
+    // Windows, and the install-mode logger isn't wired up until much later
+    // (inside the normal Flutter/InstallPage startup path, which this
+    // function exists specifically to bypass). Use the same file-based
+    // diag_write already relied on elsewhere for SYSTEM-context tracing, so
+    // this path is never silently unobservable again.
+    use crate::server::input_service::diag_write;
+
+    diag_write(&format!(
+        "try_silent_managed_upgrade: managed_client={}",
+        managed_client
+    ));
+    if !managed_client {
+        return false;
+    }
+    let installed = crate::platform::is_installed();
+    diag_write(&format!("try_silent_managed_upgrade: is_installed={}", installed));
+    if !installed {
+        return false;
+    }
+    // A raw file-existence check on the DPAPI credential
+    // (C:\ProgramData\RustDeskManaged\...) is not reliable here: that
+    // directory is ACL-restricted to SYSTEM/Administrators, and this
+    // function runs from the installer's initial, non-elevated launch -
+    // exactly the same restricted context a real double-click starts in.
+    // Ask the already-running SYSTEM-context service over the existing
+    // managed-directory IPC channel instead, which already has the access
+    // this process doesn't.
+    let ready = match query_directory_status_traced() {
+        Ok((state, _text, _snapshot)) => {
+            diag_write(&format!(
+                "try_silent_managed_upgrade: service directory state={:?}",
+                state
+            ));
+            state == "ready"
+        }
+        Err(err) => {
+            diag_write(&format!(
+                "try_silent_managed_upgrade: directory status IPC query failed: {:?}",
+                err
+            ));
+            false
+        }
+    };
+    if !ready {
+        return false;
+    }
+    let options_json = crate::ui_interface::install_options();
+    let options = crate::platform::windows::install_options_json_to_flags(&options_json);
+    let path = crate::ui_interface::install_path();
+    diag_write(&format!(
+        "try_silent_managed_upgrade: calling install_me options_json={:?} options={:?} path={:?}",
+        options_json, options, path
+    ));
+    // Runs in this (client) process, same as a normal manual install -
+    // install_me() self-elevates via a standard Windows UAC prompt when the
+    // caller isn't already elevated. That's expected and fine: this is
+    // meant to look like any other installer, not to bypass UAC.
+    match crate::platform::windows::install_me(&options, path, true, false) {
+        Ok(()) => {
+            diag_write("try_silent_managed_upgrade: install_me returned Ok");
+            true
+        }
+        Err(err) => {
+            // Do not swallow this: falling through to the normal --install
+            // flow (full UI, prompts, and a UAC request the user can actually
+            // see and act on) is far better than exiting silently and leaving
+            // the user stuck on the old version with no explanation.
+            diag_write(&format!(
+                "try_silent_managed_upgrade: install_me FAILED, falling back to full install flow: {:?}",
+                err
+            ));
+            false
+        }
+    }
 }
 
 /// shared by flutter and sciter main function
@@ -141,6 +277,15 @@ pub fn core_main() -> Option<Vec<String>> {
     if config::is_disable_installation() {
         args.retain(|arg| arg != "--install");
         flutter_args.retain(|arg| arg != "--install");
+    }
+    // Covers both paths that can land "--install" in args: click_setup above
+    // (direct double-click, no wrapper) and the portable wrapper passing it
+    // straight through as a real argument - either way, an already-installed
+    // and already-enrolled managed client just needs its files refreshed,
+    // not the full install UI.
+    #[cfg(windows)]
+    if args.contains(&"--install".to_string()) && try_silent_managed_upgrade(managed_client) {
+        return None;
     }
     if args.len() > 0 {
         if args[0] == "--version" {

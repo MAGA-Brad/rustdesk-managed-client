@@ -52,8 +52,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   Timer? _updateTimer;
   bool _managedPolicyApplied = false;
   bool isCardClosed = false;
-  int? _managedOnlineClients;
-  int? _managedActiveSessions;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -64,12 +62,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   Widget build(BuildContext context) {
     super.build(context);
     final isIncomingOnly = bind.isIncomingOnly();
+    // Managed clients auto-enroll into the directory, so the left sidebar
+    // (own ID/password, stats) is dropped entirely and the peer directory
+    // occupies the full window.
+    final isManagedClient = bind.mainGetManagedDirectoryStatus().isNotEmpty;
     return _buildBlock(
         child: Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        buildLeftPane(context),
-        if (!isIncomingOnly) const VerticalDivider(width: 1),
+        if (!isManagedClient) buildLeftPane(context),
+        if (!isManagedClient && !isIncomingOnly)
+          const VerticalDivider(width: 1),
         if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
       ],
     ));
@@ -151,7 +154,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 Expanded(child: Container())
               ],
             ),
-            buildManagedServerStats(context),
             if (isOutgoingOnly)
               Positioned(
                 bottom: 6,
@@ -724,83 +726,12 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     }
   }
 
-  // Server-authoritative counts from the managed Directory response. Reuses
-  // the existing Directory poll (~15s server-side cadence); no new endpoint
-  // or request. Absent/unparsable server_stats leaves the fields as null,
-  // which buildManagedServerStats renders as an explicit unavailable state.
-  void _refreshManagedServerStats() {
-    if (!isWindows) return;
-    final raw = bind.mainGetManagedDirectoryStatus();
-    if (raw.isEmpty) return;
-    int? onlineClients;
-    int? activeSessions;
-    try {
-      final decoded = jsonDecode(raw);
-      if (decoded is Map<String, dynamic>) {
-        final stats = decoded['server_stats'];
-        if (stats is Map) {
-          onlineClients = (stats['online_clients'] as num?)?.toInt();
-          activeSessions = (stats['active_sessions'] as num?)?.toInt();
-        }
-      }
-    } catch (e) {
-      debugPrint('Managed server_stats parse failed: $e');
-    }
-    if (onlineClients != _managedOnlineClients ||
-        activeSessions != _managedActiveSessions) {
-      setState(() {
-        _managedOnlineClients = onlineClients;
-        _managedActiveSessions = activeSessions;
-      });
-    }
-  }
-
-  Widget buildManagedServerStats(BuildContext context) {
-    if (!isWindows ||
-        bind.isOutgoingOnly() ||
-        bind.mainGetManagedDirectoryStatus().isEmpty) {
-      return const Offstage();
-    }
-    final onlineText = _managedOnlineClients?.toString() ?? '—';
-    final sessionsText = _managedActiveSessions?.toString() ?? '—';
-    final labelStyle = Theme.of(context)
-        .textTheme
-        .bodySmall
-        ?.copyWith(color: Colors.grey.withOpacity(0.8));
-    final valueStyle = Theme.of(context)
-        .textTheme
-        .bodySmall
-        ?.copyWith(fontWeight: FontWeight.w600);
-    return Positioned(
-      bottom: 6,
-      left: 12,
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(mainAxisSize: MainAxisSize.min, children: [
-              Text('${translate("Clients online")}: ', style: labelStyle),
-              Text(onlineText, style: valueStyle),
-            ]),
-            Row(mainAxisSize: MainAxisSize.min, children: [
-              Text('${translate("Active sessions")}: ', style: labelStyle),
-              Text(sessionsText, style: valueStyle),
-            ]),
-          ],
-        ),
-      ),
-    );
-  }
-
   @override
   void initState() {
     super.initState();
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
       await _enforceManagedClientPolicy();
-      _refreshManagedServerStats();
       final error = await bind.mainGetError();
       if (systemError != error) {
         systemError = error;
