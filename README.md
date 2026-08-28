@@ -1,12 +1,66 @@
 > **This is a fork of [rustdesk/rustdesk](https://github.com/rustdesk/rustdesk)**, the open-source
 > RustDesk remote desktop client (AGPL-3.0). Full credit for the base client goes to the RustDesk
-> team and its contributors — this fork adds a managed-fleet layer on top: server-managed device
-> enrollment/directory sync, mandatory 2FA for the admin/management API, a local-input-priority
-> guard so a physically-present user always wins over a remote session, and Windows
-> installer/service hardening. It also depends on a sanitized fork of
-> [rustdesk/hbb_common](https://github.com/MAGA-Brad/hbb_common) as a submodule.
+> team and its contributors.
 >
-> Everything below this notice is the upstream RustDesk project's own README, unmodified.
+> This fork ("RDC") adds a managed-fleet layer on top of the stock client, designed to pair with
+> [rustdesk-managed-directory-api](https://github.com/MAGA-Brad/rustdesk-managed-directory-api)
+> ("RDS"), a self-hosted device directory and management server. Together they turn RustDesk from
+> a remote-desktop tool you configure one machine at a time into a fleet you actually manage:
+> devices enroll themselves, an operator approves them from a web UI, and updates roll out to
+> everyone automatically — signed, verified, and never silent. It also depends on a sanitized fork
+> of [rustdesk/hbb_common](https://github.com/MAGA-Brad/hbb_common) as a submodule.
+
+## What this fork adds
+
+### Managed enrollment, not manual configuration
+- A device enrolls itself at install time — no per-machine server/relay/key configuration for end
+  users to get wrong. The install form collects a friendly device name and contact email,
+  authenticates against a shared enrollment password, and the device shows up in the directory as
+  **pending**. Nothing reaches the relay until an operator approves it.
+- If a device's local credential is ever lost or regenerated (reimage, corrupted keypair, whatever),
+  it isn't permanently orphaned — an **owner-authorized re-enrollment** flow lets an operator
+  restore it under its original identity, with the old credential cryptographically invalidated
+  the instant the new one is issued.
+- Managed-mode settings are hidden from end users entirely: no Server/Proxy fields to
+  misconfigure, forced secure (WSS) transport, and the client only ever talks to the directory
+  server it was built for.
+
+### Signed, gated auto-updates
+- Releases are Ed25519-signed on the server; the client verifies the signature before it will ever
+  apply an update — a compromised or malicious update server can't push arbitrary code to a fleet.
+- The client shows an **"Update Available"** notification the moment a newer signed build is
+  found, and stops there. Nothing installs itself. The daily background check only ever
+  *notifies* — the update only actually applies when someone clicks **Update Now**, and even then
+  only if it won't interrupt an active remote session.
+- The actual install step goes through the OS's normal elevation path (standard Windows UAC) — no
+  self-elevation tricks, no service-delegation shortcuts. It behaves like any other installer, on
+  purpose.
+
+### Built for a real fleet, not a demo
+- Multi-process aware: the GUI, the background Windows service, and the per-session connection
+  process each run independently — enrollment status, pending-update state, and update triggers
+  are relayed between them over an authenticated local IPC channel rather than assumed to be
+  shared state.
+- CGNAT-friendly registration, verified against a real carrier-grade-NAT mobile hotspot rather than
+  just a lab network — a client's registration doesn't depend on two different network flows
+  sharing a source IP, which cellular NAT pools routinely break.
+- A local-input-priority guard: a user physically at the keyboard always wins over a remote
+  session — nobody connected remotely can lock out or fight for control with the person actually
+  sitting there.
+- Windows installer/service hardening and ACL'd machine-secret credential storage (DPAPI,
+  restricted to SYSTEM) — the enrolled device's cryptographic identity isn't just sitting in a
+  plaintext config file.
+
+### Pairs with RDS
+This client is one half of a pair. The other half — enrollment API, operator accounts with 2FA,
+audit logging, relay-access leasing, and the admin UI — lives in
+[rustdesk-managed-directory-api](https://github.com/MAGA-Brad/rustdesk-managed-directory-api). It
+sits in front of a stock hbbs/hbbr, so this isn't a fork of the relay/rendezvous protocol at all —
+just real fleet management layered on top of it.
+
+---
+
+Everything below this notice is the upstream RustDesk project's own README, unmodified.
 
 ---
 
