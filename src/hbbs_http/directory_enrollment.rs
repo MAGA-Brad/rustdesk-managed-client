@@ -1736,6 +1736,27 @@ pub struct ManagedUpdateCandidate {
     pub file_path: PathBuf,
 }
 
+// Set by the background daily check as soon as a newer, signature-verified
+// build is found, so the UI can show "Update Available" without having to
+// poll the (23MB-download-capable) check itself every second. Cleared once
+// applied. This is display-only - the actual apply path always re-derives
+// its own candidate via managed_update_check_and_download(), which is
+// cheap on repeat calls because the verified file is cached on disk.
+static PENDING_MANAGED_UPDATE: std::sync::Mutex<Option<(u64, String)>> =
+    std::sync::Mutex::new(None);
+
+pub fn note_pending_managed_update(build_number: u64, version: &str) {
+    *PENDING_MANAGED_UPDATE.lock().unwrap() = Some((build_number, version.to_owned()));
+}
+
+pub fn clear_pending_managed_update() {
+    *PENDING_MANAGED_UPDATE.lock().unwrap() = None;
+}
+
+pub fn pending_managed_update() -> Option<(u64, String)> {
+    PENDING_MANAGED_UPDATE.lock().unwrap().clone()
+}
+
 pub fn managed_build_number() -> u64 {
     option_env!("RUSTDESK_MANAGED_BUILD_NUMBER")
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -1928,6 +1949,12 @@ pub async fn managed_update_check_and_download(
     let response = download_client
         .get(&download_url)
         .bearer_auth(credential)
+        // The shared client's default timeout (20s) is sized for the
+        // lightweight API calls most callers make - a multi-megabyte
+        // release download legitimately needs longer, especially over a
+        // mobile hotspot, so override it here rather than raising the
+        // shared default for every other caller.
+        .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
         .map_err(|error| DirectoryApiError::transport("managed update download", &error))?;

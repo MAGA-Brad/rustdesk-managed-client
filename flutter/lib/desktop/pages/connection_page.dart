@@ -42,6 +42,10 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
   final _reenrollmentRequestBusy = false.obs;
   final RxnInt _managedOnlineClients = RxnInt();
   final RxnInt _managedActiveSessions = RxnInt();
+  final RxnInt _pendingUpdateBuildNumber = RxnInt();
+  final _pendingUpdateVersion = ''.obs;
+  final _updateApplying = false.obs;
+  DateTime? _updateApplyStartedAt;
   Timer? _updateTimer;
 
   // Managed clients auto-enroll into the directory, so the manual
@@ -221,6 +225,42 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
           ],
         );
 
+    // Only shown once the background daily check has found and
+    // signature-verified a newer build - fully hidden otherwise, same as
+    // the rest of this managed-client status area.
+    updateAvailableWidget() => Obx(() {
+          if (_pendingUpdateBuildNumber.value == null) {
+            return const Offstage();
+          }
+          return Row(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Icon(Icons.system_update_alt_outlined,
+                      size: 16, color: kColorWarn)
+                  .marginOnly(right: 6),
+              Text(
+                translate('Update available'),
+                style: TextStyle(fontSize: em - 1, color: kColorWarn),
+              ).marginOnly(right: 12),
+              _updateApplying.value
+                  ? SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ).marginOnly(right: 8)
+                  : ElevatedButton(
+                      onPressed: () {
+                        _updateApplying.value = true;
+                        _updateApplyStartedAt = DateTime.now();
+                        bind.mainTriggerManagedUpdateNow();
+                      },
+                      child: Text(translate('Update Now')),
+                    ),
+            ],
+          );
+        });
+
     return Container(
       height: height,
       alignment: (!isIncomingOnly && _isManagedClient)
@@ -236,7 +276,20 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
                     .marginOnly(top: 2.0, left: 22.0),
               ],
             )
-          : basicWidget()),
+          : (_isManagedClient
+              ? Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    basicWidget(),
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.bottomRight,
+                        child: updateAvailableWidget(),
+                      ),
+                    ),
+                  ],
+                )
+              : basicWidget())),
     ).paddingOnly(right: isIncomingOnly ? 8 : 0);
   }
 
@@ -342,6 +395,36 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
     try {
       stateGlobal.videoConnCount.value = status['video_conn_count'] as int;
     } catch (_) {}
+
+    final pendingUpdateJson = bind.mainGetPendingManagedUpdate();
+    if (pendingUpdateJson.isEmpty) {
+      _pendingUpdateBuildNumber.value = null;
+      _pendingUpdateVersion.value = '';
+      _updateApplying.value = false;
+      _updateApplyStartedAt = null;
+    } else {
+      try {
+        final pending =
+            jsonDecode(pendingUpdateJson) as Map<String, dynamic>;
+        _pendingUpdateBuildNumber.value =
+            (pending['build_number'] as num?)?.toInt();
+        _pendingUpdateVersion.value = pending['version'] as String? ?? '';
+      } catch (_) {
+        _pendingUpdateBuildNumber.value = null;
+        _pendingUpdateVersion.value = '';
+      }
+      // The pending state only clears on a successful apply. A failed
+      // attempt (network blip, transient server error) never clears it,
+      // which would otherwise leave the spinner stuck forever with no way
+      // to retry - fall back to the button after a generous timeout.
+      final startedAt = _updateApplyStartedAt;
+      if (_updateApplying.value &&
+          startedAt != null &&
+          DateTime.now().difference(startedAt) > const Duration(seconds: 45)) {
+        _updateApplying.value = false;
+        _updateApplyStartedAt = null;
+      }
+    }
   }
 }
 

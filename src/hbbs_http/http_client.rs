@@ -16,7 +16,16 @@ macro_rules! configure_http_client {
     ($builder:expr, $tls_type:expr, $danger_accept_invalid_cert:expr, $Client: ty) => {{
         // https://github.com/rustdesk/rustdesk/issues/11569
         // https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html#method.no_proxy
-        let mut builder = $builder.no_proxy();
+        // A stalled/half-open connection (dropped packets, a dead NAT
+        // mapping, momentary server unresponsiveness) otherwise hangs a
+        // request forever - reqwest has no default timeout. Most callers of
+        // this shared client are lightweight API calls (manifest checks,
+        // heartbeats, directory status) that should complete quickly under
+        // normal conditions; a caller needing longer (e.g. a large file
+        // download) can still override this per-request via
+        // RequestBuilder::timeout(), which takes precedence over this
+        // client-level default.
+        let mut builder = $builder.no_proxy().timeout(std::time::Duration::from_secs(20));
 
         match $tls_type {
             TlsType::Plain => {}

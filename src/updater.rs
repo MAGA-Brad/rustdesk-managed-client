@@ -95,6 +95,19 @@ pub fn manually_check_update() -> ResultType<()> {
     Ok(())
 }
 
+/// For the managed-client "Update Now" button. Runs check_update() directly
+/// on a fresh thread instead of going through the mpsc channel, so it isn't
+/// subject to the background loop's MIN_INTERVAL throttle - a user clicking
+/// this expects it to act immediately, not silently no-op if the daily check
+/// happened to run a few minutes ago.
+pub fn trigger_managed_update_now() {
+    std::thread::spawn(|| {
+        if let Err(e) = check_update(true) {
+            log::error!("Error applying managed update on demand: {}", e);
+        }
+    });
+}
+
 #[allow(dead_code)]
 pub fn stop_auto_update() {
     let sender = TX_MSG.lock().unwrap();
@@ -183,8 +196,22 @@ fn check_update(manually: bool) -> ResultType<()> {
                 candidate.build_number,
                 candidate.version
             );
-            if has_no_active_conns() {
+            // This checker runs in the per-session --server process, not the
+            // --service process the GUI's status polling actually queries -
+            // relay the result over IPC rather than just noting it locally,
+            // or the "Update Available" state would never leave this process.
+            let _ = crate::ipc::notify_pending_managed_update_to_service(Some((
+                candidate.build_number,
+                candidate.version.clone(),
+            )));
+            // The background daily check (manually=false) must never silently
+            // apply an update out from under the user - it only surfaces the
+            // "Update Available" notification and waits. Only an explicit
+            // "Update Now" click (manually=true) actually triggers the apply,
+            // and even then only if it won't interrupt an active session.
+            if manually && has_no_active_conns() {
                 update_new_version(false, &candidate.version, &candidate.file_path);
+                let _ = crate::ipc::notify_pending_managed_update_to_service(None);
             }
         }
         return Ok(());

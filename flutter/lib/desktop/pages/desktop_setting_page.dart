@@ -63,9 +63,14 @@ enum SettingsTabKey {
 
 class DesktopSettingPage extends StatefulWidget {
   final SettingsTabKey initialTabkey;
+  // Network tab has nothing left to show for managed clients once Server,
+  // Proxy, and WebSocket are all hidden below - an empty tab is just
+  // confusing UI clutter, so drop the entry entirely rather than leave a
+  // blank page reachable in the sidebar.
   static final List<SettingsTabKey> tabKeys = [
     SettingsTabKey.general,
     SettingsTabKey.safety,
+    if (bind.mainGetManagedDirectoryStatus().isEmpty) SettingsTabKey.network,
     SettingsTabKey.display,
     SettingsTabKey.about,
   ];
@@ -1717,11 +1722,24 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
   }
 
   Widget network(BuildContext context) {
-    final hideServer =
+    // Managed clients hide the Server/Proxy fields (letting a fleet user
+    // point their own client at an arbitrary server or proxy would break
+    // their managed connection with no easy way back) but keep "Use
+    // WebSocket" available - it's needed on networks that block RustDesk's
+    // native protocol ports (e.g. some mobile hotspots) while otherwise
+    // allowing standard HTTPS.
+    final isManagedClient = bind.mainGetManagedDirectoryStatus().isNotEmpty;
+    final hideServer = isManagedClient ||
         bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
-    final hideProxy =
-        isWeb || bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
-    final hideWebSocket = isWeb ||
+    final hideProxy = isManagedClient ||
+        isWeb ||
+        bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
+    // Managed clients must stay on the UDP registration path - hbbs on our
+    // server rejects RegisterPk over TCP/websocket at the protocol level
+    // (unconditional NOT_SUPPORT), so a user flipping this on would silently
+    // break their own connection with no obvious way to self-diagnose it.
+    final hideWebSocket = isManagedClient ||
+        isWeb ||
         bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y';
 
     if (hideServer && hideProxy && hideWebSocket) {

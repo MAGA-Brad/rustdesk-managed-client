@@ -720,13 +720,18 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                         continue;
                     }
                     if let Ok(Some(data)) = stream.next_timeout(1000).await {
-                        // DirectoryStatusQuery is read-only status information the client UI
-                        // already surfaces; allow it on session-scope trust alone so a
-                        // not-yet-installed executable (e.g. checking readiness during a
-                        // silent managed upgrade, before its own exe path matches the
-                        // installed one) can still ask. Every other message on this channel
-                        // keeps the stricter peer-executable match.
-                        if !matches!(data, ipc::Data::DirectoryStatusQuery) {
+                        // DirectoryStatusQuery and PendingManagedUpdateQuery are both
+                        // read-only status information the client UI already surfaces;
+                        // allow them on session-scope trust alone so a not-yet-installed
+                        // executable (e.g. checking readiness during a silent managed
+                        // upgrade, before its own exe path matches the installed one) can
+                        // still ask. Every other message on this channel keeps the
+                        // stricter peer-executable match.
+                        if !matches!(
+                            data,
+                            ipc::Data::DirectoryStatusQuery
+                                | ipc::Data::PendingManagedUpdateQuery
+                        ) {
                             if let Err(err) = ipc::ensure_peer_executable_matches_current_by_pid_opt(
                                 peer_pid,
                                 crate::POSTFIX_SERVICE,
@@ -850,6 +855,29 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                                         ),
                                     )
                                     .await;
+                            }
+                            ipc::Data::PendingManagedUpdateQuery => {
+                                let pending =
+                                    crate::hbbs_http::directory_enrollment::pending_managed_update();
+                                let _ = stream
+                                    .send(&ipc::Data::PendingManagedUpdateResult(pending))
+                                    .await;
+                            }
+                            ipc::Data::PendingManagedUpdateNotify(pending) => {
+                                // Relayed from the --server process where the
+                                // auto-update checker actually runs - see
+                                // notify_pending_managed_update_to_service.
+                                match pending {
+                                    Some((build_number, version)) => {
+                                        crate::hbbs_http::directory_enrollment::note_pending_managed_update(
+                                            build_number,
+                                            &version,
+                                        );
+                                    }
+                                    None => {
+                                        crate::hbbs_http::directory_enrollment::clear_pending_managed_update();
+                                    }
+                                }
                             }
                             ipc::Data::UserSid(usid) => {
                                 if let Some(usid) = usid {

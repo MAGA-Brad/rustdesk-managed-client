@@ -2592,6 +2592,56 @@ pub fn main_get_managed_directory_status(
     }
 }
 
+/// JSON {"build_number":N,"version":"..."} if the background daily check has
+/// already found and signature-verified a newer managed-update build, or ""
+/// if none is pending. Cheap to poll every second - does not touch the
+/// network or the (up to 23MB) update file itself.
+///
+/// The check that sets this state runs in the SYSTEM service process, a
+/// separate process from this GUI with its own memory, so it must be asked
+/// over IPC rather than read directly - same reason main_get_managed_directory_status
+/// above goes through the service instead of reading local state.
+pub fn main_get_pending_managed_update() -> SyncReturn<String> {
+    #[cfg(windows)]
+    {
+        let result = crate::ipc::get_pending_managed_update_from_service()
+            .ok()
+            .flatten()
+            .map(|(build_number, version)| {
+                serde_json::json!({
+                    "build_number": build_number,
+                    "version": version,
+                })
+                .to_string()
+            })
+            .unwrap_or_default();
+        SyncReturn(result)
+    }
+    #[cfg(not(windows))]
+    {
+        SyncReturn(String::new())
+    }
+}
+
+/// "Update Now" button: apply the already-verified pending update
+/// immediately instead of waiting for an idle moment on the daily timer.
+/// Fire-and-forget - the UI observes completion via
+/// main_get_pending_managed_update() clearing once applied.
+pub fn main_trigger_managed_update_now() {
+    #[cfg(windows)]
+    {
+        // This GUI process normally runs with a filtered admin token (even
+        // when launched by an admin account) and cannot read the
+        // machine-secret directory-state file the update check needs - ask
+        // the --server process (already running the background checker in
+        // the correct interactive session) to run the check-and-apply
+        // instead of doing it here, or an enrolled device would spuriously
+        // look unenrolled. Deliberately NOT routed through the SYSTEM
+        // service - see trigger_managed_update_now_via_server.
+        let _ = crate::ipc::trigger_managed_update_now_via_server();
+    }
+}
+
 pub fn install_show_run_without_install() -> SyncReturn<bool> {
     SyncReturn(show_run_without_install())
 }

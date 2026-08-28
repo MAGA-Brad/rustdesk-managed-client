@@ -404,6 +404,14 @@ pub enum Data {
     DirectoryContactEmailUpdateRequest(String),
     #[cfg(windows)]
     DirectoryContactEmailUpdateResult(bool),
+    #[cfg(windows)]
+    PendingManagedUpdateQuery,
+    #[cfg(windows)]
+    PendingManagedUpdateResult(Option<(u64, String)>),
+    #[cfg(windows)]
+    PendingManagedUpdateNotify(Option<(u64, String)>),
+    #[cfg(windows)]
+    TriggerManagedUpdateNow,
     OnlineStatus(Option<(i64, bool)>),
     Config((String, Option<String>)),
     Options(Option<HashMap<String, String>>),
@@ -844,6 +852,13 @@ async fn handle(data: Data, stream: &mut Connection) {
                 }
                 std::process::exit(-1); // to make sure --server luauchagent process can restart because SuccessfulExit used
             }
+        }
+        #[cfg(windows)]
+        Data::TriggerManagedUpdateNow => {
+            // Handled here (the "" main-IPC listener, run by the --server
+            // process) rather than the SYSTEM service - see
+            // trigger_managed_update_now_via_server for why.
+            crate::updater::trigger_managed_update_now();
         }
         Data::OnlineStatus(_) => {
             let x = config::get_online_state();
@@ -2123,6 +2138,74 @@ pub async fn get_directory_status_from_service(
             "Managed directory service returned no status"
         )),
     }
+}
+
+// PENDING_MANAGED_UPDATE lives in directory_enrollment.rs as process-local
+// state, set by the background update checker which runs in the SYSTEM
+// service process - a separate process from this GUI, with its own memory.
+// The UI must ask the service for it over IPC rather than reading it
+// directly, the same way directory enrollment status already works.
+// The auto-update checker runs in the per-session --server process
+// (started from rendezvous_mediator's persistent loop), not the --service
+// process that owns the IPC pipe the GUI queries - so it must push its
+// result over here, the same way DirectoryFriendlyNameChanged relays a
+// GUI-side change into the service's own Config cache.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn notify_pending_managed_update_to_service(
+    pending: Option<(u64, String)>,
+) -> ResultType<()> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::PendingManagedUpdateNotify(pending))
+        .await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_pending_managed_update_from_service(
+) -> ResultType<Option<(u64, String)>> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::PendingManagedUpdateQuery)
+        .await?;
+    match stream.next_timeout(2_000).await? {
+        Some(crate::ipc::Data::PendingManagedUpdateResult(pending)) => {
+            Ok(pending)
+        }
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no pending-update status"
+        )),
+    }
+}
+
+// "Update Now" is invoked from the interactive (non-elevated) GUI process,
+// which cannot read the machine-secret directory-state file - it's ACL'd to
+// SYSTEM + BUILTIN\Administrators, and a filtered admin token (the normal
+// case when RustDesk is launched by double-clicking, even as a local admin)
+// is denied by that ACL. Reading the file there would silently see it as
+// absent and fail with a misleading "not enrolled" error.
+//
+// This asks the per-session --server process to run the check-and-apply
+// instead (the "" postfix, same channel client.rs/tray.rs/ui_interface.rs
+// already use to reach it) rather than the SYSTEM service. The --server
+// process already reads this file successfully for the background daily
+// check, and - unlike the service, which runs in session 0 - it runs bound
+// to the actual interactive session, which update_new_version() needs to
+// launch the elevated installer into the right desktop. Routing an
+// update/install step through the already-elevated service instead of
+// letting it run where the normal elevation path expects it caused a real
+// bricking incident previously (the service stopping/deleting itself
+// mid-update) - this must stay in --server, never --service.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn trigger_managed_update_now_via_server() -> ResultType<()> {
+    let mut stream = crate::ipc::connect(1000, "").await?;
+    stream
+        .send(&crate::ipc::Data::TriggerManagedUpdateNow)
+        .await?;
+    Ok(())
 }
 
 #[cfg(windows)]

@@ -967,11 +967,16 @@ fn import_config(path: &str) {
     let path = std::path::Path::new(path);
     log::info!("import config from {:?} and {:?}", path, path2);
     let config: Config = load_path(path.into());
+    // A fresh device's primary Config (id/keypair) is legitimately empty here -
+    // the keypair is generated lazily by the service on its first registration,
+    // not by the GUI/installer process writing this source file. That must not
+    // skip the *separate* Config2 import below (device options - including the
+    // managed-client's preset-device-name/email collected by the install form),
+    // which has no dependency on the keypair being present yet. These two
+    // imports need to be independent, not gated by a single early return.
     if config.is_empty() {
-        log::info!("Empty source config, skipped");
-        return;
-    }
-    if get_modified_time(&path) > get_modified_time(&Config::file())
+        log::info!("Empty source config, primary config import skipped");
+    } else if get_modified_time(&path) > get_modified_time(&Config::file())
         && get_modified_time(&path) < get_exe_time()
     {
         if store_path(Config::file(), config).is_err() {
