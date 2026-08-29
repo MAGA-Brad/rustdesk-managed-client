@@ -17,6 +17,7 @@ extern "C" {
 
 #ifdef _WIN32
 #include <libavutil/hwcontext_d3d11va.h>
+#include "win.h"
 #endif
 
 #include "common.h"
@@ -116,8 +117,26 @@ public:
     }
 
     if (hwaccel_) {
-      ret =
-          av_hwdevice_ctx_create(&hw_device_ctx_, device_type_, NULL, NULL, 0);
+      std::string device = "";
+#ifdef _WIN32
+      // NULL lets D3D11 pick its "default" adapter, which on some setups
+      // (e.g. GPU passthrough VMs) doesn't expose the ID3D11VideoDevice/
+      // ID3D11VideoContext interfaces d3d11va_device_init() needs, failing
+      // with AVERROR_UNKNOWN. Target the real hardware adapter explicitly,
+      // same as ffmpeg_ram_encode.cpp already does for nvenc.
+      for (AdapterVendor vendor : {AdapterVendor::ADAPTER_VENDOR_NVIDIA,
+                                   AdapterVendor::ADAPTER_VENDOR_AMD,
+                                   AdapterVendor::ADAPTER_VENDOR_INTEL}) {
+        int index = Adapters::GetFirstAdapterIndex(vendor);
+        if (index >= 0) {
+          device = std::to_string(index);
+          break;
+        }
+      }
+#endif
+      ret = av_hwdevice_ctx_create(&hw_device_ctx_, device_type_,
+                                   device.length() == 0 ? NULL : device.c_str(),
+                                   NULL, 0);
       if (ret < 0) {
         LOG_ERROR(std::string("av_hwdevice_ctx_create failed, ret = ") + av_err2str(ret));
         return -1;
