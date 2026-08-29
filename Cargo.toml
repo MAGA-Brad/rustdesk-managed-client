@@ -218,6 +218,13 @@ exclude = ["vdi/host", "examples/custom_plugin"]
 [patch.crates-io]
 libxdo-sys = { path = "libs/libxdo-sys-stub" }
 
+# Vendored hwcodec (pinned upstream commit 778df1f9) with two build fixes for
+# newer FFmpeg (post FF_API_FRAME_KEY / FF_PROFILE_* removal): key_frame now
+# read via AV_FRAME_FLAG_KEY, and AV_PROFILE_H264_HIGH/AV_PROFILE_HEVC_MAIN
+# replace the removed FF_PROFILE_* constants. Not yet upstreamed.
+[patch."https://github.com/rustdesk-org/hwcodec"]
+hwcodec = { path = "libs/hwcodec-patched" }
+
 [package.metadata.winres]
 LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."
 ProductName = "RustDesk"
