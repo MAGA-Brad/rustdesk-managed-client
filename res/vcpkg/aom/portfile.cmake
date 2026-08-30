@@ -36,6 +36,14 @@ if(VCPKG_TARGET_IS_UWP OR (VCPKG_TARGET_IS_WINDOWS AND VCPKG_TARGET_ARCHITECTURE
     # UWP + aom's assembler files result in weirdness and build failures
     # Also, disable assembly on ARM and ARM64 Windows to fix compilation issues.
     set(aom_target_cpu "-DAOM_TARGET_CPU=generic")
+elseif(VCPKG_TARGET_IS_ANDROID)
+    # aom's CMake ASM language detection looks for a bare "as" on PATH, which
+    # doesn't exist with the NDK's Clang toolchain (it's its own integrated
+    # assembler, invoked as clang) - configure fails with "CMAKE_ASM_COMPILER:
+    # as is not a full path and was not found in the PATH" before any actual
+    # compiling happens. Same class of problem as the Windows/ARM case above;
+    # same fix.
+    set(aom_target_cpu "-DAOM_TARGET_CPU=generic")
 endif()
 
 if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm" AND VCPKG_TARGET_IS_LINUX)

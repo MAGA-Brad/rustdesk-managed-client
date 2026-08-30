@@ -2586,9 +2586,21 @@ pub fn main_get_managed_directory_status(
         }
     }
 
+    // Non-Windows managed clients have no SYSTEM-service IPC to query for a
+    // live status (that architecture is Windows-only), but callers here just
+    // need "is this a managed build at all" (see isManagedClient checks in
+    // desktop_setting_page.dart / mobile's settings_page.dart) - return the
+    // same minimal non-empty shape the Windows Err(_) branch above does, so
+    // `.isNotEmpty` stays a valid managed-build check on every platform.
     #[cfg(not(windows))]
     {
-        SyncReturn(String::new())
+        SyncReturn(
+            serde_json::json!({
+                "state": "unavailable",
+                "text": "",
+            })
+            .to_string(),
+        )
     }
 }
 

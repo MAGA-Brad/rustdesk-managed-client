@@ -132,14 +132,23 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
     _autoDisconnectTimeout =
         bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
-    _hideServer =
+    // Managed clients hide the Server/Proxy fields the same way the desktop
+    // settings page does (see desktop_setting_page.dart's network()) -
+    // letting a fleet user point their own client at an arbitrary server or
+    // proxy would break their managed connection with no easy way back.
+    final isManagedClient = bind.mainGetManagedDirectoryStatus().isNotEmpty;
+    _hideServer = isManagedClient ||
         bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
-    _hideProxy = bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
+    _hideProxy = isManagedClient ||
+        bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
     _hideNetwork =
         bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) == 'Y';
-    _hideWebSocket =
+    // Managed clients must stay on the UDP registration path - hbbs on our
+    // server rejects RegisterPk over TCP/websocket at the protocol level, so
+    // a user flipping this on would silently break their own connection.
+    _hideWebSocket = isManagedClient ||
         bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y' ||
-            isWeb;
+        isWeb;
     _enableTrustedDevices = mainGetBoolOptionSync(kOptionEnableTrustedDevices);
     _enableUdpPunch = mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
     _enableIpv6Punch = mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);

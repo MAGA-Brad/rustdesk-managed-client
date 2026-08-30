@@ -233,8 +233,28 @@ if(VCPKG_DETECTED_CMAKE_C_COMPILER)
     set(ENV{CC} "${CC_filename}")
     string(APPEND OPTIONS " --cc=${CC_filename}")
 
-    if(VCPKG_HOST_IS_WINDOWS)
+    # host_cc builds small helper tools that run on the build machine, not
+    # the target - only reuse the just-detected target compiler for that when
+    # host and target are actually the same OS (native Windows build). When
+    # cross-compiling (e.g. to Android), CC_filename is the NDK's clang,
+    # which defaults to an Android sysroot and can't find Windows headers
+    # ("ctype.h file not found") when asked to build a native host tool.
+    if(VCPKG_HOST_IS_WINDOWS AND VCPKG_TARGET_IS_WINDOWS)
         string(APPEND OPTIONS " --host_cc=${CC_filename}")
+    elseif(VCPKG_HOST_IS_WINDOWS)
+        # No native gcc is available in vcpkg's downloaded MSYS2 root here
+        # (configure's own host_cc fallback hits "gcc: command not found"),
+        # so point at a real native-Windows-targeting clang instead of the
+        # cross-target one. This is a real, standalone LLVM install, not the
+        # NDK's copy. Uses the 8.3 short path (PROGRA~1) because "Program
+        # Files" has a space, and this string gets tokenized on whitespace
+        # further down the chain (build.sh -> configure), which silently
+        # split the path and broke option parsing when quoted normally.
+        find_program(RUSTDESK_NATIVE_CLANG NAMES clang.exe
+            PATHS "C:/PROGRA~1/LLVM/bin" NO_DEFAULT_PATH)
+        if(RUSTDESK_NATIVE_CLANG)
+            string(APPEND OPTIONS " --host_cc=${RUSTDESK_NATIVE_CLANG}")
+        endif()
     endif()
 
     list(APPEND prog_env "${CC_path}")
