@@ -3116,6 +3116,16 @@ pub fn install_stop_running_instance() {
     crate::platform::windows::stop_running_instance_before_install();
 }
 
+// flutter_rust_bridge's codegen walks this file's AST without evaluating
+// #[cfg(...)], so it always emits a wire_install_stop_running_instance()
+// call regardless of target platform. This install-over-a-running-instance
+// scenario is specific to the Windows self-extracting installer flow (there
+// is no equivalent "runInstallPage" path on Android, which installs/updates
+// APKs through the OS package manager instead), so the non-Windows arm of
+// that generated call site just needs a harmless no-op to link.
+#[cfg(not(windows))]
+pub fn install_stop_running_instance() {}
+
 // The installer's own process (runInstallPage in main.dart) never calls
 // start_server(), so it never spawns the "" (main) IPC listener that a
 // normally-running app/service already has. 2FA setup during install goes

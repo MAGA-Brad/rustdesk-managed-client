@@ -87,6 +87,90 @@ pub fn get_active_username() -> String {
     "android".into()
 }
 
+// Android equivalents of the managed-client machine-secret helpers backing
+// crate::hbbs_http::directory_enrollment's persisted-auth store (see
+// platform/windows/protected_storage.rs and platform/windows/acl.rs for the
+// Windows originals). Android already isolates each app's private storage
+// from every other app - and from other Android users - at the OS/SELinux
+// level, which is the same trust boundary Windows draws with
+// CRYPTPROTECT_LOCAL_MACHINE plus a SYSTEM/Administrators-only DACL: there
+// is no second local-account boundary on a phone to defend against, so these
+// only need to place the data under the app's already-sandboxed storage
+// root and harden its on-disk mode, not add a second cipher layer.
+#[cfg(target_os = "android")]
+pub(crate) fn protect_machine_scope(data: &[u8]) -> hbb_common::ResultType<Vec<u8>> {
+    if data.is_empty() {
+        return Err(hbb_common::anyhow::anyhow!("Cannot protect an empty value"));
+    }
+    Ok(data.to_vec())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn unprotect_machine_scope(data: &[u8]) -> hbb_common::ResultType<Vec<u8>> {
+    if data.is_empty() {
+        return Err(hbb_common::anyhow::anyhow!("Cannot unprotect an empty value"));
+    }
+    Ok(data.to_vec())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn get_program_data_dir() -> hbb_common::ResultType<std::path::PathBuf> {
+    Ok(hbb_common::config::Config::path(""))
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn create_machine_secret_directory(
+    path: &std::path::Path,
+) -> hbb_common::ResultType<()> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        hbb_common::anyhow::anyhow!(
+            "Failed to create machine-secret directory '{}': {}",
+            path.display(),
+            error
+        )
+    })?;
+    set_path_permission_for_machine_secret(path, true)
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn set_path_permission_for_machine_secret(
+    path: &std::path::Path,
+    expect_dir: bool,
+) -> hbb_common::ResultType<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        hbb_common::anyhow::anyhow!(
+            "Failed to inspect machine-secret target '{}': {}",
+            path.display(),
+            error
+        )
+    })?;
+
+    if metadata.file_type().is_symlink() {
+        return Err(hbb_common::anyhow::anyhow!(
+            "Machine-secret target is a symlink and is rejected: '{}'",
+            path.display()
+        ));
+    }
+
+    if expect_dir != metadata.is_dir() {
+        return Err(hbb_common::anyhow::anyhow!(
+            "Machine-secret target has unexpected type: '{}'",
+            path.display()
+        ));
+    }
+
+    let mode = if expect_dir { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
+        hbb_common::anyhow::anyhow!(
+            "Failed to set machine-secret permissions on '{}': {}",
+            path.display(),
+            error
+        )
+    })
+}
+
 #[cfg(target_os = "android")]
 pub const PA_SAMPLE_RATE: u32 = 48000;
 
