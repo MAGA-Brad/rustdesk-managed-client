@@ -27,6 +27,19 @@ use windows::{
 
 pub(super) const CMD_RELATIVE_PATH: &str = "cmd.exe";
 pub(super) const BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE: u32 = 0x5253_0008;
+// XCOPY's /C flag (used for the main install-directory copy) explicitly
+// continues past a locked/in-use file rather than stopping, and nothing
+// downstream checked %errorlevel% on any of the copy/move steps - so an
+// old exe/dll still held open by a not-fully-stopped process or service
+// could silently survive an "update", left running under a falsely
+// reported success. copy_exe_cmd/rename_exe_cmd now record a failure into
+// INSTALL_COPY_FAILED_FLAG instead of continuing to ignore it silently;
+// install_me/update_me check that flag after the service restart step (so
+// a failed copy still leaves the service running - on whatever binary
+// actually made it to disk - rather than trading a silent partial update
+// for a fully offline client) and exit with this code if it was set.
+pub(super) const UPDATE_FILE_COPY_FAILURE_EXIT_CODE: u32 = 0x5253_0009;
+pub(super) const INSTALL_COPY_FAILED_FLAG: &str = "RUSTDESK_INSTALL_COPY_FAILED";
 pub(super) const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2048;
 const SHORTCUT_ICON_INDEX: i32 = 0;
 

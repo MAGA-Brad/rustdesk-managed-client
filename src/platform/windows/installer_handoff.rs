@@ -3,6 +3,7 @@ use super::{
         get_system_executable, path_for_cmd_assignment, path_for_cmd_environment,
         run_elevated_and_wait, trusted_install_environment,
         BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE, CMD_RELATIVE_PATH,
+        UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
     },
     validate_install_app_name, ResultType,
 };
@@ -168,6 +169,11 @@ fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
             "failed to create the installer output directory"
         }
         BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE => "failed to decode an embedded shortcut",
+        UPDATE_FILE_COPY_FAILURE_EXIT_CODE => {
+            "failed to replace one or more installed files - they were still in \
+             use by a running process. Fully close the app (and its service) \
+             before installing or updating again"
+        }
         _ => "installer command failed",
     }
 }

@@ -117,7 +117,8 @@ pub use acl::{
 use installer_handoff::run_cmds;
 use installer_shell::{
     embedded_shortcut_commands, embedded_tray_shortcut_commands, escape_nested_cmd_ampersands,
-    shortcut_bytes, validate_install_value,
+    shortcut_bytes, validate_install_value, INSTALL_COPY_FAILED_FLAG,
+    UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
 };
 
 pub(crate) fn get_program_data_dir() -> ResultType<PathBuf> {
@@ -1644,14 +1645,20 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
 }
 
 pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String> {
+    // /C continues past a locked/in-use file instead of stopping the whole
+    // copy - intentional, so one held-open file doesn't block every other
+    // file from updating - but that means a failure here is otherwise
+    // completely silent unless something checks errorlevel afterward.
     let main_raw = format!(
-        "XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z",
+        "XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z
+        if errorlevel 1 set \"{flag}=1\"",
         PathBuf::from(src_raw)
             .parent()
             .ok_or(anyhow!("Can't get parent directory of {src_raw}"))?
             .to_string_lossy()
             .to_string(),
-        _path
+        _path,
+        flag = INSTALL_COPY_FAILED_FLAG,
     );
     return Ok(main_raw);
 }
@@ -1662,9 +1669,11 @@ pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> 
         "
         {main_exe}
         copy /Y \"{ORIGIN_PROCESS_EXE}\" \"{path}\\{broker_exe}\"
+        if errorlevel 1 set \"{flag}=1\"
         ",
         ORIGIN_PROCESS_EXE = win_topmost_window::ORIGIN_PROCESS_EXE,
         broker_exe = win_topmost_window::INJECTED_PROCESS_EXE,
+        flag = INSTALL_COPY_FAILED_FLAG,
     ))
 }
 
@@ -1682,7 +1691,9 @@ pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
         Ok(format!(
             "
         move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{app_name}.exe\"
+        if errorlevel 1 set \"{flag}=1\"
         ",
+            flag = INSTALL_COPY_FAILED_FLAG,
         ))
     }
 }
@@ -1904,6 +1915,7 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
         "
 {uninstall_str}
 chcp 65001
+set \"{copy_failed_flag}=0\"
 md \"{path}\"
 {copy_exe}
 reg add {subkey} /f
@@ -1929,6 +1941,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 {import_config}
 {after_install}
 {install_remote_printer}
+if \"%{copy_failed_flag}%\"==\"1\" exit /b {copy_failure_exit_code}
 {sleep}
     ",
         display_icon = shortcut_icon_location.as_deref().unwrap_or(exe.as_str()),
@@ -1945,6 +1958,8 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         dels = if debug { "" } else { &dels },
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         import_config = get_import_config(&exe),
+        copy_failed_flag = INSTALL_COPY_FAILED_FLAG,
+        copy_failure_exit_code = UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
     );
     run_cmds(cmds, debug, "install")?;
     run_after_run_cmds(silent);
@@ -3648,6 +3663,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let cmds = format!(
         "
 chcp 65001
+set \"{copy_failed_flag}=0\"
 sc stop {app_name}
 taskkill /F /IM {app_name}.exe{filter}
 {reg_cmd}
@@ -3657,6 +3673,7 @@ taskkill /F /IM {app_name}.exe{filter}
 {restore_service_cmd}
 {uninstall_printer_cmd}
 {install_printer_cmd}
+if \"%{copy_failed_flag}%\"==\"1\" exit /b {copy_failure_exit_code}
 {sleep}
     ",
         app_name = app_name,
@@ -3664,6 +3681,8 @@ taskkill /F /IM {app_name}.exe{filter}
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
         sleep = if debug { "timeout 300" } else { "" },
+        copy_failed_flag = INSTALL_COPY_FAILED_FLAG,
+        copy_failure_exit_code = UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
     );
 
     let _restore_session_guard = crate::common::SimpleCallOnReturn {
@@ -4992,5 +5011,46 @@ ProcessId=10136
             arg,
         );
         assert_eq!(pids.len(), 0);
+    }
+
+    // A locked/in-use file previously failed these copy/move steps silently:
+    // XCOPY's /C flag continues past the error, `copy`/`move` don't check
+    // %errorlevel% at all, and the wrapping install script always exits 0
+    // regardless - see the module-level comment on INSTALL_COPY_FAILED_FLAG.
+    // These just guard that each step still records a failure into the
+    // shared flag, since nothing else about a locked file changes here.
+    #[test]
+    fn copy_raw_cmd_flags_failure_on_errorlevel() {
+        let cmd = copy_raw_cmd("C:\\src\\rustdesk.exe", "", "C:\\dest").unwrap();
+        assert!(cmd.contains("XCOPY"));
+        assert!(cmd.contains(&format!("if errorlevel 1 set \"{INSTALL_COPY_FAILED_FLAG}=1\"")));
+    }
+
+    #[test]
+    fn copy_exe_cmd_flags_failure_on_errorlevel() {
+        let cmd = copy_exe_cmd("C:\\src\\rustdesk.exe", "C:\\dest\\rustdesk.exe", "C:\\dest")
+            .unwrap();
+        // Both the XCOPY (via copy_raw_cmd) and the broker-exe copy must each
+        // be checked - a failure on either one has to be caught.
+        let checks = cmd
+            .matches(&format!("if errorlevel 1 set \"{INSTALL_COPY_FAILED_FLAG}=1\""))
+            .count();
+        assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn rename_exe_cmd_flags_failure_on_errorlevel() {
+        let cmd = rename_exe_cmd("C:\\src\\rustdesk-tmp.exe", "C:\\dest").unwrap();
+        assert!(cmd.contains("move /Y"));
+        assert!(cmd.contains(&format!("if errorlevel 1 set \"{INSTALL_COPY_FAILED_FLAG}=1\"")));
+    }
+
+    #[test]
+    fn rename_exe_cmd_is_noop_when_already_named_correctly() {
+        // The already-correctly-named case has nothing to copy/move, so
+        // there's deliberately no failure check to add here.
+        let app_name = crate::get_app_name();
+        let cmd = rename_exe_cmd(&format!("C:\\src\\{app_name}.exe"), "C:\\dest").unwrap();
+        assert_eq!(cmd, "");
     }
 }
