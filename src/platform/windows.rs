@@ -1644,6 +1644,46 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
     (subkey, path, start_menu, exe)
 }
 
+// `sc stop`/`taskkill /F` both return as soon as the stop/terminate signal
+// is sent, not once Windows has actually released the process's open file
+// handles - copying over the old exe/dll immediately after (as every caller
+// of this used to) can still race a handle that hasn't been freed yet. This
+// polls for up to ~10 seconds (bounded so a genuinely stuck process can't
+// hang an install/update/uninstall forever) using a goto-loop rather than a
+// FOR loop specifically because the wrapping script disables delayed
+// expansion (see prepare_install_commands) - a parenthesized FOR body would
+// have its %VARS% expanded once at parse time instead of per iteration,
+// silently reading stale values. A goto-loop re-expands each line as
+// execution reaches it, so plain %VAR% works correctly here without needing
+// to touch that expansion mode. Checking for `{app_name}.exe` alone (not a
+// separate `sc query` check) covers the service too - the service is the
+// same exe running with a `--service` flag, not a distinct binary. Left as
+// a wait-and-verify step; the errorlevel checks on the copy/move commands
+// below remain as a safety net for whatever this timeout doesn't catch
+// (e.g. a third-party process or antivirus holding its own lock).
+// `extra_filter` should be the exact same PID-exclusion filter (e.g.
+// ` /FI "PID ne 1234"`, or "" to exclude nothing) already passed to the
+// `taskkill` call this follows - `tasklist` accepts the identical `/FI`
+// syntax, and without it, a caller that deliberately spared its own PID
+// (kill_self=false, e.g. the running installer during a fresh install)
+// would see its own still-running self and wait out the full timeout on
+// every single run without ever actually checking anything meaningful.
+pub(super) fn wait_for_app_processes_gone_cmd(app_name: &str, extra_filter: &str) -> String {
+    format!(
+        "
+        set \"RUSTDESK_STOP_WAIT=0\"
+        :rustdesk_wait_for_stop
+        tasklist /FI \"IMAGENAME eq {app_name}.exe\"{extra_filter} 2>nul | findstr /I /C:\"{app_name}.exe\" >nul
+        if errorlevel 1 goto :rustdesk_stop_confirmed
+        set /a RUSTDESK_STOP_WAIT+=1
+        if %RUSTDESK_STOP_WAIT% GEQ 10 goto :rustdesk_stop_confirmed
+        ping -n 2 127.0.0.1 >nul
+        goto :rustdesk_wait_for_stop
+        :rustdesk_stop_confirmed
+        "
+    )
+}
+
 pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String> {
     // /C continues past a locked/in-use file instead of stopping the whole
     // copy - intentional, so one held-open file doesn't block every other
@@ -1994,11 +2034,13 @@ fn get_before_uninstall(kill_self: bool) -> String {
     sc delete {app_name}
     taskkill /F /IM {broker_exe}
     taskkill /F /IM {app_name}.exe{filter}
+    {wait_for_stop}
     reg delete HKEY_CLASSES_ROOT\\.{ext} /f
     reg delete HKEY_CLASSES_ROOT\\{ext} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
     ",
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+        wait_for_stop = wait_for_app_processes_gone_cmd(&app_name, &filter),
     )
 }
 
@@ -3666,6 +3708,7 @@ chcp 65001
 set \"{copy_failed_flag}=0\"
 sc stop {app_name}
 taskkill /F /IM {app_name}.exe{filter}
+{wait_for_stop}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
@@ -3683,6 +3726,7 @@ if \"%{copy_failed_flag}%\"==\"1\" exit /b {copy_failure_exit_code}
         sleep = if debug { "timeout 300" } else { "" },
         copy_failed_flag = INSTALL_COPY_FAILED_FLAG,
         copy_failure_exit_code = UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
+        wait_for_stop = wait_for_app_processes_gone_cmd(&app_name, &filter),
     );
 
     let _restore_session_guard = crate::common::SimpleCallOnReturn {
@@ -5011,6 +5055,30 @@ ProcessId=10136
             arg,
         );
         assert_eq!(pids.len(), 0);
+    }
+
+    #[test]
+    fn wait_for_app_processes_gone_cmd_checks_and_bounds_the_loop() {
+        let cmd = wait_for_app_processes_gone_cmd("rustdesk", "");
+        assert!(cmd.contains("tasklist /FI \"IMAGENAME eq rustdesk.exe\""));
+        assert!(cmd.contains("findstr /I /C:\"rustdesk.exe\""));
+        // Must actually loop back, and must actually have a way out.
+        assert!(cmd.contains(":rustdesk_wait_for_stop"));
+        assert!(cmd.contains(":rustdesk_stop_confirmed"));
+        assert!(cmd.contains("GEQ 10"));
+    }
+
+    #[test]
+    fn wait_for_app_processes_gone_cmd_applies_the_pid_exclusion_filter() {
+        // Without this, a caller that deliberately spared its own PID from
+        // taskkill (kill_self=false - e.g. the running installer during a
+        // fresh install) would see its own still-running self in tasklist
+        // and burn the full timeout on every single run.
+        let filter = " /FI \"PID ne 4242\"";
+        let cmd = wait_for_app_processes_gone_cmd("rustdesk", filter);
+        assert!(cmd.contains(&format!(
+            "tasklist /FI \"IMAGENAME eq rustdesk.exe\"{filter}"
+        )));
     }
 
     // A locked/in-use file previously failed these copy/move steps silently:
