@@ -609,6 +609,26 @@ pub(crate) fn log_rejected_windows_ipc_connection(
     peer_is_system: Option<bool>,
     peer_is_elevated: Option<bool>,
 ) {
+    {
+        let diag = format!(
+            "[{:?}] postfix={:?} peer_pid={:?} peer_session_id={:?} expected_session_id={:?} peer_is_system={:?} peer_is_elevated={:?}\n",
+            std::time::SystemTime::now(),
+            postfix,
+            peer_pid,
+            peer_session_id,
+            expected_session_id,
+            peer_is_system,
+            peer_is_elevated,
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("C:\\ProgramData\\rustdesk-ipc-reject-diag.txt")
+        {
+            use std::io::Write;
+            let _ = f.write_all(diag.as_bytes());
+        }
+    }
     static LOG_THROTTLE: OnceLock<Mutex<UnauthorizedIpcLogThrottle>> = OnceLock::new();
     throttled_unauthorized_ipc_log(&LOG_THROTTLE, |suppressed| {
         if suppressed > 0 {
