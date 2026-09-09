@@ -18,6 +18,7 @@ enum WindowType {
   ViewCamera,
   PortForward,
   Terminal,
+  ManagedChat,
   Unknown
 }
 
@@ -36,6 +37,8 @@ extension Index on int {
         return WindowType.PortForward;
       case 5:
         return WindowType.Terminal;
+      case 6:
+        return WindowType.ManagedChat;
       default:
         return WindowType.Unknown;
     }
@@ -65,6 +68,11 @@ class RustDeskMultiWindowManager {
   final List<int> _viewCameraWindows = List.empty(growable: true);
   final List<int> _portForwardWindows = List.empty(growable: true);
   final List<int> _terminalWindows = List.empty(growable: true);
+  // Chat windows are keyed by conversation id, not tracked as a reusable
+  // session-slot list like the other window types above - there's exactly
+  // one window per conversation, and a closed one should be forgotten
+  // rather than kept around for reuse.
+  final Map<String, int> _managedChatWindows = {};
 
   moveTabToNewWindow(int windowId, String peerId, String sessionId,
       WindowType windowType) async {
@@ -383,6 +391,58 @@ class RustDeskMultiWindowManager {
     return MultiWindowCallResult(windowId, null);
   }
 
+  // Opens (or shows/focuses, or pushes a refresh to) the floating chat
+  // window for one conversation. Must be called from the main window
+  // thread, same as the other _*Windows lists above. A window that was
+  // closed by the user is only ever hidden (see
+  // DesktopManagedChatScreen.onWindowClose), never destroyed - matching
+  // every other window type in this file - so an existing map entry is
+  // always safe to show/focus/reuse rather than replace.
+  // A delivery confirmation for a message this device sent shouldn't pop
+  // a window open on its own - it's only useful to refresh a window the
+  // user already has open (so its "pending delivery" marker clears live),
+  // never to surface one that isn't. No-op if there's no window for this
+  // conversation right now, unlike openManagedChatWindow.
+  Future<void> refreshManagedChatWindowIfOpen(String conversationId) async {
+    final existingWindowId = _managedChatWindows[conversationId];
+    if (existingWindowId != null) {
+      await DesktopMultiWindow.invokeMethod(
+          existingWindowId, kWindowEventManagedChatMessage, conversationId);
+    }
+  }
+
+  Future<void> openManagedChatWindow(String conversationId) async {
+    final existingWindowId = _managedChatWindows[conversationId];
+    if (existingWindowId != null) {
+      await DesktopMultiWindow.invokeMethod(
+          existingWindowId, kWindowEventManagedChatMessage, conversationId);
+      await WindowController.fromWindowId(existingWindowId).show();
+      await WindowController.fromWindowId(existingWindowId).focus();
+      await registerActiveWindow(existingWindowId);
+      return;
+    }
+
+    var params = {
+      'type': WindowType.ManagedChat.index,
+      'conversation_id': conversationId,
+    };
+    final windowController =
+        await DesktopMultiWindow.createWindow(jsonEncode(params));
+    if (isWindows) {
+      windowController.setInitBackgroundColor(Colors.black);
+    }
+    final windowId = windowController.windowId;
+    windowController
+      ..setFrame(const Offset(0, 0) & const Size(950, 840))
+      ..center()
+      ..setTitle(getWindowName(overrideType: WindowType.ManagedChat));
+    if (isMacOS) {
+      Future.microtask(() => windowController.show());
+    }
+    registerActiveWindow(windowId);
+    _managedChatWindows[conversationId] = windowId;
+  }
+
   Future<MultiWindowCallResult> call(
       WindowType type, String methodName, dynamic args) async {
     final wnds = _findWindowsByType(type);
@@ -415,6 +475,8 @@ class RustDeskMultiWindowManager {
         return _portForwardWindows;
       case WindowType.Terminal:
         return _terminalWindows;
+      case WindowType.ManagedChat:
+        return _managedChatWindows.values.toList();
       case WindowType.Unknown:
         break;
     }
@@ -439,6 +501,10 @@ class RustDeskMultiWindowManager {
         break;
       case WindowType.Terminal:
         _terminalWindows.clear();
+        break;
+      case WindowType.ManagedChat:
+        _managedChatWindows.clear();
+        break;
       case WindowType.Unknown:
         break;
     }

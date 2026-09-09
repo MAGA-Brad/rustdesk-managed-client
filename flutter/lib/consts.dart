@@ -52,6 +52,7 @@ const String kAppTypeDesktopFileTransfer = "file transfer";
 const String kAppTypeDesktopViewCamera = "view camera";
 const String kAppTypeDesktopPortForward = "port forward";
 const String kAppTypeDesktopTerminal = "terminal";
+const String kAppTypeDesktopManagedChat = "managed chat";
 
 const String kWindowMainWindowOnTop = "main_window_on_top";
 const String kWindowRefreshCurrentUser = "refresh_current_user";
@@ -71,6 +72,9 @@ const String kWindowEventNewViewCamera = "new_view_camera";
 const String kWindowEventNewPortForward = "new_port_forward";
 const String kWindowEventNewTerminal = "new_terminal";
 const String kWindowEventRestoreTerminalSessions = "restore_terminal_sessions";
+// Main -> chat window: a new/updated message arrived for this conversation
+// id, refresh yourself.
+const String kWindowEventManagedChatMessage = "managed_chat_window_message";
 const String kWindowEventActiveSession = "active_session";
 const String kWindowEventActiveDisplaySession = "active_display_session";
 const String kWindowEventGetRemoteList = "get_remote_list";
@@ -252,6 +256,7 @@ const String kMsgboxTextWaitingForImage = 'Connected, waiting for image...';
 const String kEnvPortableExecutable = "RUSTDESK_APPNAME";
 
 const Color kColorWarn = Color.fromARGB(255, 245, 133, 59);
+const Color kColorActiveSession = Color.fromARGB(255, 26, 111, 219);
 const Color kColorCanvas = Colors.black;
 
 const int kMobileDefaultDisplayWidth = 720;

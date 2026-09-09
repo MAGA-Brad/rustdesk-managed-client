@@ -132,8 +132,24 @@ fn is_windows_7() -> bool {
     false
 }
 
+fn diag_write(msg: &str) {
+    let line = format!("[{:?}] {}\n", std::time::SystemTime::now(), msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\ProgramData\\rustdesk-ctrlaltdel-diag.txt")
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
     println!("executing {}", path.display());
+    diag_write(&format!(
+        "portable::execute: path={:?} args={:?} ui={}",
+        path, args, _ui
+    ));
     // setup env
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_name = exe.file_name().unwrap_or_default();
@@ -160,6 +176,10 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
             .stderr(Stdio::inherit());
     }
     let _child = cmd.spawn();
+    match &_child {
+        Ok(child) => diag_write(&format!("portable::execute: spawn Ok pid={}", child.id())),
+        Err(e) => diag_write(&format!("portable::execute: spawn FAILED err={:?}", e)),
+    }
 
     #[cfg(windows)]
     if _ui {
@@ -192,15 +212,22 @@ fn main() {
     #[cfg(not(windows))]
     let quick_support = false;
 
+    diag_write(&format!(
+        "portable::main: arg_exe={:?} args={:?} click_setup={} quick_support={}",
+        arg_exe, args, click_setup, quick_support
+    ));
+
     let mut ui = false;
     let reader = BinaryReader::default();
-    if let Some(exe) = setup(
+    let setup_result = setup(
         reader,
         None,
         click_setup || args.contains(&"--silent-install".to_owned()),
         &args,
         &mut ui,
-    ) {
+    );
+    diag_write(&format!("portable::main: setup() returned {:?}", setup_result));
+    if let Some(exe) = setup_result {
         if click_setup {
             args = vec!["--install".to_owned()];
         } else if quick_support {

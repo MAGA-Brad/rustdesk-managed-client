@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:bot_toast/bot_toast.dart';
@@ -76,6 +77,15 @@ class _PeerTabPageState extends State<PeerTabPage>
   }
 
   void _loadLocalOptions() {
+    // Managed clients only ever use tile view - the "Change view" picker is
+    // hidden entirely for them (see _createPeerViewTypeSwitch), so a saved
+    // grid/list preference from before this was locked down (or from a
+    // config carried over some other way) must not stick - always resolve
+    // to tile regardless of what's saved.
+    if (bind.mainGetManagedDirectoryStatus().isNotEmpty) {
+      peerCardUiType.value = PeerUiType.tile;
+      return;
+    }
     final uiType = bind.getLocalFlutterOption(k: kOptionPeerCardUiType);
     if (uiType != '') {
       peerCardUiType.value = int.parse(uiType) == 0
@@ -96,6 +106,27 @@ class _PeerTabPageState extends State<PeerTabPage>
       gFFI.peerTabModel.setCurrentTab(tabIndex);
       entries[tabIndex].load?.call(hint: false);
     }
+  }
+
+  Timer? _managedSessionTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    // Owned here (rather than by DirectoryPeersView, which only exists in
+    // the widget tree while the Directory tab is actually selected) so
+    // Recent/Favorite peers keep getting their active-session data backfilled
+    // no matter which tab the user is currently looking at.
+    if (bind.mainGetManagedDirectoryStatus().isNotEmpty) {
+      _managedSessionTimer = Timer.periodic(
+          const Duration(seconds: 3), (_) => enrichPeersWithManagedSessionData());
+    }
+  }
+
+  @override
+  void dispose() {
+    _managedSessionTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -235,6 +266,10 @@ class _PeerTabPageState extends State<PeerTabPage>
   }
 
   Widget _createPeerViewTypeSwitch(BuildContext context) {
+    // Nothing to switch between when tile view is the only option allowed.
+    if (bind.mainGetManagedDirectoryStatus().isNotEmpty) {
+      return const Offstage();
+    }
     return PeerViewDropdown();
   }
 
@@ -551,6 +586,10 @@ class _PeerTabPageState extends State<PeerTabPage>
 
   List<Widget> _landscapeRightActions(BuildContext context) {
     final model = Provider.of<PeerTabModel>(context);
+    // Managed clients get a locked-down toolbar: no multi-select (it's how
+    // users could select-all and bulk delete clients) and no sort picker
+    // (sorting is hardcoded to alphabetical-by-friendly-name for them).
+    final isManaged = bind.mainGetManagedDirectoryStatus().isNotEmpty;
     return [
       const PeerSearchBar().marginOnly(right: 13),
       _createRefresh(
@@ -558,12 +597,12 @@ class _PeerTabPageState extends State<PeerTabPage>
       _createRefresh(
           index: PeerTabIndex.group, loading: gFFI.groupModel.groupLoading),
       Offstage(
-        offstage: model.currentTabCachedPeers.isEmpty,
+        offstage: isManaged || model.currentTabCachedPeers.isEmpty,
         child: _createMultiSelection(),
       ),
       _createPeerViewTypeSwitch(context),
       Offstage(
-        offstage: model.currentTab == PeerTabIndex.recent.index,
+        offstage: isManaged || model.currentTab == PeerTabIndex.recent.index,
         child: PeerSortDropdown(),
       ),
       Offstage(
@@ -627,9 +666,14 @@ class _PeerTabPageState extends State<PeerTabPage>
         _createRefresh(
             index: PeerTabIndex.group, loading: gFFI.groupModel.groupLoading),
     ];
+    // See _landscapeRightActions: managed clients don't get multi-select or
+    // sort controls.
+    final isManaged = bind.mainGetManagedDirectoryStatus().isNotEmpty;
     final List<Widget> dynamicActions = [
-      if (model.currentTabCachedPeers.isNotEmpty) _createMultiSelection(),
-      if (model.currentTab != PeerTabIndex.recent.index) PeerSortDropdown(),
+      if (!isManaged && model.currentTabCachedPeers.isNotEmpty)
+        _createMultiSelection(),
+      if (!isManaged && model.currentTab != PeerTabIndex.recent.index)
+        PeerSortDropdown(),
       if (model.currentTab == PeerTabIndex.ab.index) _toggleTags()
     ];
     final rightWidth = availableWidth -

@@ -6,11 +6,13 @@ import 'package:bot_toast/bot_toast.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/common/widgets/managed_chat_dialog.dart';
 import 'package:flutter_hbb/common/widgets/overlay.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/pages/install_page.dart';
 import 'package:flutter_hbb/desktop/pages/server_page.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_file_transfer_screen.dart';
+import 'package:flutter_hbb/desktop/screen/desktop_managed_chat_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_view_camera_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_port_forward_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_remote_screen.dart';
@@ -53,9 +55,6 @@ Future<void> main(List<String> args) async {
   if (args.isNotEmpty && args.first == 'multi_window') {
     kWindowId = int.parse(args[1]);
     stateGlobal.setWindowId(kWindowId!);
-    if (!isMacOS) {
-      WindowController.fromWindowId(kWindowId!).showTitleBar(false);
-    }
     final argument = args[2].isEmpty
         ? <String, dynamic>{}
         : jsonDecode(args[2]) as Map<String, dynamic>;
@@ -64,6 +63,15 @@ Future<void> main(List<String> args) async {
     // Because stateGlobal.windowId is a global value.
     argument['windowId'] = kWindowId;
     kWindowType = type.windowType;
+    // Every sub window (including chat) draws its own frameless custom
+    // title bar - see tabbar_widget.dart / desktop_managed_chat_screen.dart.
+    // This isn't just cosmetic: with setPreventClose(true) below, the
+    // native OS close button's WM_CLOSE never reaches Dart at all (it's
+    // silently swallowed), so every window type needs its own explicit
+    // close control wired to windowManager.close(), which IS intercepted.
+    if (!isMacOS) {
+      WindowController.fromWindowId(kWindowId!).showTitleBar(false);
+    }
     switch (kWindowType) {
       case WindowType.RemoteDesktop:
         desktopType = DesktopType.remote;
@@ -99,6 +107,14 @@ Future<void> main(List<String> args) async {
           argument,
           kAppTypeDesktopTerminal,
         );
+        break;
+      case WindowType.ManagedChat:
+        desktopType = DesktopType.managedChat;
+        runMultiWindow(
+          argument,
+          kAppTypeDesktopManagedChat,
+        );
+        break;
       default:
         break;
     }
@@ -146,6 +162,9 @@ void runMainApp(bool startService) async {
   }
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();
+  // So the Directory tab's unread-mail badge (see peer_card.dart) has
+  // correct state from a cold start, not just after the first live push.
+  unawaited(gFFI.managedChatModel.loadLocalConversations());
   runApp(App());
 
   bool? alwaysOnTop;
@@ -230,6 +249,11 @@ void runMultiWindow(
         params: argument,
       );
       break;
+    case kAppTypeDesktopManagedChat:
+      widget = DesktopManagedChatScreen(
+        params: argument,
+      );
+      break;
     default:
       // no such appType
       exit(0);
@@ -278,6 +302,9 @@ void runMultiWindow(
       break;
     case kAppTypeDesktopTerminal:
       await restoreWindowPosition(WindowType.Terminal, windowId: kWindowId!);
+      break;
+    case kAppTypeDesktopManagedChat:
+      await restoreWindowPosition(WindowType.ManagedChat, windowId: kWindowId!);
       break;
     default:
       // no such appType
@@ -574,6 +601,20 @@ _registerEventHandler() {
   if (isDesktop) {
     platformFFI.registerEventHandler('native_ui', 'native_ui', (evt) async {
       NativeUiHandler.instance.onEvent(evt);
+    });
+    platformFFI.registerEventHandler(
+        'managed_chat_message', 'managed_chat_message', (evt) async {
+      final conversationId = evt['conversation_id'];
+      if (conversationId is String) {
+        await handleManagedChatPush(conversationId);
+      }
+    });
+    platformFFI.registerEventHandler(
+        'managed_chat_delivered', 'managed_chat_delivered', (evt) async {
+      final conversationId = evt['conversation_id'];
+      if (conversationId is String) {
+        await handleManagedChatDelivered(conversationId);
+      }
     });
   }
   if (isAndroid) {

@@ -250,6 +250,12 @@ class _PeersViewState extends State<_PeersView>
               // No need to listen the currentTab change event.
               // Because the currentTab change event will trigger the peers change event,
               // and the peers change event will trigger _buildPeersView().
+              // The fixed tile height is normally enough, but a card showing
+              // the active-session pill needs extra room - without this, the
+              // pill's content overflows the SizedBox and paints over
+              // whatever is in the row below (no clipping in release builds).
+              final hasSessionPill = peer.activeSessionPeer != null &&
+                  peer.activeSessionPeer!.isNotEmpty;
               return !isPortrait
                   ? Obx(() => peerCardUiType.value == PeerUiType.list
                       ? Container(height: 45, child: visibilityChild)
@@ -257,7 +263,9 @@ class _PeersViewState extends State<_PeersView>
                           ? SizedBox(
                               width: 220, height: 140, child: visibilityChild)
                           : SizedBox(
-                              width: 220, height: 42, child: visibilityChild))
+                              width: 220,
+                              height: hasSessionPill ? 64 : 42,
+                              child: visibilityChild))
                   : Container(child: visibilityChild);
             }
 
@@ -374,7 +382,13 @@ class _PeersViewState extends State<_PeersView>
       );
     }
 
-    if (widget.peers.loadEvent != LoadEvent.recent) {
+    if (bind.mainGetManagedDirectoryStatus().isNotEmpty) {
+      // Managed clients always sort alphabetically by friendly name (the
+      // sort picker is hidden for them - see peer_tab_page.dart), in every
+      // tab including Recent, which is otherwise left in natural order.
+      peers.sort((p1, p2) =>
+          p1.getId().toLowerCase().compareTo(p2.getId().toLowerCase()));
+    } else if (widget.peers.loadEvent != LoadEvent.recent) {
       switch (sortedBy) {
         case PeerSortType.remoteId:
           peers.sort((p1, p2) => p1.getId().compareTo(p2.getId()));
@@ -449,6 +463,37 @@ abstract class BasePeersView extends StatelessWidget {
         peerCardBuilder: peerCardBuilder,
         peerTabIndex: peerTabIndex);
   }
+}
+
+// Recent/Favorite peers come from the local peer cache (mainLoadRecentPeers/
+// mainLoadFavPeers), not the managed directory snapshot DirectoryPeersView
+// polls - so unlike Directory peers, they never get `activeSessionPeer` set
+// on construction. Call this periodically (see _PeerTabPageState, which
+// owns a timer for this that outlives any single tab being visible - a
+// timer owned by DirectoryPeersView itself would stop as soon as the user
+// switched off the Directory tab) to cross-reference the same snapshot by
+// rustdesk_id and backfill it onto the peers already loaded into
+// recentPeersModel/favoritePeersModel, in place.
+void enrichPeersWithManagedSessionData() {
+  final raw = bind.mainGetManagedDirectoryStatus();
+  if (raw.isEmpty) return;
+  Map<String, String?> sessionByRustdeskId;
+  try {
+    final decoded = jsonDecode(raw);
+    final devices = decoded is Map<String, dynamic> && decoded['devices'] is List
+        ? decoded['devices'] as List
+        : const [];
+    sessionByRustdeskId = {
+      for (final item in devices)
+        if (item is Map && (item['rustdesk_id'] as String?)?.isNotEmpty == true)
+          item['rustdesk_id'] as String: item['active_session_peer'] as String?,
+    };
+  } catch (e) {
+    debugPrint('Failed to parse managed directory for session enrichment: $e');
+    return;
+  }
+  gFFI.recentPeersModel.updateActiveSessionPeers(sessionByRustdeskId);
+  gFFI.favoritePeersModel.updateActiveSessionPeers(sessionByRustdeskId);
 }
 
 class RecentPeersView extends BasePeersView {
@@ -536,6 +581,7 @@ class _DirectoryPeersViewState extends State<DirectoryPeersView> {
           'note': map['last_seen_at'] ?? '',
         });
         peer.online = map['online'] == true;
+        peer.activeSessionPeer = map['active_session_peer'] as String?;
         if (peer.id.isNotEmpty) peers.add(peer);
       }
       gFFI.lanPeersModel.replacePeers(peers);

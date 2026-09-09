@@ -831,6 +831,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         await rustDeskWinManager.registerActiveWindow(call.arguments["id"]);
       } else if (call.method == kWindowEventHide) {
         await rustDeskWinManager.unregisterActiveWindow(call.arguments['id']);
+        // Cheap and harmless for any other window type - refreshes the
+        // Directory tab's unread-mail badge in case the window that just
+        // closed was a chat window whose messages just got marked read.
+        unawaited(gFFI.managedChatModel.loadLocalConversations());
       } else if (call.method == kWindowConnect) {
         await connectMainDesktop(
           call.arguments['id'],

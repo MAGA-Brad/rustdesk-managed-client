@@ -1689,8 +1689,32 @@ pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String
     // copy - intentional, so one held-open file doesn't block every other
     // file from updating - but that means a failure here is otherwise
     // completely silent unless something checks errorlevel afterward.
+    //
+    // Killing every rustdesk process first (see stop_running_instance_before_install
+    // and update_me's own taskkill+wait) is not sufficient on its own: the
+    // `--server` process runs as SYSTEM in session 0 and is routinely
+    // invisible to (or unkillable by) a merely-elevated Administrator's
+    // tasklist/taskkill - see the comment above update_me's cmds ("4
+    // processes... but only 2 shown in tasklist"). So librustdesk.dll /
+    // RustDesk.exe can still be locked when XCOPY runs, and /C then
+    // silently skips them while still reporting success. Renaming a locked
+    // file aside always succeeds on Windows even while it's memory-mapped
+    // by a running process - the file's data stays alive via that process's
+    // existing handle, decoupled from the directory entry - so clear the
+    // target names out of the way first for the file types that actually
+    // get loaded into memory, before XCOPY tries to overwrite them in
+    // place. Confirmed in production: 2026-09-06, install_me repeatedly
+    // reported Ok while librustdesk.dll on disk never changed.
+    let clear_locked = format!(
+        "
+        del /F /Q \"{path}\\*.rdupdatebak\" >nul 2>&1
+        for %%F in (\"{path}\\*.exe\" \"{path}\\*.dll\") do if exist \"%%F\" move /Y \"%%F\" \"%%F.rdupdatebak\" >nul 2>&1
+        ",
+        path = _path,
+    );
     let main_raw = format!(
-        "XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z
+        "{clear_locked}
+        XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z
         if errorlevel 1 set \"{flag}=1\"",
         PathBuf::from(src_raw)
             .parent()
@@ -1809,8 +1833,9 @@ fn get_after_install(
     netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=out action=allow program=\"{exe}\" enable=yes
     netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=in action=allow program=\"{exe}\" enable=yes
     {create_service}
+    {watchdog_setup}
     reg add HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /f /v SoftwareSASGeneration /t REG_DWORD /d 1
-    ", create_service=get_create_service(&exe))
+    ", create_service=get_create_service(&exe), watchdog_setup=get_watchdog_setup_cmd(&exe))
 }
 
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
@@ -3432,6 +3457,10 @@ pub fn try_lock_tray_single_instance() -> bool {
 pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     log::info!("Uninstalling service...");
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    // The watchdog tasks are deliberately left untouched here - see the
+    // comment on get_watchdog_setup_cmd. They stay alive and will simply
+    // no-op on their own (service_watchdog_check_and_fix reads this same
+    // option) rather than needing to be torn down and later recreated.
     Config::set_option("stop-service".into(), "Y".into());
     let cmds = format!(
         "
@@ -3480,9 +3509,11 @@ taskkill /F /IM {app_name}.exe{filter}
 copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
 {import_config}
 {create_service}
+{watchdog_setup}
     ",
         import_config = get_import_config(exe),
         create_service = get_create_service(exe),
+        watchdog_setup = get_watchdog_setup_cmd(exe),
     ))
 }
 
@@ -3858,12 +3889,31 @@ fn kill_process_by_pids(name: &str, pids: Vec<Pid>) -> ResultType<()> {
 // real OS-level argv difference from the already-running main window's, so
 // the image-name+argv match below could otherwise catch the installer itself.
 pub fn stop_running_instance_before_install() {
+    // Must happen unconditionally, before the is_self_service_running gate
+    // below: the watchdog task fires on its own 5-minute schedule regardless
+    // of whether the service happens to be running at the exact moment this
+    // function is called, and it must not race the copy step further down
+    // by recreating/restarting the service mid-update.
+    let disable_watchdog = disable_watchdog_task_cmd();
+
     // Gate on whether the service is actually running before doing anything
-    // privileged: on a genuinely fresh machine (the common case - most
+    // else privileged: on a genuinely fresh machine (the common case - most
     // installs are first-time) there's nothing to stop, and this function
     // must not trigger an extra UAC prompt for no reason.
     if !is_self_service_running() {
-        log::info!("stop_running_instance_before_install: service is not running, nothing to do");
+        log::info!(
+            "stop_running_instance_before_install: service is not running, disabling watchdog only"
+        );
+        if let Err(err) = run_cmds(
+            format!("chcp 65001\n{disable_watchdog}"),
+            false,
+            "disable_watchdog",
+        ) {
+            log::warn!(
+                "stop_running_instance_before_install: failed to disable watchdog task: {}",
+                err
+            );
+        }
         return;
     }
 
@@ -3878,14 +3928,31 @@ pub fn stop_running_instance_before_install() {
     // mechanism instead of trying to do this directly.
     let app_name = crate::get_app_name();
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    // taskkill's /F terminates a process but returns as soon as the
+    // termination signal is issued - not once the process has actually
+    // exited and released its file/pipe handles. Without waiting for that,
+    // the copy step that runs right after this returns (see install_me's
+    // copy_exe_cmd / XCOPY /Y /E /H /C ...) can still find librustdesk.dll
+    // locked by a --server or GUI process that's a few hundred ms from
+    // exiting but hasn't yet - and XCOPY's /C flag then silently *skips*
+    // that one locked file and reports success anyway, leaving the old DLL
+    // in place under a "successful" install (confirmed in production:
+    // 2026-09-06, a real install left --server running fully stale code
+    // with no visible error). get_before_uninstall already solved this
+    // exact problem for the uninstall path with the same
+    // wait_for_app_processes_gone_cmd helper - reuse it here instead of
+    // inventing a second, weaker fix.
     let cmds = format!(
         "
     chcp 65001
+    {disable_watchdog}
     sc stop {app_name}
     taskkill /F /IM {broker_exe}
     taskkill /F /IM {app_name}.exe{filter}
+    {wait_for_stop}
     ",
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+        wait_for_stop = wait_for_app_processes_gone_cmd(&app_name, &filter),
     );
     if let Err(err) = run_cmds(cmds, false, "stop_running_instance") {
         log::warn!(
@@ -4055,6 +4122,168 @@ sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayNam
 sc start {app_name}
 ",
     app_name = crate::get_app_name())
+    }
+}
+
+// Named after the app so a custom-branded client doesn't collide with a
+// stock RustDesk install's tasks on the same machine. Two separate tasks
+// (rather than one task with two triggers) because plain schtasks.exe
+// /Create only lets a single invocation define one schedule; giving a task
+// a second trigger from the CLI needs an XML task definition, which is a
+// bigger departure from this file's established plain-schtasks/sc pattern
+// than just registering a second task with the same action.
+fn watchdog_task_name() -> String {
+    format!("{} ServiceWatchdog", crate::get_app_name())
+}
+
+fn watchdog_logon_task_name() -> String {
+    format!("{} ServiceWatchdogLogon", crate::get_app_name())
+}
+
+// Recreating the tasks (rather than just re-enabling them) resets them to
+// the enabled state in one step, so install_me's call to this after a copy
+// is both "make sure they point at the current exe" and "turn them back
+// on" at once - no separate enable command needed.
+//
+// Deliberately unconditional - does NOT check stop-service and skip/delete
+// the tasks when it's "Y". An earlier version did that, but it made the
+// watchdog less resilient, not more: service_watchdog_check_and_fix()
+// already reads stop-service itself (via any_user_disabled_service()) and
+// correctly no-ops while it's set, so the periodic/logon tasks staying
+// alive costs nothing. Deleting them here meant that if stop-service ever
+// got cleared back to empty through anything other than the app's own
+// "Start" button (a direct config edit, some other tool), the watchdog
+// couldn't self-heal - it had been torn down along with the service, so
+// nothing was left running to notice the flag had changed. A watchdog that
+// stays alive and checks both directions every time it fires is simpler
+// and strictly more robust than one whose own existence is toggled by the
+// same preference it's supposed to be enforcing.
+fn get_watchdog_setup_cmd(exe: &str) -> String {
+    if config::is_outgoing_only() {
+        return "".to_string();
+    }
+    let task_name = watchdog_task_name();
+    let logon_task_name = watchdog_logon_task_name();
+    let nested_exe = escape_nested_cmd_ampersands(exe);
+    let action = format!("\\\"{nested_exe}\\\" --service-watchdog");
+    format!(
+        "schtasks /Create /F /RU SYSTEM /RL HIGHEST /SC MINUTE /MO 5 /TN \"{task_name}\" /TR \"{action}\"\nschtasks /Create /F /RU SYSTEM /RL HIGHEST /SC ONLOGON /TN \"{logon_task_name}\" /TR \"{action}\"\n"
+    )
+}
+
+// Disabling (not deleting) is deliberate: install_me's later
+// get_watchdog_setup_cmd recreates both tasks unconditionally on success,
+// so a disable here that's never followed by a recreate (install_me failed
+// or was declined) just leaves the watchdog off until the next successful
+// update - never leaves a stale task pointed at a half-replaced exe.
+fn disable_watchdog_task_cmd() -> String {
+    format!(
+        "schtasks /Change /TN \"{}\" /Disable\nschtasks /Change /TN \"{}\" /Disable\n",
+        watchdog_task_name(),
+        watchdog_logon_task_name()
+    )
+}
+
+// Invoked every 5 minutes by the scheduled task created above, already
+// running as SYSTEM - no elevation dance needed here, just plain
+// std::process::Command calls (which also sidesteps all the manual
+// cmd.exe quoting fragility that the batch-script cmds elsewhere need).
+//
+// Deliberately unconditional w.r.t. stop-service - a managed client should
+// never be able to opt itself out of remote management, whether that's via
+// an accidental Settings click, a config edit, or anything else. Brad's
+// explicit call (2026-09-07), after two earlier attempts that tried to
+// "respect" that flag from the watchdog: the flag is meaningless on a
+// managed fleet and the button that sets it is being hidden from the
+// managed-client UI entirely (desktop_setting_page.dart) as a companion
+// change, so there is no longer any legitimate way for a managed client to
+// reach this state on purpose in the first place.
+pub fn service_watchdog_check_and_fix() {
+    if config::is_outgoing_only() {
+        return;
+    }
+    let app_name = crate::get_app_name();
+    let query = std::process::Command::new("sc")
+        .args(["query", &app_name])
+        .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+        .output();
+    let (exists, running) = match &query {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).contains("RUNNING"),
+        ),
+        Err(_) => (false, false),
+    };
+    if !exists {
+        crate::server::input_service::diag_write(
+            "service_watchdog: service missing, recreating",
+        );
+        let (_, _, _, exe) = get_install_info();
+        let nested_exe = escape_nested_cmd_ampersands(&exe);
+        let bin_path = format!("\"{}\" --service", nested_exe);
+        let display_name = format!("{} Service", app_name);
+        let _ = std::process::Command::new("sc")
+            .args([
+                "create",
+                &app_name,
+                "binpath=",
+                &bin_path,
+                "start=",
+                "auto",
+                "DisplayName=",
+                &display_name,
+            ])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .output();
+        let _ = std::process::Command::new("sc")
+            .args(["start", &app_name])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .output();
+    } else if !running {
+        crate::server::input_service::diag_write("service_watchdog: service stopped, starting");
+        let _ = std::process::Command::new("sc")
+            .args(["start", &app_name])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .output();
+    }
+    ensure_tray_for_all_sessions();
+}
+
+// The Windows service starting/restarting (whether via this watchdog or
+// anything else) does not by itself put a --tray process into any
+// logged-in user's interactive session - that only happens today via a
+// Startup-folder shortcut (fires on the *next* logon, not immediately) or
+// a normal no-args launch's own is_self_service_running()-gated check in
+// core_main.rs. Confirmed in production 2026-09-07: after the watchdog
+// force-started the service, the interactive session had a working
+// service but no visible tray icon until the user manually relaunched the
+// app. Reuses the same session-crossing mechanism update_me()'s
+// _restore_session_guard already uses to restore tray sessions after an
+// update, so a managed client left with a service but no tray icon
+// self-heals within one watchdog cycle instead of needing a manual
+// relaunch.
+fn ensure_tray_for_all_sessions() {
+    let app_name = crate::get_app_name();
+    let app_exe_name = format!("{}.exe", app_name);
+    let tray_pids =
+        crate::platform::get_pids_of_process_with_args(&app_exe_name, &["--tray"]);
+    let tray_sessions: std::collections::HashSet<u32> = tray_pids
+        .iter()
+        .filter_map(|pid| get_session_id_of_process(pid.as_u32()))
+        .collect();
+    let (_, _, _, exe) = get_install_info();
+    for session in get_available_sessions(false) {
+        if session.sid == 0 || tray_sessions.contains(&session.sid) {
+            continue;
+        }
+        if unsafe { is_session_locked(session.sid) } == TRUE {
+            continue;
+        }
+        crate::server::input_service::diag_write(&format!(
+            "service_watchdog: no tray process in session {}, launching one",
+            session.sid
+        ));
+        let _ = run_exe_in_session(&exe, vec!["--tray"], session.sid, true);
     }
 }
 
@@ -5092,6 +5321,28 @@ ProcessId=10136
         let cmd = copy_raw_cmd("C:\\src\\rustdesk.exe", "", "C:\\dest").unwrap();
         assert!(cmd.contains("XCOPY"));
         assert!(cmd.contains(&format!("if errorlevel 1 set \"{INSTALL_COPY_FAILED_FLAG}=1\"")));
+    }
+
+    // A `--server` process running as SYSTEM in session 0 can keep
+    // librustdesk.dll/RustDesk.exe locked even after every visible rustdesk
+    // process has been killed and waited for (see the comment above
+    // update_me's cmds). XCOPY's /C then silently skips the locked file
+    // while still reporting success. Renaming it aside first must happen
+    // before the XCOPY line, since a rename succeeds on a locked-but-shared
+    // file even though an in-place overwrite doesn't.
+    #[test]
+    fn copy_raw_cmd_clears_locked_exe_and_dll_before_xcopy() {
+        let cmd = copy_raw_cmd("C:\\src\\rustdesk.exe", "", "C:\\dest").unwrap();
+        let clear_pos = cmd
+            .find("*.rdupdatebak")
+            .expect("must clear old rename-aside backups");
+        let move_pos = cmd
+            .find("move /Y")
+            .expect("must rename locked exe/dll aside");
+        let xcopy_pos = cmd.find("XCOPY").expect("must still XCOPY the rest");
+        assert!(clear_pos < move_pos && move_pos < xcopy_pos);
+        assert!(cmd.contains("\"C:\\dest\\*.exe\""));
+        assert!(cmd.contains("\"C:\\dest\\*.dll\""));
     }
 
     #[test]

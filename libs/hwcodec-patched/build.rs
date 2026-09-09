@@ -154,7 +154,7 @@ mod ffmpeg {
             )
         );
         {
-            let mut static_libs = vec!["avcodec", "avutil", "avformat"];
+            let mut static_libs = vec!["avcodec", "avutil", "avformat", "swresample"];
             // Intel Quick Sync (libmfx/QSV) is x86/x64-only; FFmpeg is built without
             // --enable-libmfx on arm64 (see res/vcpkg/ffmpeg/portfile.cmake), so don't link it there.
             if target_os == "windows" && (target_arch == "x64" || target_arch == "x86") {
@@ -176,7 +176,12 @@ mod ffmpeg {
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
         let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
         let dyn_libs: Vec<&str> = if target_os == "windows" {
-            ["User32", "bcrypt", "ole32", "advapi32"].to_vec()
+            // mfuuid/strmiids: vcpkg's FFmpeg build includes the Media
+            // Foundation hardware encoder backend (mfenc.o/mf_utils.o
+            // inside avcodec.lib), which needs these for its COM
+            // interface GUIDs (IID_IMFTransform, IID_ICodecAPI, etc.) -
+            // FFmpeg itself doesn't declare them as link dependencies.
+            ["User32", "bcrypt", "ole32", "advapi32", "mfuuid", "strmiids"].to_vec()
         } else if target_os == "linux" {
             let mut v = ["drm", "X11", "stdc++"].to_vec();
             if target_arch == "x86_64" {

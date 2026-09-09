@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    os::windows::ffi::OsStrExt,
     path::PathBuf,
     sync::Once,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use winapi::um::winbase::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
@@ -258,33 +260,50 @@ fn write_persisted_auth(state: &PersistedDirectoryAuth) -> ResultType<()> {
 
         drop(file);
 
-        let temp_wide: Vec<u16> = temp_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        #[cfg(windows)]
+        {
+            let temp_wide: Vec<u16> = temp_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
 
-        let state_wide: Vec<u16> = state_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+            let state_wide: Vec<u16> = state_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
 
-        let moved = unsafe {
-            MoveFileExW(
-                temp_wide.as_ptr(),
-                state_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+            let moved = unsafe {
+                MoveFileExW(
+                    temp_wide.as_ptr(),
+                    state_wide.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
 
-        if moved == 0 {
-            return Err(anyhow!(
+            if moved == 0 {
+                return Err(anyhow!(
+                    "Failed to atomically replace protected directory state '{}': {}",
+                    state_path.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        // rename(2) already atomically replaces an existing destination on the
+        // same filesystem - temp_path and state_path are always siblings in
+        // the same directory (see ensure_directory_store_dir), so there is no
+        // separate "replace existing" flag to pass the way MoveFileExW needs
+        // one on Windows.
+        #[cfg(not(windows))]
+        fs::rename(&temp_path, &state_path).map_err(|error| {
+            anyhow!(
                 "Failed to atomically replace protected directory state '{}': {}",
                 state_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
+                error
+            )
+        })?;
 
         // The replacement retains the temporary file's restrictive ACL.
         // Reapply/verify our exact desired ACL before returning success.
@@ -586,6 +605,8 @@ struct HeartbeatResponse {
     device_status: String,
     client_version: Option<String>,
     client_settings: Option<serde_json::Value>,
+    #[serde(default)]
+    debug_log_requested: bool,
 }
 #[derive(Deserialize, Serialize)]
 struct DirectoryDevice {
@@ -597,6 +618,12 @@ struct DirectoryDevice {
     last_seen_at: Option<String>,
     #[serde(default)]
     online: bool,
+    // Display name of whoever this peer currently has an active remote
+    // session with, or None if it isn't in one right now. Server-computed
+    // (device_active_sessions, both directions) so the client never has to
+    // reason about session state itself - just render this if present.
+    #[serde(default)]
+    active_session_peer: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1211,6 +1238,14 @@ async fn post_enrollment_request(
     let response = client
         .post(&url)
         .json(&request)
+        // The shared client's default timeout (20s) is sized for lightweight,
+        // frequently-retried calls (heartbeats, manifest checks) - enrollment
+        // is a rare, one-time, high-stakes call where a false timeout on a
+        // slow network leaves a device stuck in a confusing half-state (the
+        // server commits the pending row and returns a poll_token, but the
+        // client never receives it and has to be manually reconciled), so a
+        // longer allowance is worth it here specifically.
+        .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
         .map_err(|error| {
@@ -1457,6 +1492,36 @@ fn approved_credential<'a>(
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| DirectoryApiError::configuration(operation))
+}
+
+/// (base_url, bearer_credential) for the current device, for callers
+/// outside this module - managed_chat, specifically - that need to make
+/// their own authenticated calls to the managed directory API without
+/// reaching into this module's otherwise-private enrollment state.
+pub(crate) fn current_directory_credential(
+    operation: &'static str,
+) -> ResultType<(String, String)> {
+    let base_url = managed_directory_base_url()
+        .ok_or_else(|| anyhow!("Managed directory endpoint is not configured"))?
+        .to_owned();
+    let state = read_persisted_auth()?
+        .ok_or_else(|| anyhow!("Device is not enrolled"))?;
+    let credential = approved_credential(&state, operation)
+        .map_err(|error| anyhow!("{}", error))?
+        .to_owned();
+    Ok((base_url, credential))
+}
+
+/// This device's own RDS device UUID, read from local persisted state -
+/// no network call. Used by managed_chat to tell "me" apart from the
+/// other participant(s) in a conversation without needing the server to
+/// say so on every response.
+pub(crate) fn current_device_id() -> ResultType<String> {
+    let state = read_persisted_auth()?.ok_or_else(|| anyhow!("Device is not enrolled"))?;
+    state
+        .device_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Device has no continuity ID yet"))
 }
 
 async fn get_device_me_request(
@@ -1720,6 +1785,7 @@ pub async fn update_contact_email_once(
 #[derive(Deserialize)]
 struct ManagedUpdateManifest {
     channel: String,
+    arch: String,
     build_number: u64,
     version: String,
     file_name: String,
@@ -1791,6 +1857,7 @@ fn managed_update_signed_payload(manifest: &ManagedUpdateManifest) -> String {
         concat!(
             "rustdesk-managed-update-v1\n",
             "channel={}\n",
+            "arch={}\n",
             "build_number={}\n",
             "version={}\n",
             "file_name={}\n",
@@ -1799,6 +1866,7 @@ fn managed_update_signed_payload(manifest: &ManagedUpdateManifest) -> String {
             "published_at={}\n"
         ),
         manifest.channel,
+        manifest.arch,
         manifest.build_number,
         manifest.version,
         manifest.file_name,
@@ -1813,6 +1881,9 @@ fn verify_managed_update_manifest(manifest: &ManagedUpdateManifest) -> ResultTyp
 
     if manifest.channel != managed_update_channel() {
         return Err(anyhow!("Managed update channel mismatch"));
+    }
+    if manifest.arch != std::env::consts::ARCH {
+        return Err(anyhow!("Managed update architecture mismatch"));
     }
     if manifest.file_name.is_empty()
         || manifest.file_name.contains('/')
@@ -1891,7 +1962,13 @@ pub async fn managed_update_check_and_download(
         .map_err(|_| anyhow!("Managed update URL is invalid"))?;
     latest_url_parsed
         .query_pairs_mut()
-        .append_pair("channel", channel);
+        .append_pair("channel", channel)
+        // Compile-time, not runtime-detected: each build is compiled for one
+        // specific target, so this is always correct and never needs OS-level
+        // architecture detection. Lets the server serve the matching release
+        // instead of handing an ARM64 client an x86_64 "update" (or vice
+        // versa) - see main.py's managed_update_latest for the other side.
+        .append_pair("arch", std::env::consts::ARCH);
     let latest_url = latest_url_parsed.to_string();
     let client = super::http_client::create_http_client_async_with_url_strict(&latest_url)
         .await
@@ -2414,6 +2491,7 @@ mod tests {
             device_status: "approved".to_owned(),
             client_version: Some("1.0.0".to_owned()),
             client_settings: None,
+            debug_log_requested: false,
         };
 
         assert!(validate_heartbeat_response(&good).is_ok());
@@ -2424,6 +2502,7 @@ mod tests {
             device_status: "blocked".to_owned(),
             client_version: Some("1.0.0".to_owned()),
             client_settings: None,
+            debug_log_requested: false,
         };
 
         assert!(validate_heartbeat_response(&bad).is_err());
@@ -2590,6 +2669,7 @@ mod tests {
                     last_ip: None,
                     last_seen_at: None,
                     online: true,
+                    active_session_peer: None,
                 },
                 DirectoryDevice {
                     id: "device-peer".to_owned(),
@@ -2599,6 +2679,7 @@ mod tests {
                     last_ip: None,
                     last_seen_at: None,
                     online: true,
+                    active_session_peer: None,
                 },
             ],
             client_settings: None,
@@ -2681,6 +2762,17 @@ fn managed_directory_base_url() -> Option<&'static str> {
         .filter(|value| !value.is_empty())
 }
 
+// Separate from managed_directory_base_url() - the admin/ops web console
+// commonly lives on its own subdomain, distinct from the client-facing
+// directory API host, so this isn't just that URL with a path appended.
+// Unset by default; a build that wants the About screen's "Ops Console"
+// link to appear sets this at compile time.
+pub fn managed_ops_console_url() -> Option<&'static str> {
+    option_env!("RUSTDESK_MANAGED_OPS_CONSOLE_URL")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn managed_relay_lease_base_url(fallback: &str) -> &str {
     match option_env!("RUSTDESK_MANAGED_RELAY_LEASE_BASE")
         .map(str::trim)
@@ -2695,6 +2787,10 @@ struct ApprovedSchedule {
     next_heartbeat: Instant,
     next_directory: Instant,
     next_relay_lease: Instant,
+    // Set from the most recent heartbeat response's debug_log_requested
+    // flag (see device_heartbeat server-side); consumed and cleared by the
+    // debug-log upload hook in run_approved_cycle below.
+    debug_log_requested: bool,
 }
 
 impl ApprovedSchedule {
@@ -2705,6 +2801,7 @@ impl ApprovedSchedule {
             next_heartbeat: now,
             next_directory: now,
             next_relay_lease: now,
+            debug_log_requested: false,
         }
     }
 
@@ -3069,8 +3166,9 @@ async fn run_approved_cycle(
         )
         .await
         {
-            Ok(_) => {
+            Ok(response) => {
                 *consecutive_failures = 0;
+                schedule.debug_log_requested = response.debug_log_requested;
 
                 schedule.next_heartbeat =
                     Instant::now()
@@ -3143,9 +3241,90 @@ async fn run_approved_cycle(
         }
     }
 
+    // Debug-log upload: cheap to check every cycle (see maybe_upload's own
+    // marker-file gate), not slotted into the Instant-based schedule above
+    // since it doesn't need second-level precision like the other three.
+    if let Ok(credential) = approved_credential(state, "debug log upload") {
+        let force = schedule.debug_log_requested;
+        crate::hbbs_http::debug_log::maybe_upload(
+            base_url,
+            credential,
+            &identity.client_version,
+            force,
+        )
+        .await;
+        if force {
+            schedule.debug_log_requested = false;
+        }
+    }
+
     set_state(DirectoryState::Ready);
     schedule.next_delay()
 }
+
+/// Manual trigger for the debug-log upload, bypassing the daily cadence
+/// (same as a heartbeat-carried request) - lets Brad/Claude force a fresh
+/// log from a machine they have hands-on access to, via `--upload-debug-log`
+/// (see core_main.rs), without waiting on the background worker's own
+/// schedule. Spins up its own runtime since this is meant to be called from
+/// a plain sync CLI-dispatch context with no runtime running yet, mirroring
+/// updater.rs's has_no_active_conns_ipc.
+pub fn debug_log_upload_once() -> bool {
+    let rt = match hbb_common::tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("Failed to start runtime: {}", error);
+            return false;
+        }
+    };
+
+    rt.block_on(async {
+        let Some(base_url) = managed_directory_base_url() else {
+            eprintln!("Managed directory endpoint is not configured");
+            return false;
+        };
+
+        let state = match read_persisted_auth() {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                eprintln!("Device is not enrolled");
+                return false;
+            }
+            Err(error) => {
+                eprintln!("Failed to read directory auth state: {}", error);
+                return false;
+            }
+        };
+
+        let identity = match current_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                eprintln!("Failed to build device identity: {}", error);
+                return false;
+            }
+        };
+
+        let credential = match approved_credential(&state, "manual debug log upload") {
+            Ok(credential) => credential,
+            Err(error) => {
+                eprintln!("Device is not approved: {}", error);
+                return false;
+            }
+        };
+
+        crate::hbbs_http::debug_log::maybe_upload(
+            base_url,
+            credential,
+            &identity.client_version,
+            true,
+        )
+        .await;
+
+        println!("Debug log upload attempted - check RDS for the result.");
+        true
+    })
+}
+
 pub async fn enroll_once(
     enrollment_password: &str,
 ) -> ResultType<()> {

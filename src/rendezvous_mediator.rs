@@ -375,7 +375,17 @@ impl RendezvousMediator {
                         notify_android_needs_deploy();
                     }
                     _ => {
-                        log::error!("unknown RegisterPkResponse");
+                        // rpr.result.enum_value() only returns Ok(..) for
+                        // the three variants handled above - everything
+                        // else (a recognized-but-unhandled Result variant
+                        // like ID_EXISTS/TOO_FREQUENT/NOT_SUPPORT/etc, or a
+                        // genuinely out-of-schema value) lands here. Log
+                        // the raw wire value so this is diagnosable instead
+                        // of just "unknown".
+                        log::error!(
+                            "unhandled RegisterPkResponse result, raw value={:?}",
+                            rpr.result.value()
+                        );
                     }
                 }
                 if rpr.keep_alive > 0 {

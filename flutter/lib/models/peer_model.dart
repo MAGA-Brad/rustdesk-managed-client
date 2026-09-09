@@ -18,6 +18,10 @@ class Peer {
   String rdpPort;
   String rdpUsername;
   bool online = false;
+  // Display name of whoever this peer currently has an active remote
+  // session with, from the managed directory's active_session_peer field.
+  // Null when the peer isn't in a session right now.
+  String? activeSessionPeer;
   String loginName; //login username
   String device_group_name;
   String note;
@@ -163,6 +167,7 @@ class Peer {
         note: other.note,
         sameServer: other.sameServer);
     peer.online = other.online;
+    peer.activeSessionPeer = other.activeSessionPeer;
     return peer;
   }
 }
@@ -221,6 +226,22 @@ class Peers extends ChangeNotifier {
     restPeerIds = [];
     event = UpdateEvent.load;
     notifyListeners();
+  }
+
+  // Backfills activeSessionPeer (by rustdesk id) onto peers already loaded
+  // from a source - like the local recent/favorite cache - that doesn't
+  // carry managed-directory session data at load time. See
+  // enrichPeersWithManagedSessionData in peers_view.dart.
+  void updateActiveSessionPeers(Map<String, String?> sessionByRustdeskId) {
+    var changed = false;
+    for (final peer in peers) {
+      final newVal = sessionByRustdeskId[peer.id];
+      if (peer.activeSessionPeer != newVal) {
+        peer.activeSessionPeer = newVal;
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
   }
 
   void _updateOnlineState(Map<String, dynamic> evt) {

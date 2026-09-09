@@ -35,6 +35,13 @@ pub type SessionID = uuid::Uuid;
 
 lazy_static::lazy_static! {
     static ref TEXTURE_RENDER_KEY: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
+    // frb 1.x wire functions are plain (non-async) - the wire dispatch itself
+    // already runs them on frb's own background thread pool and returns the
+    // result to Dart via a port, so blocking here does not stall the UI.
+    // This runtime just gives the managed-chat HTTP/WS calls somewhere to
+    // `.await` from that synchronous context.
+    static ref MANAGED_CHAT_RUNTIME: hbb_common::tokio::runtime::Runtime =
+        hbb_common::tokio::runtime::Runtime::new().unwrap();
 }
 
 fn initialize(app_dir: &str, custom_client_config: &str) {
@@ -82,6 +89,26 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
         // core_main's init_log does not work for flutter since it is only applied to its load_library in main.c
         hbb_common::init_log(false, "flutter_ffi");
     }
+
+    // Managed chat is a desktop Directory-tab feature; the mobile app has
+    // its own separate FCM-based push mechanism via mobile_api.py, not
+    // this websocket. Spawned after init_log() above (not before, as
+    // this was originally written) - log::* is a no-op facade until the
+    // real logger is installed, so anything this background thread logs
+    // before that point is silently dropped, not just delayed.
+    //
+    // On Windows the actual websocket connection lives in --server
+    // instead (see ipc::Data::ManagedChatIpcRequest's doc comment - this
+    // GUI process can't read the enrollment credential it needs there);
+    // this just starts the listener that receives --server's relayed
+    // pushes so push_global_event can reach Dart. Other platforms don't
+    // have that GUI-vs-privileged-process file permission split, so the
+    // websocket still just runs directly in the GUI process there, same
+    // as originally written.
+    #[cfg(all(not(any(target_os = "android", target_os = "ios")), windows))]
+    managed_chat_start_push_listener();
+    #[cfg(all(not(any(target_os = "android", target_os = "ios")), not(windows)))]
+    crate::hbbs_http::managed_chat::spawn_chat_websocket_task();
 }
 
 #[inline]
@@ -97,6 +124,211 @@ pub enum EventToUI {
     Event(String),
     Rgba(usize),
     Texture(usize, bool), // (display, gpu_texture)
+}
+
+// Managed chat: out-of-session messaging between managed devices. Each
+// function returns a JSON string - either the serialized success value or
+// `{"error": "..."}"` - so Dart parses one shape uniformly rather than
+// needing frb-specific struct bindings for every response type.
+//
+// The server (RDS) is a delivery mailbox only - it purges a message once
+// every recipient has it, and never retains "read" state at all. This
+// device's own copy of chat history, and how long that copy is kept per
+// conversation, lives entirely in managed_chat_store's local sqlite file.
+// The *_sync_* functions below talk to the server and then fold whatever
+// it returns into that local store; the *_local_* functions never touch
+// the network at all, so the UI can render instantly (including offline).
+fn managed_chat_error(error: impl std::fmt::Display) -> String {
+    serde_json::json!({ "error": error.to_string() }).to_string()
+}
+
+// The interactive GUI process (a filtered, non-elevated token even for a
+// local admin user) can't read the ACL'd-to-SYSTEM+Administrators
+// machine-secret directory-state file that every managed_chat remote
+// operation needs for its auth credential - the exact same permission
+// gap already documented (and already fixed, via the same IPC-to-
+// --server relay) for the managed-update "Update Now" feature. On
+// Windows this relays the operation to the --server process, which
+// already reads that file successfully; other platforms don't have this
+// ACL scheme, so they just call the same handler in-process.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn managed_chat_remote_call(operation: &'static str, args: serde_json::Value) -> String {
+    let args_json = args.to_string();
+    log::info!("managed chat: FFI call {} args={}", operation, args_json);
+    #[cfg(windows)]
+    {
+        let result =
+            MANAGED_CHAT_RUNTIME.block_on(crate::ipc::managed_chat_ipc_call(operation, args_json));
+        log::info!("managed chat: FFI call {} returning {}", operation, result);
+        return result;
+    }
+    #[cfg(not(windows))]
+    {
+        MANAGED_CHAT_RUNTIME.block_on(crate::hbbs_http::managed_chat::handle_ipc_request(
+            operation,
+            &args_json,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        MANAGED_CHAT_RUNTIME.block_on(crate::hbbs_http::managed_chat::handle_ipc_request(
+            operation,
+            &args_json,
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_start_conversation(peer_rustdesk_id: String) -> String {
+    let raw = managed_chat_remote_call(
+        "start_conversation",
+        serde_json::json!({ "peer_rustdesk_id": peer_rustdesk_id }),
+    );
+    if let Ok(conversation) =
+        serde_json::from_str::<crate::hbbs_http::managed_chat::ChatConversation>(&raw)
+    {
+        if let Err(error) = crate::managed_chat_store::upsert_conversation(&conversation) {
+            log::error!("managed chat: failed to store conversation: {}", error);
+        }
+    }
+    raw
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_send_message(conversation_id: String, body: String) -> String {
+    let raw = managed_chat_remote_call(
+        "send_message",
+        serde_json::json!({ "conversation_id": conversation_id, "body": body }),
+    );
+    if let Ok(message) = serde_json::from_str::<crate::hbbs_http::managed_chat::ChatMessage>(&raw)
+    {
+        let delivered = !message.delivered_to.is_empty();
+        if let Err(error) =
+            crate::managed_chat_store::insert_message(&conversation_id, &message, true, delivered)
+        {
+            log::error!("managed chat: failed to store sent message: {}", error);
+        }
+    }
+    raw
+}
+
+// Pulls the current conversation list from the server (creating/refreshing
+// local rows for anything new - e.g. someone else started a conversation
+// with this device while it was offline) and returns the merged local
+// view, complete with the last-message/unread-count this device itself
+// tracks. A failed remote fetch (offline) just falls back to whatever is
+// already known locally rather than surfacing an error - conversations
+// already underway shouldn't disappear from the UI for lack of a network.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_sync_conversations() -> String {
+    let raw = managed_chat_remote_call("list_conversations", serde_json::json!({}));
+    match serde_json::from_str::<Vec<crate::hbbs_http::managed_chat::ChatConversation>>(&raw) {
+        Ok(conversations) => {
+            for conversation in &conversations {
+                if let Err(error) = crate::managed_chat_store::upsert_conversation(conversation) {
+                    log::error!("managed chat: failed to store conversation: {}", error);
+                }
+            }
+        }
+        Err(_) => log::debug!("managed chat: sync_conversations remote fetch failed: {}", raw),
+    }
+    match crate::managed_chat_store::list_conversations() {
+        Ok(conversations) => serde_json::to_string(&conversations).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// Drains whatever the server is still holding for this conversation (see
+// managed_chat.py's mailbox model), stores it locally, and returns the
+// full local history. Same offline fallback as sync_conversations above.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_sync_messages(conversation_id: String) -> String {
+    let raw = managed_chat_remote_call(
+        "get_messages",
+        serde_json::json!({ "conversation_id": conversation_id }),
+    );
+    match serde_json::from_str::<Vec<crate::hbbs_http::managed_chat::ChatMessage>>(&raw) {
+        Ok(messages) => {
+            for message in &messages {
+                if let Err(error) = crate::managed_chat_store::insert_message(
+                    &conversation_id,
+                    message,
+                    false,
+                    true,
+                ) {
+                    log::error!("managed chat: failed to store synced message: {}", error);
+                }
+            }
+        }
+        Err(_) => log::debug!("managed chat: sync_messages remote fetch failed: {}", raw),
+    }
+    match crate::managed_chat_store::list_messages(&conversation_id) {
+        Ok(messages) => serde_json::to_string(&messages).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_get_local_conversations() -> String {
+    match crate::managed_chat_store::list_conversations() {
+        Ok(conversations) => serde_json::to_string(&conversations).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_get_local_messages(conversation_id: String) -> String {
+    match crate::managed_chat_store::list_messages(&conversation_id) {
+        Ok(messages) => serde_json::to_string(&messages).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// Purely local - the server has no concept of "read" any more. Also
+// applies that conversation's retention policy immediately, since an
+// "Off" (don't keep history) conversation prunes on read.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_mark_read(conversation_id: String) -> String {
+    match crate::managed_chat_store::mark_read(&conversation_id) {
+        Ok(()) => "{}".to_string(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// Unconditionally deletes every local message in this conversation,
+// regardless of read state. Called from the chat window's own close
+// handler when retention is "no retention" (RETENTION_OFF) - that mode
+// means "visible only while the window is open", not "delete on arrival",
+// so the purge has to happen on close, not on insert/read.
+pub fn managed_chat_purge_conversation(conversation_id: String) -> String {
+    match crate::managed_chat_store::purge_conversation(&conversation_id) {
+        Ok(()) => "{}".to_string(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// retention_days: -1 = forever, 0 = "no retention" (visible only while
+// the chat window stays open - see managed_chat_purge_conversation),
+// else prune anything older than that many days. Age-based pruning is
+// applied immediately on change; "no retention" only purges on window
+// close.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_set_retention(conversation_id: String, retention_days: i64) -> String {
+    match crate::managed_chat_store::set_retention(&conversation_id, retention_days) {
+        Ok(()) => "{}".to_string(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_self_device_id() -> String {
+    managed_chat_remote_call("self_device_id", serde_json::json!({}))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_get_retention(conversation_id: String) -> String {
+    serde_json::json!({ "retention_days": crate::managed_chat_store::get_retention(&conversation_id) })
+        .to_string()
 }
 
 pub fn host_stop_system_key_propagate(_stopped: bool) {
@@ -2318,6 +2550,16 @@ pub fn main_get_build_date() -> String {
     crate::BUILD_DATE.to_string()
 }
 
+pub fn main_get_managed_build_number() -> u64 {
+    crate::hbbs_http::directory_enrollment::managed_build_number()
+}
+
+pub fn main_get_managed_ops_console_url() -> String {
+    crate::hbbs_http::directory_enrollment::managed_ops_console_url()
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub fn translate(name: String, locale: String) -> SyncReturn<String> {
     SyncReturn(crate::client::translate_locale(name, &locale))
 }
@@ -2808,6 +3050,23 @@ pub fn main_start_ipc_url_server() {
     std::thread::spawn(move || crate::server::start_ipc_url_server());
 }
 
+/// Start an ipc listener for relaying incoming managed chat messages from
+/// --server (the only process with permission to read the enrollment
+/// credential the actual websocket connection needs).
+///
+/// * Should only be called in the main flutter window - it's the only
+///   process with a Flutter engine for push_global_event to reach.
+/// * Windows only - see ipc::Data::ManagedChatIncomingMessage's doc
+///   comment for why this exists at all.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_start_push_listener() {
+    #[cfg(windows)]
+    {
+        log::info!("managed chat: starting push listener in GUI process");
+        std::thread::spawn(move || crate::server::start_managed_chat_push_listener());
+    }
+}
+
 pub fn main_test_wallpaper(_second: u64) {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     std::thread::spawn(move || match crate::platform::WallPaperRemover::new() {
@@ -3111,20 +3370,23 @@ pub fn main_supported_input_source() -> SyncReturn<String> {
 // connection to the *existing* service's listener (a different executable
 // path than this temp-extracted installer - a legitimate identity check,
 // not a bug). Stop it first so there's nothing left to conflict with.
-#[cfg(windows)]
-pub fn install_stop_running_instance() {
-    crate::platform::windows::stop_running_instance_before_install();
-}
-
 // flutter_rust_bridge's codegen walks this file's AST without evaluating
-// #[cfg(...)], so it always emits a wire_install_stop_running_instance()
-// call regardless of target platform. This install-over-a-running-instance
-// scenario is specific to the Windows self-extracting installer flow (there
-// is no equivalent "runInstallPage" path on Android, which installs/updates
-// APKs through the OS package manager instead), so the non-Windows arm of
-// that generated call site just needs a harmless no-op to link.
-#[cfg(not(windows))]
-pub fn install_stop_running_instance() {}
+// #[cfg(...)] on top-level items - two separate #[cfg]-gated fns of the
+// same name (as this used to be) parse as a duplicate symbol and fail
+// codegen outright, regardless of target. The single-declaration,
+// cfg-inside-the-body shape (matching main_supported_input_source()
+// above) is what this file uses everywhere else for exactly this reason.
+// This install-over-a-running-instance scenario is specific to the
+// Windows self-extracting installer flow (there is no equivalent
+// runInstallPage path on Android, which installs/updates APKs through
+// the OS package manager instead), so the non-Windows arm is a harmless
+// no-op.
+pub fn install_stop_running_instance() {
+    #[cfg(windows)]
+    {
+        crate::platform::windows::stop_running_instance_before_install();
+    }
+}
 
 // The installer's own process (runInstallPage in main.dart) never calls
 // start_server(), so it never spawns the "" (main) IPC listener that a

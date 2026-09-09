@@ -110,6 +110,7 @@ enum DesktopType {
   terminal,
   cm,
   portForward,
+  managedChat,
 }
 
 bool isDoubleEqual(double a, double b) {
@@ -3048,6 +3049,8 @@ String getWindowName({WindowType? overrideType}) {
       return "Port Forward - $name";
     case WindowType.RemoteDesktop:
       return "Remote Desktop - $name";
+    case WindowType.ManagedChat:
+      return "Chat - $name";
     default:
       break;
   }

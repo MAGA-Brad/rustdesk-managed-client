@@ -6,7 +6,9 @@ use serde_json::{Map, Value};
 pub mod account;
 pub mod downloader;
 pub mod directory_enrollment;
+mod debug_log;
 mod http_client;
+pub mod managed_chat;
 pub mod record_upload;
 pub mod sync;
 pub use http_client::{

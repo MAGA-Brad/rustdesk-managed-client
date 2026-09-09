@@ -82,6 +82,9 @@ totp-rs = { version = "5.4", default-features = false, features = ["gen_secret",
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys"}
 reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd"], default-features=false }
+tokio-tungstenite = { version = "0.26", features = ["native-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# Local, per-device managed-chat history store (bundled: no system sqlite3 dependency).
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
@@ -215,8 +218,17 @@ exclude = ["vdi/host", "examples/custom_plugin"]
 
 # Patch libxdo-sys to use a stub implementation that doesn't require libxdo
 # This allows building and running on systems without libxdo installed (e.g., Wayland-only)
+#
+# libsodium-sys: adds SODIUM_LIB_DIR_<TARGET> (checked before plain
+# SODIUM_LIB_DIR) so a real x64-host cross-compile to aarch64-pc-windows-msvc
+# can point the host-arch build (a build-dependency, always native) and the
+# target-arch build (the actual arm64 binary) at two different libsodium
+# libs - upstream's single global SODIUM_LIB_DIR can't distinguish them, and
+# aarch64 Windows has no libsodium prebuilt/from-source path otherwise, only
+# the vcpkg-built static lib. See libs/libsodium-sys-patched/build.rs.
 [patch.crates-io]
 libxdo-sys = { path = "libs/libxdo-sys-stub" }
+libsodium-sys = { path = "libs/libsodium-sys-patched" }
 
 # Vendored hwcodec (pinned upstream commit 778df1f9) with two build fixes for
 # newer FFmpeg (post FF_API_FRAME_KEY / FF_PROFILE_* removal): key_frame now

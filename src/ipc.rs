@@ -412,6 +412,31 @@ pub enum Data {
     PendingManagedUpdateNotify(Option<(u64, String)>),
     #[cfg(windows)]
     TriggerManagedUpdateNow,
+    // Managed chat's REST calls need the machine-secret directory-state
+    // file, which is ACL'd to SYSTEM + Administrators - the interactive
+    // GUI process (a filtered, non-elevated token even for a local admin
+    // user) can't read it, exactly the same permission gap documented
+    // above for TriggerManagedUpdateNow. Routed to the --server process
+    // for the same reason: it already reads this file successfully and
+    // runs bound to the right session. (operation, json_args) in,
+    // json_result (or a JSON {"error": ...} object) out - see
+    // hbbs_http::managed_chat::handle_ipc_request for the operation list.
+    #[cfg(windows)]
+    ManagedChatIpcRequest(String, String),
+    #[cfg(windows)]
+    ManagedChatIpcResponse(String),
+    // The actual chat websocket connection also has to live in --server
+    // for the same ACL reason (see ManagedChatIpcRequest above) - but
+    // push_global_event only reaches Dart from inside the GUI process,
+    // which hosts the Flutter engine. --server sends this, fire-and-
+    // forget, to a small dedicated listener the GUI hosts just for this
+    // (see managed_chat_start_push_listener in flutter_ffi.rs) - modeled
+    // on the same "receiver hosts the listener, sender connects out as a
+    // one-shot client" shape server.rs's start_ipc_url_server already
+    // uses for UrlLink, just inverted for --server as the sender instead
+    // of an external OS-level URL activation.
+    #[cfg(windows)]
+    ManagedChatIncomingMessage(String),
     OnlineStatus(Option<(i64, bool)>),
     Config((String, Option<String>)),
     Options(Option<HashMap<String, String>>),
@@ -859,6 +884,17 @@ async fn handle(data: Data, stream: &mut Connection) {
             // process) rather than the SYSTEM service - see
             // trigger_managed_update_now_via_server for why.
             crate::updater::trigger_managed_update_now();
+        }
+        #[cfg(windows)]
+        Data::ManagedChatIpcRequest(operation, args_json) => {
+            log::info!(
+                "managed chat IPC: server process received {} request",
+                operation
+            );
+            let result =
+                crate::hbbs_http::managed_chat::handle_ipc_request(&operation, &args_json).await;
+            log::info!("managed chat IPC: server process result: {}", result);
+            allow_err!(stream.send(&Data::ManagedChatIpcResponse(result)).await);
         }
         Data::OnlineStatus(_) => {
             let x = config::get_online_state();
@@ -2101,7 +2137,13 @@ pub async fn send_directory_enrollment_secret(
     // service response.
     drop(message);
 
-    match stream.next_timeout(30_000).await? {
+    // Must exceed the enrollment HTTP request's own timeout
+    // (post_enrollment_request in directory_enrollment.rs, currently 60s) -
+    // this is a wrapper around that whole round-trip (service receives this
+    // IPC call, makes the HTTP request, persists the result, replies), so a
+    // shorter outer deadline here would cut the wait off before the inner
+    // HTTP timeout ever gets a chance to matter.
+    match stream.next_timeout(65_000).await? {
         Some(
             crate::ipc::Data::DirectoryEnrollmentResult(
                 accepted,
@@ -2206,6 +2248,55 @@ pub async fn trigger_managed_update_now_via_server() -> ResultType<()> {
         .send(&crate::ipc::Data::TriggerManagedUpdateNow)
         .await?;
     Ok(())
+}
+
+// See ManagedChatIpcRequest's doc comment for why this can't just call
+// hbbs_http::managed_chat directly from the GUI process. Returns the
+// operation's JSON result (or a JSON {"error": ...} object) as a plain
+// String either way - the caller (flutter_ffi.rs) doesn't need to
+// distinguish an IPC-layer failure from an application-layer one, both
+// render the same "something went wrong" toast to the user.
+#[cfg(windows)]
+pub async fn managed_chat_ipc_call(operation: &str, args_json: String) -> String {
+    let make_error = |message: String| serde_json::json!({ "error": message }).to_string();
+
+    log::info!("managed chat IPC: calling {} (from GUI process)", operation);
+
+    let mut stream = match crate::ipc::connect(1000, "").await {
+        Ok(stream) => stream,
+        Err(error) => {
+            log::info!(
+                "managed chat IPC: failed to connect to server process: {}",
+                error
+            );
+            return make_error(format!("failed to reach server process: {}", error));
+        }
+    };
+    if let Err(error) = stream
+        .send(&crate::ipc::Data::ManagedChatIpcRequest(
+            operation.to_string(),
+            args_json,
+        ))
+        .await
+    {
+        log::info!("managed chat IPC: failed to send request: {}", error);
+        return make_error(error.to_string());
+    }
+    log::info!("managed chat IPC: request sent, awaiting response");
+    match stream.next_timeout(10_000).await {
+        Ok(Some(crate::ipc::Data::ManagedChatIpcResponse(json))) => {
+            log::info!("managed chat IPC: got response: {}", json);
+            json
+        }
+        Ok(_) => {
+            log::info!("managed chat IPC: unexpected response variant");
+            make_error("server process gave no response".to_string())
+        }
+        Err(error) => {
+            log::info!("managed chat IPC: error awaiting response: {}", error);
+            make_error(error.to_string())
+        }
+    }
 }
 
 #[cfg(windows)]

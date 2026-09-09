@@ -15,6 +15,8 @@ import '../../models/peer_model.dart';
 import '../../models/platform_model.dart';
 import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
 import '../../desktop/widgets/popup_menu.dart';
+import '../../utils/multi_window_manager.dart';
+import 'managed_chat_dialog.dart';
 import 'dart:math' as math;
 
 typedef PopupMenuEntryBuilder = Future<List<mod_menu.PopupMenuEntry<String>>>
@@ -248,6 +250,7 @@ class _PeerCardState extends State<_PeerCard>
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.titleSmall,
                         )),
+                        UnreadMailBadge(hostname: peer.hostname),
                       ]).marginOnly(top: isPortrait ? 0 : 2),
                       Row(
                         children: [
@@ -288,6 +291,12 @@ class _PeerCardState extends State<_PeerCard>
                             )
                         ],
                       ),
+                      if (getActiveSessionPill(peer.activeSessionPeer) != null)
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: getActiveSessionPill(peer.activeSessionPeer)!
+                              .marginOnly(top: 3),
+                        ),
                     ],
                   ).marginOnly(top: 2),
                 ),
@@ -428,7 +437,11 @@ class _PeerCardState extends State<_PeerCard>
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.titleSmall,
                         )),
+                        UnreadMailBadge(hostname: peer.hostname),
                       ]).paddingSymmetric(vertical: 8)),
+                      if (getActiveSessionPill(peer.activeSessionPeer) != null)
+                        getActiveSessionPill(peer.activeSessionPeer)!
+                            .marginOnly(right: 8),
                       checkBoxOrActionMoreLandscape(peer, isTile: false),
                     ],
                   ).paddingSymmetric(horizontal: 12.0),
@@ -838,6 +851,21 @@ abstract class BasePeerCard extends StatelessWidget {
   }
 
   @protected
+  MenuEntryBase<String> _messageAction(String id) {
+    return MenuEntryButton<String>(
+      childBuilder: (TextStyle? style) => Text(
+        translate('Message'),
+        style: style,
+      ),
+      proc: () {
+        openManagedChatWithPeer(id);
+      },
+      padding: menuPadding,
+      dismissOnClicked: true,
+    );
+  }
+
+  @protected
   MenuEntryBase<String> _removeAction(String id) {
     return MenuEntryButton<String>(
       childBuilder: (TextStyle? style) => Row(
@@ -1083,8 +1111,11 @@ class DirectoryPeerCard extends BasePeerCard {
     final menuItems = <MenuEntryBase<String>>[
       _connectAction(context),
       _transferFileAction(context),
-      MenuEntryDivider(),
     ];
+    if (bind.mainGetManagedDirectoryStatus().isNotEmpty) {
+      menuItems.add(_messageAction(peer.id));
+    }
+    menuItems.add(MenuEntryDivider());
     if (!favs.contains(peer.id)) {
       menuItems.add(_addFavAction(peer.id));
     } else {
@@ -1431,6 +1462,77 @@ Widget getOnline(double rightPadding, bool online) {
           padding: EdgeInsets.fromLTRB(0, 4, rightPadding, 4),
           child: CircleAvatar(
               radius: 3, backgroundColor: online ? Colors.green : kColorWarn)));
+}
+
+/// Mail-icon badge shown on a Directory card when there's an unread
+/// managed-chat conversation with that peer - lets the user notice and
+/// open it even when a live push's popup window failed to grab focus
+/// (Windows blocks a background process from stealing foreground focus)
+/// or was missed outright (see managed_chat.rs's notify_gui_of_incoming_message
+/// retry comment). Matched by hostname, not RustDesk id - that's what
+/// ChatParticipant carries.
+class UnreadMailBadge extends StatelessWidget {
+  final String hostname;
+
+  const UnreadMailBadge({Key? key, required this.hostname}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      final conversation =
+          gFFI.managedChatModel.conversationForPeerHostname(hostname);
+      if (conversation == null || conversation.unreadCount <= 0) {
+        return const SizedBox.shrink();
+      }
+      return Tooltip(
+        message: translate('Unread messages'),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(999),
+          onTap: () => rustDeskWinManager.openManagedChatWindow(conversation.id),
+          child: Padding(
+            padding: const EdgeInsets.all(2),
+            child: Icon(Icons.mail, size: 16, color: kColorActiveSession),
+          ),
+        ),
+      );
+    });
+  }
+}
+
+Widget? getActiveSessionPill(String? activeSessionPeer) {
+  if (activeSessionPeer == null || activeSessionPeer.isEmpty) return null;
+  // Fleet friendly names follow a "Name-DeviceType" convention (e.g.
+  // "Brady-Home", "Manny-Laptop") - show just the name part before the
+  // first dash, since the device-type suffix isn't useful in this
+  // already-tight pill. Falls back to the full string if there's no dash.
+  final shortName = activeSessionPeer.split('-').first;
+  // Solid fill + white text rather than tinted-background/colored-text -
+  // the latter tested unreadable over a compressed remote session (low
+  // contrast at 10px compounds with video compression blur on fine text).
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+    decoration: BoxDecoration(
+      color: kColorActiveSession,
+      borderRadius: BorderRadius.circular(999),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.screen_share_outlined, size: 12, color: Colors.white)
+            .marginOnly(right: 4),
+        Flexible(
+          child: Text(
+            '${translate('In session')} - $shortName',
+            style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                color: Colors.white),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 Widget build_more(BuildContext context, {bool invert = false}) {

@@ -361,9 +361,19 @@ pub fn install_me_managed(
                             "Managed directory enrollment handoff failed: {}",
                             error
                         );
+                        // This branch is a transport/IPC-level failure (timeout,
+                        // connection issue) - not a definitive rejection from
+                        // the server (that's the Ok((false, reason)) arm above,
+                        // which keeps its own message). In practice the actual
+                        // enrollment POST commonly still reaches and is recorded
+                        // by the server even when the client never sees the
+                        // response in time, so a message implying outright
+                        // failure is often simply wrong. Say what's actually
+                        // known and give a real next step instead of alarming
+                        // the user over something that may have already worked.
                         show_managed_install_error(
                             &format!(
-                                "RustDesk was installed, but enrollment could not be completed due to an unexpected error.\n\n{}",
+                                "RustDesk was installed and the enrollment request was sent, but confirmation was not received in time.\n\nThis device may already be waiting for approval - check the admin panel, or simply re-run the installer to confirm.\n\n{}",
                                 error
                             ),
                         );

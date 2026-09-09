@@ -449,6 +449,18 @@ class _GeneralState extends State<_General> {
       return const Offstage();
     }
 
+    // A managed client's SYSTEM-level watchdog unconditionally keeps the
+    // service running regardless of this setting (see
+    // service_watchdog_check_and_fix in src/platform/windows.rs) - a
+    // managed device should never be able to opt itself out of remote
+    // management, whether by an accidental click here or otherwise. Since
+    // the button would appear to work for a few minutes and then silently
+    // revert, hide it outright rather than leave it as a confusing no-op.
+    final isManagedClient = bind.mainGetManagedDirectoryStatus().isNotEmpty;
+    if (isManagedClient) {
+      return const Offstage();
+    }
+
     final hideStopService =
         bind.mainGetBuildinOption(key: kOptionHideStopService) == 'Y';
 
@@ -2531,12 +2543,16 @@ class _AboutState extends State<_About> {
       final buildDate = await bind.mainGetBuildDate();
       final fingerprint = await bind.mainGetFingerprint();
       final myId = await bind.mainGetMyId();
+      final managedBuildNumber = await bind.mainGetManagedBuildNumber();
+      final managedOpsConsoleUrl = await bind.mainGetManagedOpsConsoleUrl();
       return {
         'license': license,
         'version': version,
         'buildDate': buildDate,
         'fingerprint': fingerprint,
-        'myId': myId
+        'myId': myId,
+        'managedBuildNumber': managedBuildNumber,
+        'managedOpsConsoleUrl': managedOpsConsoleUrl,
       };
     }(), hasData: (data) {
       final license = data['license'].toString();
@@ -2544,6 +2560,8 @@ class _AboutState extends State<_About> {
       final buildDate = data['buildDate'].toString();
       final fingerprint = data['fingerprint'].toString();
       final myId = data['myId'].toString();
+      final managedBuildNumber = data['managedBuildNumber'] as int;
+      final managedOpsConsoleUrl = data['managedOpsConsoleUrl'].toString();
       const linkStyle = TextStyle(decoration: TextDecoration.underline);
       final scrollController = ScrollController();
       return SingleChildScrollView(
@@ -2555,9 +2573,22 @@ class _AboutState extends State<_About> {
               const SizedBox(
                 height: 8.0,
               ),
+              if (managedOpsConsoleUrl.isNotEmpty)
+                InkWell(
+                    onTap: () {
+                      launchUrlString(managedOpsConsoleUrl);
+                    },
+                    child: Text(
+                      'Ops Console',
+                      style: linkStyle,
+                    ).marginSymmetric(vertical: 4.0)),
               SelectionArea(
                   child: Text('${translate('Version')}: $version')
                       .marginSymmetric(vertical: 4.0)),
+              if (managedBuildNumber > 0)
+                SelectionArea(
+                    child: Text('Build: $managedBuildNumber')
+                        .marginSymmetric(vertical: 4.0)),
               SelectionArea(
                   child: Text('${translate('Build Date')}: $buildDate')
                       .marginSymmetric(vertical: 4.0)),

@@ -70,8 +70,8 @@ static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Initial wait after startup before the first update check (30 seconds).
 pub const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 
-/// One full day — default interval between update checks.
-pub const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+/// Default interval between update checks (30 minutes).
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 30);
 
 /// Minimum interval between consecutive update checks (10 minutes).
 pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
@@ -98,8 +98,8 @@ pub fn manually_check_update() -> ResultType<()> {
 /// For the managed-client "Update Now" button. Runs check_update() directly
 /// on a fresh thread instead of going through the mpsc channel, so it isn't
 /// subject to the background loop's MIN_INTERVAL throttle - a user clicking
-/// this expects it to act immediately, not silently no-op if the daily check
-/// happened to run a few minutes ago.
+/// this expects it to act immediately, not silently no-op if the scheduled
+/// check happened to run a few minutes ago.
 pub fn trigger_managed_update_now() {
     std::thread::spawn(|| {
         if let Err(e) = check_update(true) {
@@ -158,7 +158,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
     }
 
     let mut last_check_time = Instant::now();
-    let mut check_interval = DUR_ONE_DAY;
+    let mut check_interval = CHECK_INTERVAL;
     loop {
         let recv_res = rx_msg.recv_timeout(check_interval);
         match &recv_res {
@@ -177,7 +177,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
                     check_interval = RETRY_INTERVAL;
                 } else {
                     last_check_time = Instant::now();
-                    check_interval = DUR_ONE_DAY;
+                    check_interval = CHECK_INTERVAL;
                 }
             }
             Ok(UpdateMsg::Exit) => break,
@@ -204,7 +204,7 @@ fn check_update(manually: bool) -> ResultType<()> {
                 candidate.build_number,
                 candidate.version.clone(),
             )));
-            // The background daily check (manually=false) must never silently
+            // The background scheduled check (manually=false) must never silently
             // apply an update out from under the user - it only surfaces the
             // "Update Available" notification and waits. Only an explicit
             // "Update Now" click (manually=true) actually triggers the apply,
@@ -542,7 +542,7 @@ pub fn start_auto_update_macos() {
             log::info!("[root-update] Auto-update scheduler thread started.");
             std::thread::sleep(INITIAL_CHECK_DELAY);
             wait_for_failed_update_retry();
-            let mut interval = DUR_ONE_DAY;
+            let mut interval = CHECK_INTERVAL;
             loop {
                 log::info!("[root-update] Running scheduled update check...");
                 let no_active_conns = has_no_active_conns_ipc();
@@ -558,7 +558,7 @@ pub fn start_auto_update_macos() {
                                 // failure interval until the new daemon replaces us.
                                 interval = RETRY_INTERVAL;
                             } else {
-                                interval = DUR_ONE_DAY;
+                                interval = CHECK_INTERVAL;
                             }
                         }
                         Err(e) => {

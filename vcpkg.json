@@ -64,6 +64,26 @@
       "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
     },
     {
+      "name": "amd-amf",
+      "host": true,
+      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
+    },
+    {
+      "name": "amd-amf",
+      "host": false,
+      "platform": "(((windows & !arm) | linux) & static)"
+    },
+    {
+      "name": "ffnvcodec",
+      "host": true,
+      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
+    },
+    {
+      "name": "ffnvcodec",
+      "host": false,
+      "platform": "(((windows & !arm) | linux) & static)"
+    },
+    {
       "name": "ffmpeg",
       "host": true,
       "features": [

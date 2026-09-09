@@ -131,6 +131,21 @@ fn try_silent_managed_upgrade(managed_client: bool) -> bool {
     let options_json = crate::ui_interface::install_options();
     let options = crate::platform::windows::install_options_json_to_flags(&options_json);
     let path = crate::ui_interface::install_path();
+
+    // The full manual-install flow (install_page.dart, the path this
+    // function exists to bypass) always calls this before install_me() -
+    // without it here too, install_me()'s XCOPY /C step can find
+    // librustdesk.dll still locked by the currently-running --server/GUI
+    // it was never told to stop, silently skip that one file, and report
+    // success anyway (confirmed in production, 2026-09-06: a device stayed
+    // on the old DLL through multiple "successful" installer runs with no
+    // visible error, only diagnosable from the fact that a brand-new
+    // staged copy in %LOCALAPPDATA% had the right file but Program Files
+    // never did). This call is itself a no-op with no UAC prompt if
+    // nothing is running yet (see its own is_self_service_running gate).
+    diag_write("try_silent_managed_upgrade: stopping running instance before install");
+    crate::platform::windows::stop_running_instance_before_install();
+
     diag_write(&format!(
         "try_silent_managed_upgrade: calling install_me options_json={:?} options={:?} path={:?}",
         options_json, options, path
@@ -142,6 +157,22 @@ fn try_silent_managed_upgrade(managed_client: bool) -> bool {
     match crate::platform::windows::install_me(&options, path, true, false) {
         Ok(()) => {
             diag_write("try_silent_managed_upgrade: install_me returned Ok");
+            // install_me() runs with silent=true here, so run_after_run_cmds()
+            // only restarts the tray process, never the visible main window -
+            // by design, for the ordinary "just refresh the files" case. But a
+            // managed client re-run *by a person* double-clicking the
+            // installer is exactly the opposite case: they're doing this to
+            // see it work. Without this, a successful update is completely
+            // silent - no window, nothing - indistinguishable from the
+            // installer having done nothing at all. Brad's explicit call:
+            // relaunch the actual app rather than show a popup - seeing it
+            // come back up is confirmation enough on its own.
+            let (_, _, _, exe) = crate::platform::windows::get_install_info();
+            diag_write(&format!(
+                "try_silent_managed_upgrade: relaunching main window at {:?}",
+                exe
+            ));
+            hbb_common::allow_err!(crate::platform::windows::run_exe_direct(&exe, vec![], true));
             true
         }
         Err(err) => {
@@ -285,6 +316,23 @@ pub fn core_main() -> Option<Vec<String>> {
     // not the full install UI.
     #[cfg(windows)]
     if args.contains(&"--install".to_string()) && try_silent_managed_upgrade(managed_client) {
+        return None;
+    }
+    // Fired every 5 minutes by the "{app} ServiceWatchdog" scheduled task
+    // (itself set up by install_me on Windows) - already running as SYSTEM,
+    // so this just checks/repairs the service and exits without ever
+    // reaching the Flutter UI.
+    #[cfg(windows)]
+    if args.contains(&"--service-watchdog".to_string()) {
+        crate::platform::windows::service_watchdog_check_and_fix();
+        return None;
+    }
+    // Manual override for the daily debug-log upload - see
+    // hbbs_http::directory_enrollment::debug_log_upload_once. Useful when
+    // someone has hands-on access to a machine and wants a fresh log
+    // without waiting on the background worker's own schedule.
+    if args.contains(&"--upload-debug-log".to_string()) {
+        crate::hbbs_http::directory_enrollment::debug_log_upload_once();
         return None;
     }
     if args.len() > 0 {

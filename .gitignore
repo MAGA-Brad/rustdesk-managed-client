@@ -1,5 +1,6 @@
 /build
 /target
+local-managed-build.ps1
 .vscode
 .idea
 .DS_Store

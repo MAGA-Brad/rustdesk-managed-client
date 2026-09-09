@@ -32,7 +32,14 @@ use windows::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeClientProces
 #[cfg(windows)]
 #[inline]
 pub(crate) fn should_allow_everyone_create_on_windows(postfix: &str) -> bool {
-    postfix.is_empty() || hbb_common::config::is_service_ipc_postfix(postfix)
+    // "_managed_chat_push": the GUI-hosted listener --server connects to
+    // (as a client) to relay an incoming chat message back for
+    // push_global_event - same cross-session-token shape as the ""
+    // channel (GUI connects out to --server there; here --server
+    // connects out to the GUI), so it gets the same security treatment.
+    postfix.is_empty()
+        || postfix == "_managed_chat_push"
+        || hbb_common::config::is_service_ipc_postfix(postfix)
 }
 
 #[cfg(windows)]
