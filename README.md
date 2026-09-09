@@ -58,6 +58,12 @@ audit logging, relay-access leasing, and the admin UI — lives in
 sits in front of a stock hbbs/hbbr, so this isn't a fork of the relay/rendezvous protocol at all —
 just real fleet management layered on top of it.
 
+### Managed chat
+- A lightweight text channel to a specific managed device, separate from RustDesk's own in-session
+  chat — works whether or not a remote-control session is active, relayed through RDS rather than
+  the relay/rendezvous server. Useful for a quick "starting your remote session now" without a
+  separate side channel.
+
 ### Support and diagnostics, built in
 - An **About** screen exposes the exact build number, build date, and connection fingerprint/ID a
   device is running — the same identifiers an operator sees for that device in RDS, so matching a
