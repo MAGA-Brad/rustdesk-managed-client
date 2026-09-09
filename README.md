@@ -58,6 +58,23 @@ audit logging, relay-access leasing, and the admin UI — lives in
 sits in front of a stock hbbs/hbbr, so this isn't a fork of the relay/rendezvous protocol at all —
 just real fleet management layered on top of it.
 
+### Support and diagnostics, built in
+- An **About** screen exposes the exact build number, build date, and connection fingerprint/ID a
+  device is running — the same identifiers an operator sees for that device in RDS, so matching a
+  support call to a dashboard entry doesn't require guesswork.
+- **Remote debug-log requests**: an operator can pull a device's local debug log on demand from
+  RDS — one device or the whole fleet at once — without needing a remote session into the machine
+  first just to go looking for logs.
+- The client self-reports its managed build number on every heartbeat, so RDS's Client Management
+  view always shows real per-device build/update status instead of an assumed one.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Managed device list](screenshots/RDC_Home.png) | ![Security settings — TOTP, computer name, contact email](screenshots/RDC_Security_Name_Email.png) |
+| ![General settings](screenshots/RDC_Settings.png) | ![About — build, fingerprint, ID](screenshots/RDC_About.png) |
+
 ---
 
 Everything below this notice is the upstream RustDesk project's own README, unmodified.
