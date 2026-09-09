@@ -4,21 +4,21 @@
 >
 > This fork ("RDC") adds a managed-fleet layer on top of the stock client, designed to pair with
 > [rustdesk-managed-directory-api](https://github.com/MAGA-Brad/rustdesk-managed-directory-api)
-> ("RDS"), a self-hosted device directory and management server. Together they turn RustDesk from
+> ("RDS"), a self-hosted Client directory and management server. Together they turn RustDesk from
 > a remote-desktop tool you configure one machine at a time into a fleet you actually manage:
-> devices enroll themselves, an operator approves them from a web UI, and updates roll out to
+> Clients enroll themselves, a Client Manager approves them from a web UI, and updates roll out to
 > everyone automatically — signed, verified, and never silent. It also depends on a sanitized fork
 > of [rustdesk/hbb_common](https://github.com/MAGA-Brad/hbb_common) as a submodule.
 
 ## What this fork adds
 
 ### Managed enrollment, not manual configuration
-- A device enrolls itself at install time — no per-machine server/relay/key configuration for end
-  users to get wrong. The install form collects a friendly device name and contact email,
-  authenticates against a shared enrollment password, and the device shows up in the directory as
-  **pending**. Nothing reaches the relay until an operator approves it.
-- If a device's local credential is ever lost or regenerated (reimage, corrupted keypair, whatever),
-  it isn't permanently orphaned — an **owner-authorized re-enrollment** flow lets an operator
+- A Client enrolls itself at install time — no per-machine server/relay/key configuration for end
+  users to get wrong. The install form collects a friendly Client name and contact email,
+  authenticates against a shared enrollment password, and the Client shows up in the directory as
+  **pending**. Nothing reaches the relay until a Client Manager approves it.
+- If a Client's local credential is ever lost or regenerated (reimage, corrupted keypair, whatever),
+  it isn't permanently orphaned — an **owner-authorized re-enrollment** flow lets a Client Manager
   restore it under its original identity, with the old credential cryptographically invalidated
   the instant the new one is issued.
 - Managed-mode settings are hidden from end users entirely: no Server/Proxy fields to
@@ -42,43 +42,43 @@
   are relayed between them over an authenticated local IPC channel rather than assumed to be
   shared state.
 - CGNAT-friendly registration, verified against a real carrier-grade-NAT mobile hotspot rather than
-  just a lab network — a client's registration doesn't depend on two different network flows
+  just a lab network — a Client's registration doesn't depend on two different network flows
   sharing a source IP, which cellular NAT pools routinely break.
 - A local-input-priority guard: a user physically at the keyboard always wins over a remote
   session — nobody connected remotely can lock out or fight for control with the person actually
   sitting there.
 - Windows installer/service hardening and ACL'd machine-secret credential storage (DPAPI,
-  restricted to SYSTEM) — the enrolled device's cryptographic identity isn't just sitting in a
+  restricted to SYSTEM) — the enrolled Client's cryptographic identity isn't just sitting in a
   plaintext config file.
 
 ### Pairs with RDS
-This client is one half of a pair. The other half — enrollment API, operator accounts with 2FA,
-audit logging, relay-access leasing, and the admin UI — lives in
+This client is one half of a pair. The other half — enrollment API, Client Manager accounts with
+2FA, audit logging, relay-access leasing, and the admin UI — lives in
 [rustdesk-managed-directory-api](https://github.com/MAGA-Brad/rustdesk-managed-directory-api). It
 sits in front of a stock hbbs/hbbr, so this isn't a fork of the relay/rendezvous protocol at all —
 just real fleet management layered on top of it.
 
 ### Managed chat
-- A lightweight text channel to a specific managed device, separate from RustDesk's own in-session
+- A lightweight text channel to a specific managed Client, separate from RustDesk's own in-session
   chat — works whether or not a remote-control session is active, relayed through RDS rather than
   the relay/rendezvous server. Useful for a quick "starting your remote session now" without a
   separate side channel.
 
 ### Support and diagnostics, built in
 - An **About** screen exposes the exact build number, build date, and connection fingerprint/ID a
-  device is running — the same identifiers an operator sees for that device in RDS, so matching a
-  support call to a dashboard entry doesn't require guesswork.
-- **Remote debug-log requests**: an operator can pull a device's local debug log on demand from
-  RDS — one device or the whole fleet at once — without needing a remote session into the machine
+  Client is running — the same identifiers a Client Manager sees for that Client in RDS, so
+  matching a support call to a dashboard entry doesn't require guesswork.
+- **Remote debug-log requests**: a Client Manager can pull a Client's local debug log on demand from
+  RDS — one Client or the whole fleet at once — without needing a remote session into the machine
   first just to go looking for logs.
 - The client self-reports its managed build number on every heartbeat, so RDS's Client Management
-  view always shows real per-device build/update status instead of an assumed one.
+  view always shows real per-Client build/update status instead of an assumed one.
 
 ## Screenshots
 
 | | |
 |---|---|
-| ![Managed device list](screenshots/RDC_Home.png) | ![Security settings — TOTP, computer name, contact email](screenshots/RDC_Security_Name_Email.png) |
+| ![Managed Client list](screenshots/RDC_Home.png) | ![Security settings — TOTP, computer name, contact email](screenshots/RDC_Security_Name_Email.png) |
 | ![General settings](screenshots/RDC_Settings.png) | ![About — build, fingerprint, ID](screenshots/RDC_About.png) |
 
 ---
