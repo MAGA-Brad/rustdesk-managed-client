@@ -38,12 +38,11 @@ void _disableAndroidSoftKeyboard({bool? isKeyboardVisible}) {
 
 class ViewCameraPage extends StatefulWidget {
   ViewCameraPage(
-      {Key? key,
+      {super.key,
       required this.id,
       this.password,
       this.isSharedPassword,
-      this.forceRelay})
-      : super(key: key);
+      this.forceRelay});
 
   final String id;
   final String? password;
@@ -107,8 +106,8 @@ class _ViewCameraPageState extends State<ViewCameraPage>
         .changeCurrentKey(MessageKey(widget.id, ChatModel.clientModeID));
     _blockableOverlayState.applyFfi(gFFI);
     gFFI.imageModel.addCallbackOnFirstImage((String peerId) {
-      gFFI.recordingModel
-          .updateStatus(bind.sessionGetIsRecording(sessionId: gFFI.sessionId));
+      gFFI.recordingModel.updateStatus(
+          bind.crateFlutterFfiSessionGetIsRecording(sessionId: gFFI.sessionId));
       if (gFFI.recordingModel.start) {
         showToast(translate('Automatically record outgoing sessions'));
       }
@@ -455,20 +454,11 @@ class _ViewCameraPageState extends State<ViewCameraPage>
     final menus = toolbarControls(context, id, gFFI);
 
     final List<PopupMenuEntry<int>> more = [
-      ...mobileActionMenus
-          .asMap()
-          .entries
-          .map((e) =>
-              PopupMenuItem<int>(child: e.value.getChild(), value: e.key))
-          .toList(),
+      ...mobileActionMenus.asMap().entries.map(
+          (e) => PopupMenuItem<int>(child: e.value.getChild(), value: e.key)),
       if (mobileActionMenus.isNotEmpty) PopupMenuDivider(),
-      ...menus
-          .asMap()
-          .entries
-          .map((e) => PopupMenuItem<int>(
-              child: e.value.getChild(),
-              value: e.key + mobileActionMenus.length))
-          .toList(),
+      ...menus.asMap().entries.map((e) => PopupMenuItem<int>(
+          child: e.value.getChild(), value: e.key + mobileActionMenus.length)),
     ];
     () async {
       var index = await showMenu(
@@ -487,14 +477,16 @@ class _ViewCameraPageState extends State<ViewCameraPage>
     }();
   }
 
-  onPressedTextChat(String id) {
+  void onPressedTextChat(String id) {
     gFFI.chatModel.changeCurrentKey(MessageKey(id, ChatModel.clientModeID));
     gFFI.chatModel.toggleChatOverlay();
   }
 
-  showChatOptions(String id) async {
-    onPressVoiceCall() => bind.sessionRequestVoiceCall(sessionId: sessionId);
-    onPressEndVoiceCall() => bind.sessionCloseVoiceCall(sessionId: sessionId);
+  Future<void> showChatOptions(String id) async {
+    onPressVoiceCall() =>
+        bind.crateFlutterFfiSessionRequestVoiceCall(sessionId: sessionId);
+    onPressEndVoiceCall() =>
+        bind.crateFlutterFfiSessionCloseVoiceCall(sessionId: sessionId);
 
     makeTextMenu(String label, Widget icon, VoidCallback onPressed,
             {TextStyle? labelStyle}) =>
@@ -592,7 +584,7 @@ void showOptions(
     // - light theme: 0xff2196f3 (Colors.blue)
     // - dark theme: 0xff212121 (the canvas color?)
     final numBgSelected =
-        Theme.of(context).colorScheme.primary.withOpacity(0.6);
+        Theme.of(context).colorScheme.primary.withValues(alpha: 0.6);
     for (var i = 0; i < pi.displays.length; ++i) {
       children.add(InkWell(
           onTap: () {

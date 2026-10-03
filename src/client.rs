@@ -5220,7 +5220,6 @@ mod port_forward_mux_tests {
         assert!(asks(&lc));
     }
 }
-
 pub async fn hc_connection(
     feedback: i32,
     rendezvous_server: String,
@@ -5319,6 +5318,16 @@ pub mod peer_online {
                 }
                 Err(e) => {
                     log::debug!("query onlines, {}", &e);
+                    // A timeout/protocol error (as opposed to the immediate
+                    // connect/send failures already handled inside
+                    // query_online_states_, which report all-offline) used
+                    // to fall through here without ever calling `f`, leaving
+                    // the UI's last-known online states cached forever - so a
+                    // peer that was online before this client lost its own
+                    // connection to the server kept showing as online
+                    // indefinitely. Treat any failure to get a definitive
+                    // answer the same way: report every queried peer offline.
+                    f(vec![], ids);
                 }
             }
         }

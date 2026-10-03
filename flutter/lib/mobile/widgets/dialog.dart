@@ -15,7 +15,8 @@ void _showSuccess() {
 void setTemporaryPasswordLengthDialog(
     OverlayDialogManager dialogManager) async {
   List<String> lengths = ['6', '8', '10'];
-  String length = await bind.mainGetOption(key: "temporary-password-length");
+  String length =
+      await bind.crateFlutterFfiMainGetOption(key: "temporary-password-length");
   var index = lengths.indexOf(length);
   if (index < 0) index = 0;
   length = lengths[index];
@@ -26,8 +27,9 @@ void setTemporaryPasswordLengthDialog(
       setState(() {
         length = newValue;
       });
-      bind.mainSetOption(key: "temporary-password-length", value: newValue);
-      bind.mainUpdateTemporaryPassword();
+      bind.crateFlutterFfiMainSetOption(
+          key: "temporary-password-length", value: newValue);
+      bind.crateFlutterFfiMainUpdateTemporaryPassword();
       Future.delayed(Duration(milliseconds: 200), () {
         close();
         _showSuccess();
@@ -57,7 +59,7 @@ void showServerSettings(OverlayDialogManager dialogManager,
     void Function(VoidCallback) setState) async {
   Map<String, dynamic> options = {};
   try {
-    options = jsonDecode(await bind.mainGetOptions());
+    options = jsonDecode(await bind.crateFlutterFfiMainGetOptions());
   } catch (e) {
     print("Invalid server config: $e");
   }

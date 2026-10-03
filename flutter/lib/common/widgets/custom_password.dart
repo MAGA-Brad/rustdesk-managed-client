@@ -73,8 +73,7 @@ class PasswordStrengthIndicator extends StatelessWidget {
   final RxString password;
   final double weakMedium = 0.33;
   final double mediumStrong = 0.67;
-  const PasswordStrengthIndicator({Key? key, required this.password})
-      : super(key: key);
+  const PasswordStrengthIndicator({super.key, required this.password});
 
   @override
   Widget build(BuildContext context) {

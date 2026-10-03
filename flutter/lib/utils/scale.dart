@@ -22,7 +22,7 @@ double percentToScale(int percent) => clampCustomScalePercent(percent) / 100.0;
 
 /// Fetch, parse and clamp the custom scale percent for a session.
 Future<int> getSessionCustomScalePercent(UuidValue sessionId) async {
-  final opt = await bind.sessionGetFlutterOption(
+  final opt = await bind.crateFlutterFfiSessionGetFlutterOption(
       sessionId: sessionId, k: kCustomScalePercentKey);
   return parseCustomScalePercent(opt);
 }

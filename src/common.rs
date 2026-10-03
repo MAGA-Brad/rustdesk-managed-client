@@ -37,7 +37,7 @@ use hbb_common::{
 
 use crate::{
     hbbs_http::{create_http_client_async, get_url_for_tls},
-    ui_interface::{get_api_server as ui_get_api_server, get_option, is_installed, set_option},
+    ui_interface::{get_api_server as ui_get_api_server, get_option, set_option},
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -133,6 +133,38 @@ pub fn global_init() -> bool {
 }
 
 pub fn global_clean() {}
+
+// Shared by the plain-file diagnostic writers (server/input_service.rs's
+// diag_write, ipc/auth.rs's rejected-IPC-connection log) that predate this
+// helper and previously just appended forever with no cap. One of those -
+// the rejected-IPC diagnostic - was found to have grown past 80MB on a
+// machine that kept hitting a rejection loop, since every appending
+// OpenOptions::new().create(true).append(true) write site had this same
+// gap independently. Centralized here so any future plain-file diagnostic
+// writer gets the cap for free instead of needing to remember it.
+//
+// Cheap by design: checks size via a stat, not by reading the file, so
+// this is safe to call on every single write regardless of frequency.
+#[cfg(windows)]
+pub(crate) fn append_capped_diag_line(path: &str, line: &str) {
+    use std::io::Write;
+    const MAX_DIAG_BYTES: u64 = 5 * 1024 * 1024;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > MAX_DIAG_BYTES {
+            // Drop and start over rather than trying to tail-trim a plain
+            // append-only file in place - these are best-effort debug
+            // traces, not something anything else depends on reading
+            // continuously, so losing the oldest entries on rotation is
+            // fine and much simpler than a rolling truncate.
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
 
 #[inline]
 pub fn set_server_running(b: bool) {
@@ -2357,7 +2389,30 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+fn load_managed_client_defaults() {
+    let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+
+    if let Some(server) = option_env!("RUSTDESK_MANAGED_SERVER")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        defaults
+            .entry("custom-rendezvous-server".to_owned())
+            .or_insert_with(|| server.to_owned());
+    }
+
+    if let Some(key) = option_env!("RUSTDESK_MANAGED_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        defaults
+            .entry("key".to_owned())
+            .or_insert_with(|| key.to_owned());
+    }
+}
+
 pub fn load_custom_client() {
+    load_managed_client_defaults();
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
@@ -2456,6 +2511,7 @@ pub fn get_dst_align_rgba() -> usize {
 }
 
 pub fn read_custom_client(config: &str) {
+    load_managed_client_defaults();
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
         return;

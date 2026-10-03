@@ -42,12 +42,11 @@ void _disableAndroidSoftKeyboard({bool? isKeyboardVisible}) {
 
 class RemotePage extends StatefulWidget {
   RemotePage(
-      {Key? key,
+      {super.key,
       required this.id,
       this.password,
       this.isSharedPassword,
-      this.forceRelay})
-      : super(key: key);
+      this.forceRelay});
 
   final String id;
   final String? password;
@@ -115,8 +114,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         .changeCurrentKey(MessageKey(widget.id, ChatModel.clientModeID));
     _blockableOverlayState.applyFfi(gFFI);
     gFFI.imageModel.addCallbackOnFirstImage((String peerId) {
-      gFFI.recordingModel
-          .updateStatus(bind.sessionGetIsRecording(sessionId: gFFI.sessionId));
+      gFFI.recordingModel.updateStatus(
+          bind.crateFlutterFfiSessionGetIsRecording(sessionId: gFFI.sessionId));
       if (gFFI.recordingModel.start) {
         showToast(translate('Automatically record outgoing sessions'));
       }
@@ -150,7 +149,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // down. The reconnect then re-attaches to the leaked session and is stuck on
     // "Connecting...". Dispatching it here makes teardown happen synchronously on
     // pop; the `sessionClose` in `gFFI.close()` becomes a no-op once removed.
-    unawaited(bind.sessionClose(sessionId: sessionId));
+    unawaited(bind.crateFlutterFfiSessionClose(sessionId: sessionId));
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
     gFFI.dialogManager.hideMobileActionsOverlay(store: false);
@@ -319,7 +318,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
     // Input the new string.
     if (newStr.length > 1) {
-      bind.sessionInputString(sessionId: sessionId, value: newStr);
+      bind.crateFlutterFfiSessionInputString(
+          sessionId: sessionId, value: newStr);
     } else {
       inputChar(newStr);
     }
@@ -355,11 +355,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 content == '（）' ||
                 content == '【】')) {
           // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
-          bind.sessionInputString(sessionId: sessionId, value: content);
+          bind.crateFlutterFfiSessionInputString(
+              sessionId: sessionId, value: content);
           _openKeyboardUnlocked();
           return;
         }
-        bind.sessionInputString(sessionId: sessionId, value: content);
+        bind.crateFlutterFfiSessionInputString(
+            sessionId: sessionId, value: content);
       } else {
         inputChar(content);
       }
@@ -612,18 +614,17 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                           futureBuilder(
                               future: gFFI.invokeMethod(
                                   "get_value", "KEY_IS_SUPPORT_VOICE_CALL"),
-                              hasData: (isSupportVoiceCall) => IconButton(
-                                    color: Colors.white,
-                                    icon: isAndroid && isSupportVoiceCall
-                                        ? SvgPicture.asset('assets/chat.svg',
-                                            colorFilter: ColorFilter.mode(
-                                                Colors.white, BlendMode.srcIn))
-                                        : Icon(Icons.message),
-                                    onPressed: () =>
-                                        isAndroid && isSupportVoiceCall
-                                            ? showChatOptions(widget.id)
-                                            : onPressedTextChat(widget.id),
-                                  ))
+                              hasData: (isSupportVoiceCall) => isAndroid &&
+                                      isSupportVoiceCall
+                                  ? IconButton(
+                                      color: Colors.white,
+                                      icon: SvgPicture.asset('assets/chat.svg',
+                                          colorFilter: ColorFilter.mode(
+                                              Colors.white, BlendMode.srcIn)),
+                                      onPressed: () =>
+                                          showChatOptions(widget.id),
+                                    )
+                                  : SizedBox.shrink())
                         ]) +
                   [
                     IconButton(
@@ -720,7 +721,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     final ffiModel = Provider.of<FfiModel>(context);
     var paints = <Widget>[ImagePaint(ffiModel: ffiModel)];
     if (showCursorPaint) {
-      final cursor = bind.sessionGetToggleOptionSync(
+      final cursor = bind.crateFlutterFfiSessionGetToggleOptionSync(
           sessionId: sessionId, arg: 'show-remote-cursor');
       if (ffiModel.keyboard || cursor) {
         paints.add(CursorPaint(widget.id));
@@ -773,20 +774,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     final menus = toolbarControls(context, id, gFFI);
 
     final List<PopupMenuEntry<int>> more = [
-      ...mobileActionMenus
-          .asMap()
-          .entries
-          .map((e) =>
-              PopupMenuItem<int>(child: e.value.getChild(), value: e.key))
-          .toList(),
+      ...mobileActionMenus.asMap().entries.map(
+          (e) => PopupMenuItem<int>(child: e.value.getChild(), value: e.key)),
       if (mobileActionMenus.isNotEmpty) PopupMenuDivider(),
-      ...menus
-          .asMap()
-          .entries
-          .map((e) => PopupMenuItem<int>(
-              child: e.value.getChild(),
-              value: e.key + mobileActionMenus.length))
-          .toList(),
+      ...menus.asMap().entries.map((e) => PopupMenuItem<int>(
+          child: e.value.getChild(), value: e.key + mobileActionMenus.length)),
     ];
     () async {
       var index = await showMenu(
@@ -805,14 +797,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }();
   }
 
-  onPressedTextChat(String id) {
-    gFFI.chatModel.changeCurrentKey(MessageKey(id, ChatModel.clientModeID));
-    gFFI.chatModel.toggleChatOverlay();
-  }
-
-  showChatOptions(String id) async {
-    onPressVoiceCall() => bind.sessionRequestVoiceCall(sessionId: sessionId);
-    onPressEndVoiceCall() => bind.sessionCloseVoiceCall(sessionId: sessionId);
+  Future<void> showChatOptions(String id) async {
+    onPressVoiceCall() =>
+        bind.crateFlutterFfiSessionRequestVoiceCall(sessionId: sessionId);
+    onPressEndVoiceCall() =>
+        bind.crateFlutterFfiSessionCloseVoiceCall(sessionId: sessionId);
 
     makeTextMenu(String label, Widget icon, VoidCallback onPressed,
             {TextStyle? labelStyle}) =>
@@ -835,8 +824,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       VoiceCallStatus.connected
     ].contains(gFFI.chatModel.voiceCallStatus.value);
     final menus = [
-      makeTextMenu('Text chat', Icon(Icons.message, color: MyTheme.accent),
-          () => onPressedTextChat(widget.id)),
       isInVoice
           ? makeTextMenu(
               'End voice call',
@@ -888,7 +875,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               onTouchModeChange: (t) {
                 gFFI.ffiModel.toggleTouchMode();
                 final v = gFFI.ffiModel.touchMode ? 'Y' : 'N';
-                bind.mainSetLocalOption(key: kOptionTouchMode, value: v);
+                bind.crateFlutterFfiMainSetLocalOption(
+                    key: kOptionTouchMode, value: v);
               },
               virtualMouseMode: gFFI.ffiModel.virtualMouseMode,
               inputModel: gFFI.inputModel,
@@ -897,10 +885,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   // * Currently mobile does not enable map mode
   // void changePhysicalKeyboardInputMode() async {
-  //   var current = await bind.sessionGetKeyboardMode(id: widget.id) ?? "legacy";
+  //   var current = await bind.crateFlutterFfiSessionGetKeyboardMode(id: widget.id) ?? "legacy";
   //   gFFI.dialogManager.show((setState, close) {
   //     void setMode(String? v) async {
-  //       await bind.sessionSetKeyboardMode(id: widget.id, value: v ?? "");
+  //       await bind.crateFlutterFfiSessionSetKeyboardMode(id: widget.id, value: v ?? "");
   //       setState(() => current = v ?? '');
   //       Future.delayed(Duration(milliseconds: 300), close);
   //     }
@@ -959,7 +947,7 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
         onPressed: onPressed);
   }
 
-  _updateRect() {
+  void _updateRect() {
     RenderObject? renderObject = _key.currentContext?.findRenderObject();
     if (renderObject == null) {
       return;
@@ -1140,7 +1128,7 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
 
 class ImagePaint extends StatelessWidget {
   final FfiModel ffiModel;
-  ImagePaint({Key? key, required this.ffiModel}) : super(key: key);
+  ImagePaint({super.key, required this.ffiModel});
 
   @override
   Widget build(BuildContext context) {
@@ -1234,7 +1222,7 @@ void showOptions(
     // - light theme: 0xff2196f3 (Colors.blue)
     // - dark theme: 0xff212121 (the canvas color?)
     final numBgSelected =
-        Theme.of(context).colorScheme.primary.withOpacity(0.6);
+        Theme.of(context).colorScheme.primary.withValues(alpha: 0.6);
     for (var i = 0; i < pi.displays.length; ++i) {
       children.add(InkWell(
           onTap: () {
@@ -1480,7 +1468,7 @@ TTextMenu? getResolutionMenu(FFI ffi, String id) {
                   '${display.width}x${display.height}',
                   (value) {
                     close();
-                    bind.sessionChangeResolution(
+                    bind.crateFlutterFfiSessionChangeResolution(
                       sessionId: ffi.sessionId,
                       display: pi.currentDisplay,
                       width: e.width,

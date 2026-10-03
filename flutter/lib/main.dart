@@ -6,14 +6,16 @@ import 'package:bot_toast/bot_toast.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/common/widgets/managed_chat_dialog.dart';
 import 'package:flutter_hbb/common/widgets/overlay.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/pages/install_page.dart';
 import 'package:flutter_hbb/desktop/pages/server_page.dart';
-import 'package:flutter_hbb/desktop/screen/desktop_file_transfer_screen.dart';
+import 'package:flutter_hbb/desktop/screen/desktop_managed_chat_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_view_camera_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_port_forward_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_remote_screen.dart';
+import 'package:flutter_hbb/desktop/screen/desktop_rustdrop_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_terminal_screen.dart';
 import 'package:flutter_hbb/desktop/widgets/refresh_wrapper.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -50,9 +52,6 @@ Future<void> main(List<String> args) async {
   if (args.isNotEmpty && args.first == 'multi_window') {
     kWindowId = int.parse(args[1]);
     stateGlobal.setWindowId(kWindowId!);
-    if (!isMacOS) {
-      WindowController.fromWindowId(kWindowId!).showTitleBar(false);
-    }
     final argument = args[2].isEmpty
         ? <String, dynamic>{}
         : jsonDecode(args[2]) as Map<String, dynamic>;
@@ -61,6 +60,15 @@ Future<void> main(List<String> args) async {
     // Because stateGlobal.windowId is a global value.
     argument['windowId'] = kWindowId;
     kWindowType = type.windowType;
+    // Every sub window (including chat) draws its own frameless custom
+    // title bar - see tabbar_widget.dart / desktop_managed_chat_screen.dart.
+    // This isn't just cosmetic: with setPreventClose(true) below, the
+    // native OS close button's WM_CLOSE never reaches Dart at all (it's
+    // silently swallowed), so every window type needs its own explicit
+    // close control wired to windowManager.close(), which IS intercepted.
+    if (!isMacOS) {
+      WindowController.fromWindowId(kWindowId!).showTitleBar(false);
+    }
     switch (kWindowType) {
       case WindowType.RemoteDesktop:
         desktopType = DesktopType.remote;
@@ -96,6 +104,14 @@ Future<void> main(List<String> args) async {
           argument,
           kAppTypeDesktopTerminal,
         );
+        break;
+      case WindowType.ManagedChat:
+        desktopType = DesktopType.managedChat;
+        runMultiWindow(
+          argument,
+          kAppTypeDesktopManagedChat,
+        );
+        break;
       default:
         break;
     }
@@ -104,6 +120,11 @@ Future<void> main(List<String> args) async {
     desktopType = DesktopType.cm;
     await windowManager.ensureInitialized();
     runConnectionManagerScreen();
+  } else if (args.isNotEmpty && args.first == '--rustdrop') {
+    debugPrint("--rustdrop started");
+    desktopType = DesktopType.rustdrop;
+    await windowManager.ensureInitialized();
+    runRustDropScreen();
   } else if (args.contains('--install')) {
     runInstallPage();
   } else {
@@ -135,42 +156,97 @@ void runMainApp(bool startService) async {
   await initEnv(kAppTypeMain);
   checkUpdate();
   // trigger connection status updater
-  await bind.mainCheckConnectStatus();
+  await bind.crateFlutterFfiMainCheckConnectStatus();
   if (startService) {
     gFFI.serverModel.startService();
   }
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();
+  // So the Directory tab's unread-mail badge (see peer_card.dart) has
+  // correct state from a cold start, not just after the first live push.
+  unawaited(gFFI.managedChatModel.loadLocalConversations());
   runApp(App());
 
   bool? alwaysOnTop;
   if (isDesktop) {
-    alwaysOnTop =
-        bind.mainGetBuildinOption(key: "main-window-always-on-top") == 'Y';
+    alwaysOnTop = bind.crateFlutterFfiMainGetBuildinOption(
+            key: "main-window-always-on-top") ==
+        'Y';
   }
 
   // Set window option.
   WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
       isMainWindow: true, alwaysOnTop: alwaysOnTop);
-  windowManager.waitUntilReadyToShow(windowOptions, () async {
-    // Restore the location of the main window before window hide or show.
-    await restoreWindowPosition(WindowType.Main);
-    // Check the startup argument, if we successfully handle the argument, we keep the main window hidden.
-    final handledByUniLinks = await initUniLinks();
-    debugPrint("handled by uni links: $handledByUniLinks");
-    if (handledByUniLinks || handleUriLink(cmdArgs: kBootArgs)) {
-      windowManager.hide();
-    } else {
-      windowManager.show();
-      windowManager.focus();
-      // Move registration of active main window here to prevent from async visible check.
-      rustDeskWinManager.registerActiveWindow(kWindowMainId);
+
+  // Same belt-and-suspenders and same auto-retry-once as runRustDropScreen()
+  // below: waitUntilReadyToShow's callback can silently never fire (no
+  // exception, no window, no error). Unlike RustDrop there's no
+  // single-instance mutex here to wedge, but a hung, windowless process is
+  // still worth cleaning up, and a fresh relaunch has a real chance of
+  // landing where the first attempt didn't. Multiple main windows can
+  // already coexist (no single-instance guard for this path), so spawning
+  // one more here is exactly as safe as the user launching it by hand.
+  final isRetryAttempt = Platform.environment['WINDOW_LAUNCH_RETRY'] == '1';
+  bool windowShown = false;
+  Timer(const Duration(seconds: 5), () {
+    if (windowShown) return;
+    if (isRetryAttempt) {
+      _rustdropWindowDiag(
+          'runMainApp: TIMEOUT on retry attempt, giving up, exiting');
+      exit(0);
     }
-    windowManager.setOpacity(1);
-    windowManager.setTitle(getWindowName());
-    // Do not use `windowManager.setResizable()` here.
-    setResizable(!bind.isIncomingOnly());
+    _rustdropWindowDiag(
+        'runMainApp: TIMEOUT waiting for window, relaunching fresh attempt in 2s');
+    Future.delayed(const Duration(seconds: 2), () async {
+      try {
+        await Process.start(
+          Platform.resolvedExecutable,
+          [],
+          environment: {'WINDOW_LAUNCH_RETRY': '1'},
+          mode: ProcessStartMode.detached,
+        );
+        _rustdropWindowDiag('runMainApp: retry relaunch spawned');
+      } catch (e) {
+        _rustdropWindowDiag('runMainApp: retry relaunch FAILED: $e');
+      }
+      exit(0);
+    });
   });
+
+  _rustdropWindowDiag('runMainApp: calling waitUntilReadyToShow');
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
+    windowShown = true;
+    _rustdropWindowDiag('runMainApp: waitUntilReadyToShow callback fired');
+    try {
+      // Restore the location of the main window before window hide or show.
+      await restoreWindowPosition(WindowType.Main);
+      _rustdropWindowDiag('runMainApp: restoreWindowPosition done');
+      // Check the startup argument, if we successfully handle the argument, we keep the main window hidden.
+      final handledByUniLinks = await initUniLinks();
+      debugPrint("handled by uni links: $handledByUniLinks");
+      _rustdropWindowDiag(
+          'runMainApp: initUniLinks done, handledByUniLinks=$handledByUniLinks');
+      if (handledByUniLinks || handleUriLink(cmdArgs: kBootArgs)) {
+        windowManager.hide();
+        _rustdropWindowDiag('runMainApp: hide() (handled by uni link)');
+      } else {
+        windowManager.show();
+        windowManager.focus();
+        _rustdropWindowDiag('runMainApp: show()+focus() done');
+        // Move registration of active main window here to prevent from async visible check.
+        rustDeskWinManager.registerActiveWindow(kWindowMainId);
+      }
+      windowManager.setOpacity(1);
+      windowManager.setTitle(getWindowName());
+      // Do not use `windowManager.setResizable()` here.
+      setResizable(!bind.crateFlutterFfiIsIncomingOnly());
+      _rustdropWindowDiag('runMainApp: all complete');
+    } catch (e, st) {
+      _rustdropWindowDiag('runMainApp: EXCEPTION: $e\n$st');
+    }
+  });
+  _rustdropWindowDiag(
+      'runMainApp: waitUntilReadyToShow call returned (registration, not completion)');
 }
 
 void runMobileApp() async {
@@ -204,11 +280,6 @@ void runMultiWindow(
         params: argument,
       );
       break;
-    case kAppTypeDesktopFileTransfer:
-      widget = DesktopFileTransferScreen(
-        params: argument,
-      );
-      break;
     case kAppTypeDesktopViewCamera:
       draggablePositions.load();
       widget = DesktopViewCameraScreen(
@@ -222,6 +293,11 @@ void runMultiWindow(
       break;
     case kAppTypeDesktopTerminal:
       widget = DesktopTerminalScreen(
+        params: argument,
+      );
+      break;
+    case kAppTypeDesktopManagedChat:
+      widget = DesktopManagedChatScreen(
         params: argument,
       );
       break;
@@ -274,12 +350,29 @@ void runMultiWindow(
     case kAppTypeDesktopTerminal:
       await restoreWindowPosition(WindowType.Terminal, windowId: kWindowId!);
       break;
+    case kAppTypeDesktopManagedChat:
+      if (!_isLegacyDefaultManagedChatFrame()) {
+        await restoreWindowPosition(WindowType.ManagedChat,
+            windowId: kWindowId!);
+      }
+      break;
     default:
       // no such appType
       exit(0);
   }
   // show window from hidden status
   WindowController.fromWindowId(kWindowId!).show();
+}
+
+// Chat windows used to open at a fixed 950x840, and every install that ever
+// quit with one open saved exactly that as its "remembered" frame. Treat
+// that frame as never customized, so those installs get the compact
+// default; a size the user actually chose is still restored.
+bool _isLegacyDefaultManagedChatFrame() {
+  final saved = LastWindowPosition.loadFromString(
+      bind.crateFlutterFfiGetLocalFlutterOption(
+          k: windowFramePrefix + WindowType.ManagedChat.name));
+  return saved != null && saved.width == 950 && saved.height == 840;
 }
 
 void runConnectionManagerScreen() async {
@@ -289,7 +382,7 @@ void runConnectionManagerScreen() async {
     const DesktopServerPage(),
     MyTheme.currentThemeMode(),
   );
-  final hide = await bind.cmGetConfig(name: "hide_cm") == 'true';
+  final hide = await bind.crateFlutterFfiCmGetConfig(name: "hide_cm") == 'true';
   gFFI.serverModel.hideCm = hide;
   if (hide) {
     await hideCmWindow(isStartup: true);
@@ -303,12 +396,12 @@ void runConnectionManagerScreen() async {
 
 bool _isCmReadyToShow = false;
 
-showCmWindow({bool isStartup = false}) async {
+Future<void> showCmWindow({bool isStartup = false}) async {
   if (isStartup) {
     WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
         size: kConnectionManagerWindowSizeClosedChat, alwaysOnTop: true);
     await windowManager.waitUntilReadyToShow(windowOptions, null);
-    bind.mainHideDock();
+    bind.crateFlutterFfiMainHideDock();
     await Future.wait([
       windowManager.show(),
       windowManager.focus(),
@@ -323,31 +416,134 @@ showCmWindow({bool isStartup = false}) async {
       await windowManager.setOpacity(1);
       await windowManager.focus();
       await windowManager.minimize(); //needed
-      await windowManager.setSizeAlignment(
-          kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
+      // Deliberately does NOT reset position/size here (unlike the isStartup
+      // branch above) - this runs every time a new connection re-shows an
+      // already-initialized window, and snapping it back to a fixed corner
+      // on every connection is exactly the "can't keep it moved" behavior
+      // that made this window feel pinned rather than a normal floating,
+      // freely-movable window. Whatever position the user last left it at
+      // (dragged via buildTitleBar()'s startDragging(), or the OS's own
+      // move/resize) is preserved across show/hide cycles.
       windowOnTop(null);
     }
   }
 }
 
-hideCmWindow({bool isStartup = false}) async {
+Future<void> hideCmWindow({bool isStartup = false}) async {
   if (isStartup) {
     WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
         size: kConnectionManagerWindowSizeClosedChat);
     windowManager.setOpacity(0);
     await windowManager.waitUntilReadyToShow(windowOptions, null);
-    bind.mainHideDock();
+    bind.crateFlutterFfiMainHideDock();
     await windowManager.minimize();
     await windowManager.hide();
     _isCmReadyToShow = true;
   } else if (_isCmReadyToShow) {
     if (await windowManager.getOpacity() != 0) {
       await windowManager.setOpacity(0);
-      bind.mainHideDock();
+      bind.crateFlutterFfiMainHideDock();
       await windowManager.minimize();
       await windowManager.hide();
     }
   }
+}
+
+void _rustdropWindowDiag(String message) {
+  try {
+    final line = '${DateTime.now().toIso8601String()} pid=$pid $message\n';
+    File('${Platform.environment['TEMP']}\\rustdrop_window_diag.txt')
+        .writeAsStringSync(line, mode: FileMode.append, flush: true);
+  } catch (_) {
+    // Best-effort diagnostic only.
+  }
+}
+
+// RustDrop's window has no hide-to-tray-on-close lifecycle like the
+// managed-chat/CM windows do - register/poll/notify runs continuously in
+// --server regardless of whether this window is even open (see
+// rustdrop_service.rs's doc comment), so closing this window doesn't stop
+// anything and can just exit the process normally, same as install_page.dart.
+void runRustDropScreen() async {
+  _rustdropWindowDiag('runRustDropScreen: start, calling initEnv');
+  await initEnv(kAppTypeRustDrop);
+  _rustdropWindowDiag('runRustDropScreen: initEnv done, calling _runApp');
+  _runApp(
+    'RustDrop',
+    const DesktopRustDropScreen(),
+    MyTheme.currentThemeMode(),
+  );
+  _rustdropWindowDiag(
+      'runRustDropScreen: _runApp returned, building WindowOptions');
+  WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
+    size: const Size(480, 640),
+    center: true,
+  );
+  // Belt-and-suspenders against waitUntilReadyToShow's callback silently
+  // never firing (no exception, no timeout of its own - the native window
+  // just never gets created). Without this, a --rustdrop process that hits
+  // that stays alive holding the single-instance mutex
+  // (core_main.rs's try_lock_rustdrop_single_instance) forever, so every
+  // later click just hits "Another RustDrop window is already running" and
+  // does nothing - one silent failure permanently wedges the feature until
+  // someone kills the process by hand. Real launches show the window in
+  // well under a second per this file's own diagnostics, so 5s is a
+  // generous margin.
+  //
+  // On timeout, don't just exit - relaunch fresh once. The one confirmed
+  // occurrence of this (on a test client, receiving side of an active
+  // session) looked like transient contention rather than something
+  // permanently broken, so a second attempt a couple seconds later has a
+  // real chance of landing cleanly instead of leaving the user to notice
+  // the failure and retry by hand. WINDOW_LAUNCH_RETRY caps this at one retry -
+  // the relaunched process sees it set and just gives up on its own
+  // timeout, so a sustained failure still fails fast instead of looping.
+  final isRetryAttempt = Platform.environment['WINDOW_LAUNCH_RETRY'] == '1';
+  bool windowShown = false;
+  Timer(const Duration(seconds: 5), () {
+    if (windowShown) return;
+    if (isRetryAttempt) {
+      _rustdropWindowDiag(
+          'runRustDropScreen: TIMEOUT on retry attempt, giving up, exiting to release single-instance lock');
+      exit(0);
+    }
+    _rustdropWindowDiag(
+        'runRustDropScreen: TIMEOUT waiting for window, relaunching fresh attempt in 2s');
+    Future.delayed(const Duration(seconds: 2), () async {
+      try {
+        await Process.start(
+          Platform.resolvedExecutable,
+          ['--rustdrop'],
+          environment: {'WINDOW_LAUNCH_RETRY': '1'},
+          mode: ProcessStartMode.detached,
+        );
+        _rustdropWindowDiag('runRustDropScreen: retry relaunch spawned');
+      } catch (e) {
+        _rustdropWindowDiag('runRustDropScreen: retry relaunch FAILED: $e');
+      }
+      exit(0);
+    });
+  });
+
+  _rustdropWindowDiag('runRustDropScreen: calling waitUntilReadyToShow');
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
+    windowShown = true;
+    _rustdropWindowDiag('waitUntilReadyToShow: callback fired');
+    try {
+      await windowManager.show();
+      _rustdropWindowDiag('waitUntilReadyToShow: show() done');
+      await windowManager.focus();
+      _rustdropWindowDiag('waitUntilReadyToShow: focus() done');
+      await windowManager.setOpacity(1);
+      _rustdropWindowDiag('waitUntilReadyToShow: setOpacity(1) done');
+      windowManager.setTitle('RustDrop');
+      _rustdropWindowDiag('waitUntilReadyToShow: setTitle done, all complete');
+    } catch (e, st) {
+      _rustdropWindowDiag('waitUntilReadyToShow: EXCEPTION: $e\n$st');
+    }
+  });
+  _rustdropWindowDiag(
+      'runRustDropScreen: waitUntilReadyToShow call returned (registration, not completion)');
 }
 
 void _runApp(
@@ -444,7 +640,7 @@ class _AppState extends State<App> with WidgetsBindingObserver {
       // Synchronize the window theme of the system.
       updateSystemWindowTheme();
       if (desktopType == DesktopType.main) {
-        bind.mainChangeTheme(dark: to.toShortString());
+        bind.crateFlutterFfiMainChangeTheme(dark: to.toShortString());
       }
     };
     WidgetsBinding.instance.addObserver(this);
@@ -496,8 +692,8 @@ class _AppState extends State<App> with WidgetsBindingObserver {
           navigatorKey: globalKey,
           debugShowCheckedModeBanner: false,
           title: isWeb
-              ? '${bind.mainGetAppNameSync()} Web Client V2 (Preview)'
-              : bind.mainGetAppNameSync(),
+              ? '${bind.crateFlutterFfiMainGetAppNameSync()} Web Client V2 (Preview)'
+              : bind.crateFlutterFfiMainGetAppNameSync(),
           theme: MyTheme.lightTheme,
           darkTheme: MyTheme.darkTheme,
           themeMode: MyTheme.currentThemeMode(),
@@ -553,7 +749,7 @@ Widget _keepScaleBuilder(BuildContext context, Widget? child) {
   );
 }
 
-_registerEventHandler() {
+void _registerEventHandler() {
   if (isDesktop && desktopType != DesktopType.main) {
     platformFFI.registerEventHandler('theme', 'theme', (evt) async {
       String? dark = evt['dark'];
@@ -563,6 +759,22 @@ _registerEventHandler() {
     });
     platformFFI.registerEventHandler('language', 'language', (_) async {
       reloadAllWindows();
+    });
+  }
+  if (isDesktop) {
+    platformFFI.registerEventHandler(
+        'managed_chat_message', 'managed_chat_message', (evt) async {
+      final conversationId = evt['conversation_id'];
+      if (conversationId is String) {
+        await handleManagedChatPush(conversationId);
+      }
+    });
+    platformFFI.registerEventHandler(
+        'managed_chat_delivered', 'managed_chat_delivered', (evt) async {
+      final conversationId = evt['conversation_id'];
+      if (conversationId is String) {
+        await handleManagedChatDelivered(conversationId);
+      }
     });
   }
   if (isAndroid) {

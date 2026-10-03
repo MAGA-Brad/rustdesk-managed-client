@@ -121,11 +121,11 @@ abstract class MenuEntryBase<T> {
   });
   List<mod_menu.PopupMenuEntry<T>> build(BuildContext context, MenuConfig conf);
 
-  enabledStyle(BuildContext context) => TextStyle(
+  TextStyle enabledStyle(BuildContext context) => TextStyle(
       color: Theme.of(context).textTheme.titleLarge?.color,
       fontSize: MenuConfig.fontSize,
       fontWeight: FontWeight.normal);
-  disabledStyle() => TextStyle(
+  TextStyle disabledStyle() => TextStyle(
       color: Colors.grey,
       fontSize: MenuConfig.fontSize,
       fontWeight: FontWeight.normal);
@@ -182,10 +182,9 @@ class MenuEntryRadios<T> extends MenuEntryBase<T> {
     this.padding,
     dismissOnClicked = false,
     dismissCallback,
-    RxBool? enabled,
+    super.enabled,
   }) : super(
           dismissOnClicked: dismissOnClicked,
-          enabled: enabled,
           dismissCallback: dismissCallback,
         ) {
     () async {
@@ -195,7 +194,7 @@ class MenuEntryRadios<T> extends MenuEntryBase<T> {
 
   List<MenuEntryRadioOption> get options => optionsGetter();
   RxString get curOption => _curOption;
-  setOption(String option) async {
+  Future<void> setOption(String option) async {
     await optionSetter(_curOption.value, option);
     if (_curOption.value != option) {
       final opt = await curOptionGetter();
@@ -305,10 +304,9 @@ class MenuEntrySubRadios<T> extends MenuEntryBase<T> {
     required this.optionSetter,
     this.padding,
     dismissOnClicked = false,
-    RxBool? enabled,
+    super.enabled,
   }) : super(
           dismissOnClicked: dismissOnClicked,
-          enabled: enabled,
         ) {
     () async {
       _curOption.value = await curOptionGetter();
@@ -317,7 +315,7 @@ class MenuEntrySubRadios<T> extends MenuEntryBase<T> {
 
   List<MenuEntryRadioOption> get options => optionsGetter();
   RxString get curOption => _curOption;
-  setOption(String option) async {
+  Future<void> setOption(String option) async {
     await optionSetter(_curOption.value, option);
     if (_curOption.value != option) {
       final opt = await curOptionGetter();
@@ -435,11 +433,10 @@ abstract class MenuEntrySwitchBase<T> extends MenuEntryBase<T> {
     required dismissOnClicked,
     this.textStyle,
     this.padding,
-    RxBool? enabled,
+    super.enabled,
     dismissCallback,
   }) : super(
           dismissOnClicked: dismissOnClicked,
-          enabled: enabled,
           dismissCallback: dismissCallback,
         );
 
@@ -448,7 +445,7 @@ abstract class MenuEntrySwitchBase<T> extends MenuEntryBase<T> {
   RxBool get curOption;
   Future<void> setOption(bool? option);
 
-  tryPop(BuildContext context) {
+  void tryPop(BuildContext context) {
     if (dismissOnClicked && Navigator.canPop(context)) {
       Navigator.pop(context);
       super.dismissCallback?.call();
@@ -527,24 +524,16 @@ class MenuEntrySwitch<T> extends MenuEntrySwitchBase<T> {
   final RxBool _curOption = false.obs;
 
   MenuEntrySwitch({
-    required SwitchType switchType,
-    required String text,
+    required super.switchType,
+    required super.text,
     required this.getter,
     required this.setter,
-    Rx<TextStyle>? textStyle,
-    EdgeInsets? padding,
-    dismissOnClicked = false,
-    RxBool? enabled,
-    dismissCallback,
-  }) : super(
-          switchType: switchType,
-          text: text,
-          textStyle: textStyle,
-          padding: padding,
-          dismissOnClicked: dismissOnClicked,
-          enabled: enabled,
-          dismissCallback: dismissCallback,
-        ) {
+    super.textStyle,
+    super.padding,
+    super.dismissOnClicked = false,
+    super.enabled,
+    super.dismissCallback,
+  }) {
     () async {
       _curOption.value = await getter();
     }();
@@ -570,24 +559,16 @@ class MenuEntrySwitchSync<T> extends MenuEntrySwitchBase<T> {
   final RxBool _curOption = false.obs;
 
   MenuEntrySwitchSync({
-    required SwitchType switchType,
-    required String text,
+    required super.switchType,
+    required super.text,
     required bool currentValue,
     required this.setter,
-    Rx<TextStyle>? textStyle,
-    EdgeInsets? padding,
-    dismissOnClicked = false,
-    RxBool? enabled,
-    dismissCallback,
-  }) : super(
-          switchType: switchType,
-          text: text,
-          textStyle: textStyle,
-          padding: padding,
-          dismissOnClicked: dismissOnClicked,
-          enabled: enabled,
-          dismissCallback: dismissCallback,
-        ) {
+    super.textStyle,
+    super.padding,
+    super.dismissOnClicked = false,
+    super.enabled,
+    super.dismissCallback,
+  }) {
     _curOption.value = currentValue;
   }
 
@@ -613,23 +594,16 @@ class MenuEntrySwitch2<T> extends MenuEntrySwitchBase<T> {
   final SwitchSetter setter;
 
   MenuEntrySwitch2({
-    required SwitchType switchType,
-    required String text,
+    required super.switchType,
+    required super.text,
     required this.getter,
     required this.setter,
-    Rx<TextStyle>? textStyle,
-    EdgeInsets? padding,
-    dismissOnClicked = false,
+    super.textStyle,
+    super.padding,
+    super.dismissOnClicked = false,
     RxBool? enabled,
-    dismissCallback,
-  }) : super(
-          switchType: switchType,
-          text: text,
-          textStyle: textStyle,
-          padding: padding,
-          dismissOnClicked: dismissOnClicked,
-          dismissCallback: dismissCallback,
-        );
+    super.dismissCallback,
+  });
 
   @override
   RxBool get curOption => getter();
@@ -650,8 +624,8 @@ class MenuEntrySubMenu<T> extends MenuEntryBase<T> {
     required this.text,
     required this.entries,
     this.padding,
-    RxBool? enabled,
-  }) : super(enabled: enabled);
+    super.enabled,
+  });
 
   @override
   List<mod_menu.PopupMenuEntry<T>> build(
@@ -699,11 +673,10 @@ class MenuEntryButton<T> extends MenuEntryBase<T> {
     required this.proc,
     this.padding,
     dismissOnClicked = false,
-    RxBool? enabled,
+    super.enabled,
     dismissCallback,
   }) : super(
           dismissOnClicked: dismissOnClicked,
-          enabled: enabled,
           dismissCallback: dismissCallback,
         );
 

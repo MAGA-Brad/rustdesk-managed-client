@@ -25,6 +25,10 @@ type Message = RendezvousMessage;
 
 #[cfg(not(target_os = "ios"))]
 pub(super) fn start_listening() -> ResultType<()> {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        log::info!("LAN discovery listener disabled by managed policy");
+        return Ok(());
+    }
     let addr = SocketAddr::from(([0, 0, 0, 0], get_broadcast_port()));
     let socket = std::net::UdpSocket::bind(addr)?;
     socket.set_read_timeout(Some(std::time::Duration::from_millis(1000)))?;
@@ -75,6 +79,9 @@ pub(super) fn start_listening() -> ResultType<()> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn discover() -> ResultType<()> {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return Ok(());
+    }
     let sockets = send_query()?;
     let rx = spawn_wait_responses(sockets);
     handle_received_peers(rx).await?;

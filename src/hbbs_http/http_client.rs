@@ -16,7 +16,16 @@ macro_rules! configure_http_client {
     ($builder:expr, $tls_type:expr, $danger_accept_invalid_cert:expr, $Client: ty) => {{
         // https://github.com/rustdesk/rustdesk/issues/11569
         // https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html#method.no_proxy
-        let mut builder = $builder.no_proxy();
+        // A stalled/half-open connection (dropped packets, a dead NAT
+        // mapping, momentary server unresponsiveness) otherwise hangs a
+        // request forever - reqwest has no default timeout. Most callers of
+        // this shared client are lightweight API calls (manifest checks,
+        // heartbeats, directory status) that should complete quickly under
+        // normal conditions; a caller needing longer (e.g. a large file
+        // download) can still override this per-request via
+        // RequestBuilder::timeout(), which takes precedence over this
+        // client-level default.
+        let mut builder = $builder.no_proxy().timeout(std::time::Duration::from_secs(20));
 
         match $tls_type {
             TlsType::Plain => {}
@@ -255,24 +264,6 @@ fn create_http_client_with_url_(
         );
     }
     client
-}
-
-pub async fn create_http_client_async_with_url(url: &str) -> AsyncClient {
-    let proxy_conf = Config::get_socks();
-    let tls_url = get_url_for_tls(url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_type_cached = tls_type.is_some();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
-    create_http_client_async_with_url_(
-        url,
-        tls_url,
-        tls_type,
-        is_tls_type_cached,
-        danger_accept_invalid_cert,
-        danger_accept_invalid_cert,
-    )
-    .await
 }
 
 pub async fn create_http_client_async_with_url_strict(url: &str) -> ResultType<AsyncClient> {

@@ -15,6 +15,38 @@ use tao::{
 };
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Stroke, Transform};
 
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+fn is_session_connected() -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSActive, WTSConnectState, WTSFreeMemory, WTSQuerySessionInformationW,
+        WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SESSION,
+    };
+
+    unsafe {
+        let mut buf = PWSTR(std::ptr::null_mut());
+        let mut bytes: u32 = 0;
+        if WTSQuerySessionInformationW(
+            None,
+            WTS_CURRENT_SESSION,
+            WTSConnectState,
+            &mut buf,
+            &mut bytes,
+        )
+        .is_err()
+            || buf.0.is_null()
+        {
+            // Fail open: an inability to query session state shouldn't stop
+            // the overlay from rendering.
+            return true;
+        }
+        let state = *(buf.0 as *const WTS_CONNECTSTATE_CLASS);
+        WTSFreeMemory(buf.0 as _);
+        state == WTSActive
+    }
+}
+
 pub(super) fn create_event_loop() -> ResultType<()> {
     let face = match create_font_face() {
         Ok(face) => Some(face),
@@ -74,7 +106,11 @@ pub(super) fn create_event_loop() -> ResultType<()> {
     let mut resized = final_size.is_none();
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
+        // Paced rather than ControlFlow::Poll: every frame runs
+        // is_session_connected(), an RPC to the Terminal Services service
+        // (~0.6 ms), and a free-spinning loop would issue hundreds per
+        // second. Cursor events still wake the loop immediately.
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL);
 
         match event {
             Event::WindowEvent { event, .. } => match event {
@@ -206,6 +242,16 @@ pub(super) fn create_event_loop() -> ResultType<()> {
                 }
             }
             Event::MainEventsCleared => {
+                // The window's GDI-backed surface goes invalid the instant the
+                // hosting session disconnects (RDP drop, logoff); a
+                // redraw issued right after that can block in the OS call
+                // forever with no timeout. Exit cleanly instead of risking
+                // that hang - client.rs restarts this process once a
+                // connection is still registered and the session reconnects.
+                if !is_session_connected() {
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
                 window.request_redraw();
             }
             Event::UserEvent((k, evt)) => match evt {

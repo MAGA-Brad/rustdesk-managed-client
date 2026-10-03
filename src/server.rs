@@ -681,6 +681,25 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                 std::process::exit(-1);
             }
         });
+        // Lives here, not the GUI process's init() - see
+        // ipc::Data::ManagedChatIpcRequest's doc comment: this is the
+        // only process with permission to read the enrollment credential
+        // the websocket connection needs. Incoming messages get relayed
+        // back to the GUI process's push listener from inside this task.
+        #[cfg(all(windows, feature = "flutter"))]
+        {
+            log::info!("managed chat: spawning websocket task in --server");
+            crate::managed_chat_store::init();
+            crate::hbbs_http::managed_chat::spawn_chat_websocket_task();
+        }
+        // Same reasoning as managed chat above: current_identity() reads
+        // the ACL'd enrollment credential, so this has to live in
+        // `--server`, not the raw SYSTEM service or the plain GUI window.
+        #[cfg(all(windows, feature = "flutter"))]
+        {
+            log::info!("rustdrop: spawning register/poll task in --server");
+            crate::rustdrop_service::spawn_task();
+        }
         // Warm the DRM availability cache before any client connects, so the first connection does
         // not race a cold `_drm` probe and ship an empty display list ("No displays" + retry).
         // X11 is skipped -- probing there makes the root service open DRM readers for a path this
@@ -775,6 +794,81 @@ pub async fn start_ipc_url_server() {
                         }
                         _ => {
                             log::warn!("An unexpected data was sent to the ipc url server.")
+                        }
+                    },
+                    Err(err) => {
+                        log::error!("{}", err);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(err) => {
+            log::error!("{}", err);
+        }
+    }
+}
+
+// Mirrors start_ipc_url_server above, just for Windows and a different
+// sender: managed_chat's actual websocket connection has to run in
+// --server (see ManagedChatIpcRequest's doc comment for the ACL reason),
+// but push_global_event only reaches Dart from inside the GUI process,
+// which hosts the Flutter engine. This listener - started only in the
+// GUI process, see managed_chat_start_push_listener in flutter_ffi.rs -
+// is what --server connects out to, fire-and-forget, to relay an
+// incoming message back.
+#[cfg(all(windows, feature = "flutter"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn start_managed_chat_push_listener() {
+    log::info!("managed chat push listener: starting");
+    // Retries only cover the "Access is denied" a stale, not-yet-torn-down
+    // prior instance of this same pipe name causes - Windows pins a named
+    // pipe's security descriptor to its first instance, so a fresh
+    // CreateNamedPipe call can be denied by a leftover instance from a
+    // process that's already exiting but hasn't released the handle yet
+    // (seen in the field on several fleet machines). A short retry window
+    // covers that ordinary race; it does nothing for a permission problem
+    // that isn't actually transient, which will just fail the same way on
+    // the last attempt as it would have on the first.
+    let mut result = crate::ipc::new_listener("_managed_chat_push").await;
+    for attempt in 1..=3 {
+        if result.is_ok() {
+            break;
+        }
+        log::warn!(
+            "managed chat push listener: start attempt {} failed, retrying: {:?}",
+            attempt,
+            result.as_ref().err()
+        );
+        hbb_common::sleep(1.0).await;
+        result = crate::ipc::new_listener("_managed_chat_push").await;
+    }
+    match result {
+        Ok(mut incoming) => {
+            log::info!("managed chat push listener: listening");
+            while let Some(Ok(conn)) = incoming.next().await {
+                log::info!("managed chat push listener: connection accepted");
+                let mut conn = crate::ipc::Connection::new(conn);
+                match conn.next_timeout(1000).await {
+                    Ok(Some(data)) => match data {
+                        Data::ManagedChatIncomingMessage(event) => {
+                            // Never the event itself: it carries the message body.
+                            log::info!(
+                                "managed chat push listener: relaying to Dart ({} bytes)",
+                                event.len()
+                            );
+                            match crate::flutter::push_global_event(
+                                crate::flutter::APP_TYPE_MAIN,
+                                event,
+                            ) {
+                                None => log::warn!("No main window app found!"),
+                                Some(..) => {}
+                            }
+                        }
+                        _ => {
+                            log::warn!(
+                                "An unexpected data was sent to the managed chat push listener."
+                            )
                         }
                     },
                     Err(err) => {

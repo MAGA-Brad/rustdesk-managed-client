@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 
 import 'package:dynamic_layouts/dynamic_layouts.dart';
 import 'package:flutter/foundation.dart';
@@ -57,7 +58,8 @@ final peerSearchText = "".obs;
 /// for peer sort, global obs value
 RxString? _peerSort;
 RxString get peerSort {
-  _peerSort ??= bind.getLocalFlutterOption(k: kOptionPeerSorting).obs;
+  _peerSort ??=
+      bind.crateFlutterFfiGetLocalFlutterOption(k: kOptionPeerSorting).obs;
   return _peerSort!;
 }
 
@@ -77,9 +79,7 @@ class _PeersView extends StatefulWidget {
       {required this.peers,
       required this.peerCardBuilder,
       required this.peerTabIndex,
-      this.peerFilter,
-      Key? key})
-      : super(key: key);
+      this.peerFilter});
 
   @override
   _PeersViewState createState() => _PeersViewState();
@@ -215,7 +215,7 @@ class _PeersViewState extends State<_PeersView>
     );
   }
 
-  onVisibilityChanged(VisibilityInfo info) {
+  void onVisibilityChanged(VisibilityInfo info) {
     final peerId = _peerId((info.key as ValueKey).value);
     if (info.visibleFraction > 0.00001) {
       _curPeers.add(peerId);
@@ -249,6 +249,12 @@ class _PeersViewState extends State<_PeersView>
               // No need to listen the currentTab change event.
               // Because the currentTab change event will trigger the peers change event,
               // and the peers change event will trigger _buildPeersView().
+              // The fixed tile height is normally enough, but a card showing
+              // the active-session pill needs extra room - without this, the
+              // pill's content overflows the SizedBox and paints over
+              // whatever is in the row below (no clipping in release builds).
+              final hasSessionPill = peer.activeSessionPeer != null &&
+                  peer.activeSessionPeer!.isNotEmpty;
               return !isPortrait
                   ? Obx(() => peerCardUiType.value == PeerUiType.list
                       ? Container(height: 45, child: visibilityChild)
@@ -256,7 +262,9 @@ class _PeersViewState extends State<_PeersView>
                           ? SizedBox(
                               width: 220, height: 140, child: visibilityChild)
                           : SizedBox(
-                              width: 220, height: 42, child: visibilityChild))
+                              width: 220,
+                              height: hasSessionPill ? 64 : 42,
+                              child: visibilityChild))
                   : Container(child: visibilityChild);
             }
 
@@ -314,7 +322,7 @@ class _PeersViewState extends State<_PeersView>
 
   void _startCheckOnlines() {
     () async {
-      final p = await bind.mainIsUsingPublicServer();
+      final p = await bind.crateFlutterFfiMainIsUsingPublicServer();
       if (!p) {
         _queryInterval = const Duration(seconds: 6);
       }
@@ -333,7 +341,8 @@ class _PeersViewState extends State<_PeersView>
           if (!skipIfNotActive && (_queryCount < _maxQueryCount || !p)) {
             if (now.difference(_lastQueryTime) >= _queryInterval) {
               if (_curPeers.isNotEmpty) {
-                bind.queryOnlines(ids: _curPeers.toList(growable: false));
+                bind.crateFlutterFfiQueryOnlines(
+                    ids: _curPeers.toList(growable: false));
                 _lastQueryTime = DateTime.now();
                 _queryCount += 1;
               }
@@ -345,9 +354,9 @@ class _PeersViewState extends State<_PeersView>
     }();
   }
 
-  _queryOnlines(bool isLoadEvent) {
+  void _queryOnlines(bool isLoadEvent) {
     if (_curPeers.isNotEmpty) {
-      bind.queryOnlines(ids: _curPeers.toList(growable: false));
+      bind.crateFlutterFfiQueryOnlines(ids: _curPeers.toList(growable: false));
       _queryCount = 0;
     }
     _lastQueryPeers = {..._curPeers};
@@ -367,13 +376,19 @@ class _PeersViewState extends State<_PeersView>
     // fallback to id sorting
     if (!PeerSortType.values.contains(sortedBy)) {
       sortedBy = PeerSortType.remoteId;
-      bind.setLocalFlutterOption(
+      bind.crateFlutterFfiSetLocalFlutterOption(
         k: kOptionPeerSorting,
         v: sortedBy,
       );
     }
 
-    if (widget.peers.loadEvent != LoadEvent.recent) {
+    if (bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty) {
+      // Managed clients always sort alphabetically by friendly name (the
+      // sort picker is hidden for them - see peer_tab_page.dart), in every
+      // tab including Recent, which is otherwise left in natural order.
+      peers.sort((p1, p2) =>
+          p1.getId().toLowerCase().compareTo(p2.getId().toLowerCase()));
+    } else if (widget.peers.loadEvent != LoadEvent.recent) {
       switch (sortedBy) {
         case PeerSortType.remoteId:
           peers.sort((p1, p2) => p1.getId().compareTo(p2.getId()));
@@ -416,11 +431,11 @@ abstract class BasePeersView extends StatelessWidget {
   final PeerCardBuilder peerCardBuilder;
 
   const BasePeersView({
-    Key? key,
+    super.key,
     required this.peerTabIndex,
     this.peerFilter,
     required this.peerCardBuilder,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -450,11 +465,42 @@ abstract class BasePeersView extends StatelessWidget {
   }
 }
 
+// Recent/Favorite peers come from the local peer cache (mainLoadRecentPeers/
+// mainLoadFavPeers), not the managed directory snapshot DirectoryPeersView
+// polls - so unlike Directory peers, they never get `activeSessionPeer` set
+// on construction. Call this periodically (see _PeerTabPageState, which
+// owns a timer for this that outlives any single tab being visible - a
+// timer owned by DirectoryPeersView itself would stop as soon as the user
+// switched off the Directory tab) to cross-reference the same snapshot by
+// rustdesk_id and backfill it onto the peers already loaded into
+// recentPeersModel/favoritePeersModel, in place.
+void enrichPeersWithManagedSessionData() {
+  final raw = bind.crateFlutterFfiMainGetManagedDirectoryStatus();
+  if (raw.isEmpty) return;
+  Map<String, String?> sessionByRustdeskId;
+  try {
+    final decoded = jsonDecode(raw);
+    final devices =
+        decoded is Map<String, dynamic> && decoded['devices'] is List
+            ? decoded['devices'] as List
+            : const [];
+    sessionByRustdeskId = {
+      for (final item in devices)
+        if (item is Map && (item['rustdesk_id'] as String?)?.isNotEmpty == true)
+          item['rustdesk_id'] as String: item['active_session_peer'] as String?,
+    };
+  } catch (e) {
+    debugPrint('Failed to parse managed directory for session enrichment: $e');
+    return;
+  }
+  gFFI.recentPeersModel.updateActiveSessionPeers(sessionByRustdeskId);
+  gFFI.favoritePeersModel.updateActiveSessionPeers(sessionByRustdeskId);
+}
+
 class RecentPeersView extends BasePeersView {
   RecentPeersView(
-      {Key? key, EdgeInsets? menuPadding, ScrollController? scrollController})
+      {super.key, EdgeInsets? menuPadding, ScrollController? scrollController})
       : super(
-          key: key,
           peerTabIndex: PeerTabIndex.recent,
           peerCardBuilder: (Peer peer) => RecentPeerCard(
             peer: peer,
@@ -465,16 +511,15 @@ class RecentPeersView extends BasePeersView {
   @override
   Widget build(BuildContext context) {
     final widget = super.build(context);
-    bind.mainLoadRecentPeers();
+    bind.crateFlutterFfiMainLoadRecentPeers();
     return widget;
   }
 }
 
 class FavoritePeersView extends BasePeersView {
   FavoritePeersView(
-      {Key? key, EdgeInsets? menuPadding, ScrollController? scrollController})
+      {super.key, EdgeInsets? menuPadding, ScrollController? scrollController})
       : super(
-          key: key,
           peerTabIndex: PeerTabIndex.fav,
           peerCardBuilder: (Peer peer) => FavoritePeerCard(
             peer: peer,
@@ -485,37 +530,96 @@ class FavoritePeersView extends BasePeersView {
   @override
   Widget build(BuildContext context) {
     final widget = super.build(context);
-    bind.mainLoadFavPeers();
+    bind.crateFlutterFfiMainLoadFavPeers();
     return widget;
   }
 }
 
-class DiscoveredPeersView extends BasePeersView {
-  DiscoveredPeersView(
-      {Key? key, EdgeInsets? menuPadding, ScrollController? scrollController})
-      : super(
-          key: key,
-          peerTabIndex: PeerTabIndex.lan,
-          peerCardBuilder: (Peer peer) => DiscoveredPeerCard(
-            peer: peer,
-            menuPadding: menuPadding,
-          ),
-        );
+class DirectoryPeersView extends StatefulWidget {
+  final EdgeInsets? menuPadding;
+
+  const DirectoryPeersView({super.key, this.menuPadding});
+
+  @override
+  State<DirectoryPeersView> createState() => _DirectoryPeersViewState();
+}
+
+class _DirectoryPeersViewState extends State<DirectoryPeersView> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
+    _timer = Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
+  }
+
+  void _refresh() {
+    if (!mounted) return;
+    final raw = bind.crateFlutterFfiMainGetManagedDirectoryStatus();
+    if (raw.isEmpty) {
+      gFFI.lanPeersModel.replacePeers([]);
+      return;
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      final devices =
+          decoded is Map<String, dynamic> && decoded['devices'] is List
+              ? decoded['devices'] as List
+              : const [];
+      final peers = <Peer>[];
+      for (final item in devices) {
+        if (item is! Map) continue;
+        final map = Map<String, dynamic>.from(item);
+        final peer = Peer.fromJson({
+          'id': map['rustdesk_id'] ?? '',
+          'alias': map['display_name'] ?? '',
+          'hostname': map['hostname'] ?? '',
+          'platform': 'Windows',
+          'username': '',
+          'tags': <dynamic>[],
+          'note': map['last_seen_at'] ?? '',
+        });
+        peer.online = map['online'] == true;
+        peer.activeSessionPeer = map['active_session_peer'] as String?;
+        if (peer.id.isNotEmpty) peers.add(peer);
+      }
+      gFFI.lanPeersModel.replacePeers(peers);
+    } catch (e) {
+      debugPrint('Failed to parse managed directory: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final widget = super.build(context);
-    bind.mainLoadLanPeers();
-    bind.mainDiscover();
-    return widget;
+    return BasePeersViewWidget(
+      peerTabIndex: PeerTabIndex.lan,
+      peerCardBuilder: (Peer peer) => DirectoryPeerCard(
+        peer: peer,
+        menuPadding: widget.menuPadding,
+      ),
+    );
   }
+}
+
+class BasePeersViewWidget extends BasePeersView {
+  const BasePeersViewWidget({
+    super.key,
+    required super.peerTabIndex,
+    required super.peerCardBuilder,
+  });
 }
 
 class AddressBookPeersView extends BasePeersView {
   AddressBookPeersView(
-      {Key? key, EdgeInsets? menuPadding, ScrollController? scrollController})
+      {super.key, EdgeInsets? menuPadding, ScrollController? scrollController})
       : super(
-          key: key,
           peerTabIndex: PeerTabIndex.ab,
           peerFilter: (Peer peer) =>
               _hitTag(gFFI.abModel.selectedTags, peer.tags),
@@ -556,9 +660,8 @@ class AddressBookPeersView extends BasePeersView {
 
 class MyGroupPeerView extends BasePeersView {
   MyGroupPeerView(
-      {Key? key, EdgeInsets? menuPadding, ScrollController? scrollController})
+      {super.key, EdgeInsets? menuPadding, ScrollController? scrollController})
       : super(
-          key: key,
           peerTabIndex: PeerTabIndex.group,
           peerFilter: filter,
           peerCardBuilder: (Peer peer) => MyGroupPeerCard(

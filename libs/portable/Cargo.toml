@@ -22,6 +22,7 @@ windows = { version = "0.61", features = [
     "Win32",
     "Win32_System",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }
 native-windows-gui = {version = "1.0", default-features = false, features = ["animation-timer", "image-decoder"]}
 

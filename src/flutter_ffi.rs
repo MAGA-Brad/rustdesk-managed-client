@@ -3,21 +3,23 @@ use crate::keyboard::input_source::{change_input_source, get_cur_session_input_s
 #[cfg(target_os = "linux")]
 use crate::platform::linux::is_x11;
 use crate::{
-    client::file_trait::FileManager,
-    common::{make_fd_to_json, make_vec_fd_to_json},
     flutter::{
         self, session_add, session_add_existed, session_start_, sessions, try_sync_peer_option,
     },
     input::*,
     ui_interface::{self, *},
 };
-use flutter_rust_bridge::{StreamSink, SyncReturn};
+#[cfg(feature = "plugin_framework")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use hbb_common::allow_err;
+use crate::frb_generated::StreamSink;
+use flutter_rust_bridge::frb;
 use hbb_common::{
     config::{self, LocalConfig, PeerConfig, PeerInfoSerde},
     lazy_static, log,
     rendezvous_proto::ConnType,
-    ResultType,
 };
+pub use hbb_common::ResultType;
 use base::{
     config::keys,
     fs,
@@ -36,6 +38,27 @@ pub type SessionID = uuid::Uuid;
 
 lazy_static::lazy_static! {
     static ref TEXTURE_RENDER_KEY: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
+    // frb 1.x wire functions are plain (non-async) - the wire dispatch itself
+    // already runs them on frb's own background thread pool and returns the
+    // result to Dart via a port, so blocking here does not stall the UI.
+    // This runtime just gives the managed-chat HTTP/WS calls somewhere to
+    // `.await` from that synchronous context.
+    static ref MANAGED_CHAT_RUNTIME: hbb_common::tokio::runtime::Runtime =
+        hbb_common::tokio::runtime::Runtime::new().unwrap();
+    // Same reasoning as MANAGED_CHAT_RUNTIME, for RustDrop's own IPC/HTTP
+    // calls from this (the --rustdrop) process.
+    static ref RUSTDROP_RUNTIME: hbb_common::tokio::runtime::Runtime =
+        hbb_common::tokio::runtime::Runtime::new().unwrap();
+    // Populated once by rustdrop_init() - see its doc comment.
+    static ref RUSTDROP_STATE: std::sync::RwLock<Option<RustDropState>> =
+        std::sync::RwLock::new(None);
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct RustDropState {
+    identity: crate::rustdrop_rds_client::Identity,
+    private_key: [u8; crate::rustdrop_crypto::PRIVATE_KEY_BYTES],
+    public_key_b64: String,
 }
 
 fn initialize(app_dir: &str, custom_client_config: &str) {
@@ -51,6 +74,7 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     } else {
         crate::read_custom_client(custom_client_config);
     }
+
     #[cfg(target_os = "android")]
     {
         // flexi_logger can't work when android_logger initialized.
@@ -82,11 +106,43 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
         // core_main's init_log does not work for flutter since it is only applied to its load_library in main.c
         hbb_common::init_log(false, "flutter_ffi");
     }
+
+    // Managed chat is a desktop Directory-tab feature; the mobile app has
+    // its own separate FCM-based push mechanism via mobile_api.py, not
+    // this websocket. Spawned after init_log() above (not before, as
+    // this was originally written) - log::* is a no-op facade until the
+    // real logger is installed, so anything this background thread logs
+    // before that point is silently dropped, not just delayed.
+    //
+    // On Windows the actual websocket connection lives in --server
+    // instead (see ipc::Data::ManagedChatIpcRequest's doc comment - this
+    // GUI process can't read the enrollment credential it needs there);
+    // this just starts the listener that receives --server's relayed
+    // pushes so push_global_event can reach Dart. Other platforms don't
+    // have that GUI-vs-privileged-process file permission split, so the
+    // websocket still just runs directly in the GUI process there, same
+    // as originally written.
+    //
+    // initialize() runs for every Flutter-engine process (main, --cm,
+    // --rustdrop, --install alike), but only ONE process can ever hold
+    // the singleton named pipe / own the visible Dart engine that
+    // push_global_event actually reaches. Without this is_main() gate,
+    // --cm/--rustdrop/--install race the real main window for the same
+    // pipe at startup - whichever one wins silently "steals" all future
+    // chat push notifications, while the main window's own attempts fail
+    // with "Access is denied" and the user never sees an incoming
+    // message until they manually reopen the chat page.
+    if crate::common::is_main() {
+        #[cfg(all(not(any(target_os = "android", target_os = "ios")), windows))]
+        managed_chat_start_push_listener();
+        #[cfg(all(not(any(target_os = "android", target_os = "ios")), not(windows)))]
+        crate::hbbs_http::managed_chat::spawn_chat_websocket_task();
+    }
 }
 
 #[inline]
-pub fn start_global_event_stream(s: StreamSink<String>, app_type: String) -> ResultType<()> {
-    super::flutter::start_global_event_stream(s, app_type)
+pub fn start_global_event_stream(s: StreamSink<String>, app_type: String) -> Result<(), String> {
+    super::flutter::start_global_event_stream(s, app_type).map_err(|e| e.to_string())
 }
 
 #[inline]
@@ -109,13 +165,583 @@ pub enum EventToUI {
     },
 }
 
+// Managed chat: out-of-session messaging between managed devices. Each
+// function returns a JSON string - either the serialized success value or
+// `{"error": "..."}"` - so Dart parses one shape uniformly rather than
+// needing frb-specific struct bindings for every response type.
+//
+// The server (RDS) is a delivery mailbox only - it purges a message once
+// every recipient has it, and never retains "read" state at all. This
+// device's own copy of chat history, and how long that copy is kept per
+// conversation, lives entirely in managed_chat_store's local sqlite file.
+// The *_sync_* functions below talk to the server and then fold whatever
+// it returns into that local store; the *_local_* functions never touch
+// the network at all, so the UI can render instantly (including offline).
+fn managed_chat_error(error: impl std::fmt::Display) -> String {
+    serde_json::json!({ "error": error.to_string() }).to_string()
+}
+
+// The interactive GUI process (a filtered, non-elevated token even for a
+// local admin user) can't read the ACL'd-to-SYSTEM+Administrators
+// machine-secret directory-state file that every managed_chat remote
+// operation needs for its auth credential - the exact same permission
+// gap already documented (and already fixed, via the same IPC-to-
+// --server relay) for the managed-update "Update Now" feature. On
+// Windows this relays the operation to the --server process, which
+// already reads that file successfully; other platforms don't have this
+// ACL scheme, so they just call the same handler in-process.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn managed_chat_remote_call(operation: &'static str, args: serde_json::Value) -> String {
+    let args_json = args.to_string();
+    // Sizes only: args and results can carry message bodies.
+    log::info!(
+        "managed chat: FFI call {} ({} bytes of args)",
+        operation,
+        args_json.len()
+    );
+    #[cfg(windows)]
+    {
+        let result =
+            MANAGED_CHAT_RUNTIME.block_on(crate::ipc::managed_chat_ipc_call(operation, args_json));
+        log::info!(
+            "managed chat: FFI call {} returning {} bytes",
+            operation,
+            result.len()
+        );
+        return result;
+    }
+    #[cfg(not(windows))]
+    {
+        MANAGED_CHAT_RUNTIME.block_on(crate::hbbs_http::managed_chat::handle_ipc_request(
+            operation,
+            &args_json,
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_start_conversation(peer_rustdesk_id: String) -> String {
+    let raw = managed_chat_remote_call(
+        "start_conversation",
+        serde_json::json!({ "peer_rustdesk_id": peer_rustdesk_id }),
+    );
+    if let Ok(conversation) =
+        serde_json::from_str::<crate::hbbs_http::managed_chat::ChatConversation>(&raw)
+    {
+        if let Err(error) = crate::managed_chat_store::upsert_conversation(&conversation) {
+            log::error!("managed chat: failed to store conversation: {}", error);
+        }
+    }
+    raw
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_send_message(conversation_id: String, body: String) -> String {
+    let raw = managed_chat_remote_call(
+        "send_message",
+        serde_json::json!({ "conversation_id": conversation_id, "body": body }),
+    );
+    if let Ok(message) = serde_json::from_str::<crate::hbbs_http::managed_chat::ChatMessage>(&raw)
+    {
+        let delivered = !message.delivered_to.is_empty();
+        if let Err(error) =
+            crate::managed_chat_store::insert_message(&conversation_id, &message, true, delivered)
+        {
+            log::error!("managed chat: failed to store sent message: {}", error);
+        }
+    }
+    raw
+}
+
+// Pulls the current conversation list from the server (creating/refreshing
+// local rows for anything new - e.g. someone else started a conversation
+// with this device while it was offline) and returns the merged local
+// view, complete with the last-message/unread-count this device itself
+// tracks. A failed remote fetch (offline) just falls back to whatever is
+// already known locally rather than surfacing an error - conversations
+// already underway shouldn't disappear from the UI for lack of a network.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_sync_conversations() -> String {
+    let raw = managed_chat_remote_call("list_conversations", serde_json::json!({}));
+    match serde_json::from_str::<Vec<crate::hbbs_http::managed_chat::ChatConversation>>(&raw) {
+        Ok(conversations) => {
+            for conversation in &conversations {
+                if let Err(error) = crate::managed_chat_store::upsert_conversation(conversation) {
+                    log::error!("managed chat: failed to store conversation: {}", error);
+                }
+            }
+        }
+        Err(_) => log::debug!("managed chat: sync_conversations remote fetch failed: {}", raw),
+    }
+    match crate::managed_chat_store::list_conversations() {
+        Ok(conversations) => serde_json::to_string(&conversations).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// Drains whatever the server is still holding for this conversation (see
+// managed_chat.py's mailbox model), stores it locally, and returns the
+// full local history. Same offline fallback as sync_conversations above.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_sync_messages(conversation_id: String) -> String {
+    let raw = managed_chat_remote_call(
+        "get_messages",
+        serde_json::json!({ "conversation_id": conversation_id }),
+    );
+    match serde_json::from_str::<Vec<crate::hbbs_http::managed_chat::ChatMessage>>(&raw) {
+        Ok(messages) => {
+            for message in &messages {
+                if let Err(error) = crate::managed_chat_store::insert_message(
+                    &conversation_id,
+                    message,
+                    false,
+                    true,
+                ) {
+                    log::error!("managed chat: failed to store synced message: {}", error);
+                }
+            }
+        }
+        Err(_) => log::debug!("managed chat: sync_messages remote fetch failed: {}", raw),
+    }
+    match crate::managed_chat_store::list_messages(&conversation_id) {
+        Ok(messages) => serde_json::to_string(&messages).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_get_local_conversations() -> String {
+    match crate::managed_chat_store::list_conversations() {
+        Ok(conversations) => serde_json::to_string(&conversations).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_get_local_messages(conversation_id: String) -> String {
+    match crate::managed_chat_store::list_messages(&conversation_id) {
+        Ok(messages) => serde_json::to_string(&messages).unwrap_or_default(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// Purely local - the server has no concept of "read" any more. Also
+// applies that conversation's retention policy immediately, since an
+// "Off" (don't keep history) conversation prunes on read.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_mark_read(conversation_id: String) -> String {
+    match crate::managed_chat_store::mark_read(&conversation_id) {
+        Ok(()) => "{}".to_string(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// Unconditionally deletes every local message in this conversation,
+// regardless of read state. Called from the chat window's own close
+// handler when retention is "no retention" (RETENTION_OFF) - that mode
+// means "visible only while the window is open", not "delete on arrival",
+// so the purge has to happen on close, not on insert/read.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_purge_conversation(conversation_id: String) -> String {
+    match crate::managed_chat_store::purge_conversation(&conversation_id) {
+        Ok(()) => "{}".to_string(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+// retention_days: -1 = forever, 0 = "no retention" (visible only while
+// the chat window stays open - see managed_chat_purge_conversation),
+// else prune anything older than that many days. Age-based pruning is
+// applied immediately on change; "no retention" only purges on window
+// close.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_set_retention(conversation_id: String, retention_days: i64) -> String {
+    match crate::managed_chat_store::set_retention(&conversation_id, retention_days) {
+        Ok(()) => "{}".to_string(),
+        Err(error) => managed_chat_error(error),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_self_device_id() -> String {
+    managed_chat_remote_call("self_device_id", serde_json::json!({}))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_get_retention(conversation_id: String) -> String {
+    serde_json::json!({ "retention_days": crate::managed_chat_store::get_retention(&conversation_id) })
+        .to_string()
+}
+
+// RustDrop: unlike managed_chat above, everything past the initial identity/
+// keypair fetch runs directly in THIS process (list_devices, list_drops,
+// send_file, accept_drop, decline_drop all call rustdrop_rds_client /
+// rustdrop_transfer in-process, never relayed through --server) - that
+// separation from --server is the whole reason RustDrop's UI is its own OS
+// process (launched with --rustdrop) rather than a multi_window sub-window
+// of the main app: a bug in this freshly-rewritten code can't take down a
+// live remote-control session running in --server.
+//
+// Each function returns a JSON string - either the serialized success value
+// or `{"error": "..."}"` - same convention as managed_chat, so Dart parses
+// one shape uniformly.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn rustdrop_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    log::error!("rustdrop: {}", message);
+    serde_json::json!({ "error": message }).to_string()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn rustdrop_decode_public_key(b64: &str) -> Result<[u8; crate::rustdrop_crypto::PUBLIC_KEY_BYTES], String> {
+    use hbb_common::base64::Engine;
+    let bytes = hbb_common::base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("malformed public key: {e}"))?;
+    if bytes.len() != crate::rustdrop_crypto::PUBLIC_KEY_BYTES {
+        return Err("malformed public key length".into());
+    }
+    let mut key = [0u8; crate::rustdrop_crypto::PUBLIC_KEY_BYTES];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+// Fetches this device's identity (the ACL'd enrollment credential) and
+// RustDrop keypair exactly once per process lifetime and caches them - same
+// "ask once, keep running" pattern the retired Electron client's own
+// ensureIdentity() used. On Windows both live behind the SYSTEM+
+// Administrators ACL wall this process's own (deliberately non-elevated,
+// see main_launch_rustdrop's doc comment) token can't satisfy, so they're
+// fetched from --server over IPC (see ipc::Data::RustDropKeypairRequest's
+// doc comment); other platforms have no such ACL split, so this reads them
+// directly.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn rustdrop_ensure_identity() -> Result<(), String> {
+    // Belt-and-suspenders: RustDrop must only ever run as the real
+    // interactive user (see main_launch_rustdrop's fix for the actual
+    // spawn-time bug this guards against). Refuse outright if this process
+    // is somehow still LocalSystem - better a clear error than a file-save
+    // dialog silently defaulting into the SYSTEM/LocalService profile.
+    #[cfg(windows)]
+    if crate::platform::is_root() {
+        return Err("RustDrop cannot run as SYSTEM - it must run as the logged-in user".into());
+    }
+
+    // Identity/credential is fetched fresh on EVERY call, deliberately never
+    // cached - it's a cheap local IPC round-trip (no network hop to RDS),
+    // and the main --server process already keeps this current on disk via
+    // its own independent, already-working credential-refresh/revocation-
+    // detection loop (resolve_approved_unauthorized in
+    // directory_enrollment.rs, driven by its own heartbeat traffic).
+    // Caching it here for the process lifetime, like this used to, meant a
+    // device blocked/revoked/re-enrolled mid-session kept using a stale
+    // credential until the whole RustDrop window was closed and reopened -
+    // the same "stuck until restart" shape the TLS-capability-cache bug
+    // had. The X25519 keypair below is the opposite: it's generated locally
+    // and never rotates on its own, so it's still fetched once and cached.
+    #[cfg(windows)]
+    log::info!("diag: ensure_identity: requesting identity via IPC");
+    #[cfg(windows)]
+    let identity_json = RUSTDROP_RUNTIME.block_on(crate::ipc::rustdrop_identity_ipc_call());
+    #[cfg(windows)]
+    log::info!("diag: ensure_identity: identity IPC returned");
+    #[cfg(not(windows))]
+    let identity_json = {
+        let identity = crate::rustdrop_rds_client::current_identity().map_err(|e| e.to_string())?;
+        serde_json::json!({
+            "device_id": identity.device_id,
+            "directory_base_url": identity.directory_base_url,
+            "directory_credential": identity.directory_credential,
+        })
+        .to_string()
+    };
+
+    #[derive(serde::Deserialize)]
+    struct IdentityJson {
+        device_id: String,
+        directory_base_url: String,
+        directory_credential: String,
+    }
+    let identity_parsed: IdentityJson = serde_json::from_str(&identity_json)
+        .map_err(|_| format!("failed to fetch identity: {identity_json}"))?;
+
+    let cached_keypair = RUSTDROP_STATE
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|s| (s.private_key, s.public_key_b64.clone()));
+
+    let (private_key, public_key_b64) = if let Some(keypair) = cached_keypair {
+        keypair
+    } else {
+        #[cfg(windows)]
+        log::info!("diag: ensure_identity: requesting keypair via IPC (not cached)");
+        #[cfg(windows)]
+        let keypair_json = RUSTDROP_RUNTIME.block_on(crate::ipc::rustdrop_keypair_ipc_call());
+        #[cfg(windows)]
+        log::info!("diag: ensure_identity: keypair IPC returned");
+        #[cfg(not(windows))]
+        let keypair_json = {
+            use hbb_common::base64::Engine;
+            let keypair = crate::rustdrop_keystore::load_or_create();
+            serde_json::json!({
+                "public_key": keypair.public_key_base64,
+                "private_key": hbb_common::base64::engine::general_purpose::STANDARD
+                    .encode(keypair.private_key),
+            })
+            .to_string()
+        };
+
+        #[derive(serde::Deserialize)]
+        struct KeypairJson {
+            public_key: String,
+            private_key: String,
+        }
+        let keypair_parsed: KeypairJson = serde_json::from_str(&keypair_json)
+            .map_err(|_| format!("failed to fetch keypair: {keypair_json}"))?;
+
+        let private_key_bytes = {
+            use hbb_common::base64::Engine;
+            hbb_common::base64::engine::general_purpose::STANDARD
+                .decode(&keypair_parsed.private_key)
+                .map_err(|e| format!("malformed private key: {e}"))?
+        };
+        if private_key_bytes.len() != crate::rustdrop_crypto::PRIVATE_KEY_BYTES {
+            return Err("malformed private key length".into());
+        }
+        let mut private_key = [0u8; crate::rustdrop_crypto::PRIVATE_KEY_BYTES];
+        private_key.copy_from_slice(&private_key_bytes);
+        (private_key, keypair_parsed.public_key)
+    };
+
+    *RUSTDROP_STATE.write().unwrap() = Some(RustDropState {
+        identity: crate::rustdrop_rds_client::Identity {
+            device_id: identity_parsed.device_id,
+            directory_base_url: identity_parsed.directory_base_url,
+            directory_credential: identity_parsed.directory_credential,
+        },
+        private_key,
+        public_key_b64,
+    });
+    log::info!("diag: ensure_identity: complete");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn rustdrop_init() -> String {
+    match rustdrop_ensure_identity() {
+        Ok(()) => {
+            let guard = RUSTDROP_STATE.read().unwrap();
+            let state = guard.as_ref().unwrap();
+            log::info!("rustdrop: initialized, device_id={}", state.identity.device_id);
+            serde_json::json!({
+                "device_id": state.identity.device_id,
+                "public_key": state.public_key_b64,
+            })
+            .to_string()
+        }
+        Err(e) => rustdrop_error(e),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn rustdrop_list_devices() -> String {
+    log::info!("diag: list_devices: start, calling ensure_identity");
+    if let Err(e) = rustdrop_ensure_identity() {
+        log::info!("diag: list_devices: ensure_identity failed: {e}");
+        return rustdrop_error(e);
+    }
+    log::info!("diag: list_devices: ensure_identity ok, reading RUSTDROP_STATE");
+    let identity = RUSTDROP_STATE.read().unwrap().as_ref().unwrap().identity.clone();
+    log::info!("diag: list_devices: calling rds_client::list_devices");
+    let result = RUSTDROP_RUNTIME.block_on(crate::rustdrop_rds_client::list_devices(&identity));
+    log::info!("diag: list_devices: rds_client::list_devices returned, ok={}", result.is_ok());
+    match result {
+        Ok(devices) => serde_json::to_string(&devices).unwrap_or_else(|e| rustdrop_error(e)),
+        Err(e) => rustdrop_error(e),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn rustdrop_list_drops() -> String {
+    log::info!("diag: list_drops: start, calling ensure_identity");
+    if let Err(e) = rustdrop_ensure_identity() {
+        log::info!("diag: list_drops: ensure_identity failed: {e}");
+        return rustdrop_error(e);
+    }
+    log::info!("diag: list_drops: ensure_identity ok, reading RUSTDROP_STATE");
+    let identity = RUSTDROP_STATE.read().unwrap().as_ref().unwrap().identity.clone();
+    log::info!("diag: list_drops: calling rds_client::list_drops");
+    let result = RUSTDROP_RUNTIME.block_on(crate::rustdrop_rds_client::list_drops(&identity));
+    log::info!("diag: list_drops: rds_client::list_drops returned, ok={}", result.is_ok());
+    match result {
+        Ok(drops) => serde_json::to_string(&drops).unwrap_or_else(|e| rustdrop_error(e)),
+        Err(e) => rustdrop_error(e),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn rustdrop_decline_drop(drop_id: String) -> String {
+    if let Err(e) = rustdrop_ensure_identity() {
+        return rustdrop_error(e);
+    }
+    let identity = RUSTDROP_STATE.read().unwrap().as_ref().unwrap().identity.clone();
+    match RUSTDROP_RUNTIME.block_on(crate::rustdrop_rds_client::decline_drop(&identity, &drop_id)) {
+        Ok(()) => {
+            log::info!("rustdrop: declined drop {}", drop_id);
+            "{}".to_string()
+        }
+        Err(e) => rustdrop_error(e),
+    }
+}
+
+// Polled by the UI (fast timer, ~1s, only while a row is actively
+// uploading/downloading) to drive a progress bar. Deliberately not gated on
+// rustdrop_ensure_identity() - this is a pure in-memory lookup with no
+// network/identity involved, and staying cheap matters since it's polled
+// frequently. `{"active": false}` means "nothing to show a progress bar
+// for" (not started, already finished, or never tracked) - not an error.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[frb(sync)]
+pub fn rustdrop_transfer_progress(drop_id: String) -> String {
+    match crate::rustdrop_transfer::get_transfer_progress(&drop_id) {
+        Some((bytes_done, total_bytes, state)) => serde_json::json!({
+            "active": true,
+            "bytes_done": bytes_done,
+            "total_bytes": total_bytes,
+            "state": state,
+        })
+        .to_string(),
+        None => "{\"active\":false}".to_string(),
+    }
+}
+
+// Both pure in-memory ops (flip a watch channel / look up a map), same
+// #[frb(sync)] rationale as rustdrop_transfer_progress above - cheap
+// enough not to need the async FRB path. Reused for both the user-facing
+// Pause button and the automatic stall-giveup timer (see TransferState's
+// doc comment in rustdrop_transfer.rs) - `false` back means "nothing to
+// pause/resume" (already finished, or never started), not an error.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[frb(sync)]
+pub fn rustdrop_pause_transfer(drop_id: String) -> String {
+    serde_json::json!({ "ok": crate::rustdrop_transfer::pause_transfer(&drop_id) }).to_string()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[frb(sync)]
+pub fn rustdrop_resume_transfer(drop_id: String) -> String {
+    serde_json::json!({ "ok": crate::rustdrop_transfer::resume_transfer(&drop_id) }).to_string()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn rustdrop_send_file(recipient_device_id: String, local_path: String) -> String {
+    if let Err(e) = rustdrop_ensure_identity() {
+        return rustdrop_error(e);
+    }
+    let (identity, private_key, public_key_b64) = {
+        let guard = RUSTDROP_STATE.read().unwrap();
+        let state = guard.as_ref().unwrap();
+        (
+            state.identity.clone(),
+            state.private_key,
+            state.public_key_b64.clone(),
+        )
+    };
+    let result: Result<crate::rustdrop_rds_client::DropInfo, String> =
+        RUSTDROP_RUNTIME.block_on(async {
+            let devices = crate::rustdrop_rds_client::list_devices(&identity)
+                .await
+                .map_err(|e| e.to_string())?;
+            let recipient = devices
+                .iter()
+                .find(|d| d.device_id == recipient_device_id)
+                .ok_or_else(|| "recipient not found".to_string())?;
+            let recipient_public_key_b64 = recipient.public_key.as_ref().ok_or_else(|| {
+                "Recipient's encryption key isn't available yet. It may not have registered fully - try again shortly.".to_string()
+            })?;
+            let recipient_public_key = rustdrop_decode_public_key(recipient_public_key_b64)?;
+            let key = crate::rustdrop_crypto::derive_key(&private_key, &recipient_public_key)
+                .map_err(|e| e.to_string())?;
+            crate::rustdrop_transfer::send_file(
+                &identity,
+                &key,
+                &public_key_b64,
+                &recipient_device_id,
+                std::path::Path::new(&local_path),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(drop) => {
+            log::info!(
+                "rustdrop: sent {} to device {}",
+                drop.filename,
+                drop.recipient_device_id
+            );
+            serde_json::to_string(&drop).unwrap_or_else(|e| rustdrop_error(e))
+        }
+        Err(e) => rustdrop_error(e),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn rustdrop_accept_drop(drop_json: String, dest_dir: String) -> String {
+    if let Err(e) = rustdrop_ensure_identity() {
+        return rustdrop_error(e);
+    }
+    let drop: crate::rustdrop_rds_client::DropInfo = match serde_json::from_str(&drop_json) {
+        Ok(d) => d,
+        Err(e) => return rustdrop_error(format!("malformed drop: {e}")),
+    };
+    let (identity, private_key) = {
+        let guard = RUSTDROP_STATE.read().unwrap();
+        let state = guard.as_ref().unwrap();
+        (state.identity.clone(), state.private_key)
+    };
+    let result: Result<std::path::PathBuf, String> = RUSTDROP_RUNTIME.block_on(async {
+        let sender_public_key_b64 = drop
+            .sender_public_key
+            .as_ref()
+            .ok_or_else(|| "drop has no sender public key".to_string())?;
+        let sender_public_key = rustdrop_decode_public_key(sender_public_key_b64)?;
+        let key = crate::rustdrop_crypto::derive_key(&private_key, &sender_public_key)
+            .map_err(|e| e.to_string())?;
+        crate::rustdrop_transfer::accept_drop(
+            &identity,
+            &key,
+            &drop,
+            std::path::Path::new(&dest_dir),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    });
+    match result {
+        Ok(path) => {
+            log::info!("rustdrop: accepted {} -> {}", drop.filename, path.display());
+            serde_json::json!({ "saved_path": path.to_string_lossy() }).to_string()
+        }
+        Err(e) => rustdrop_error(e),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn rustdrop_default_downloads_dir() -> String {
+    config::Config::get_home()
+        .join("Downloads")
+        .to_string_lossy()
+        .to_string()
+}
+
 pub fn host_stop_system_key_propagate(_stopped: bool) {
     #[cfg(windows)]
     crate::platform::windows::stop_system_key_propagate(_stopped);
 }
 
 // This function is only used to count the number of control sessions.
-pub fn peer_get_sessions_count(id: String, conn_type: i32) -> SyncReturn<usize> {
+#[frb(sync)]
+pub fn peer_get_sessions_count(id: String, conn_type: i32) -> usize {
     let conn_type = if conn_type == ConnType::VIEW_CAMERA as i32 {
         ConnType::VIEW_CAMERA
     } else if conn_type == ConnType::FILE_TRANSFER as i32 {
@@ -129,22 +755,24 @@ pub fn peer_get_sessions_count(id: String, conn_type: i32) -> SyncReturn<usize> 
     } else {
         ConnType::DEFAULT_CONN
     };
-    SyncReturn(sessions::get_session_count(id, conn_type))
+    (sessions::get_session_count(id, conn_type))
 }
 
+#[frb(sync)]
 pub fn session_add_existed_sync(
     id: String,
     session_id: SessionID,
     displays: Vec<i32>,
     is_view_camera: bool,
-) -> SyncReturn<String> {
+) -> String {
     if let Err(e) = session_add_existed(id.clone(), session_id, displays, is_view_camera) {
-        SyncReturn(format!("Failed to add session with id {}, {}", &id, e))
+        (format!("Failed to add session with id {}, {}", &id, e))
     } else {
-        SyncReturn("".to_owned())
+        ("".to_owned())
     }
 }
 
+#[frb(sync)]
 pub fn session_add_sync(
     session_id: SessionID,
     id: String,
@@ -158,7 +786,7 @@ pub fn session_add_sync(
     password: String,
     is_shared_password: bool,
     conn_token: Option<String>,
-) -> SyncReturn<String> {
+) -> String {
     let add_res = session_add(
         &session_id,
         &id,
@@ -180,9 +808,9 @@ pub fn session_add_sync(
     }
 
     if let Err(e) = add_res {
-        SyncReturn(format!("Failed to add session with id {}, {}", &id, e))
+        (format!("Failed to add session with id {}, {}", &id, e))
     } else {
-        SyncReturn("".to_owned())
+        ("".to_owned())
     }
 }
 
@@ -190,8 +818,8 @@ pub fn session_start(
     events2ui: StreamSink<EventToUI>,
     session_id: SessionID,
     id: String,
-) -> ResultType<()> {
-    session_start_(&session_id, &id, events2ui)
+) -> Result<(), String> {
+    session_start_(&session_id, &id, events2ui).map_err(|e| e.to_string())
 }
 
 pub fn session_start_with_displays(
@@ -199,8 +827,8 @@ pub fn session_start_with_displays(
     session_id: SessionID,
     id: String,
     displays: Vec<i32>,
-) -> ResultType<()> {
-    session_start_(&session_id, &id, events2ui)?;
+) -> Result<(), String> {
+    session_start_(&session_id, &id, events2ui).map_err(|e| e.to_string())?;
 
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.capture_displays(displays.clone(), vec![], vec![]);
@@ -255,9 +883,10 @@ pub fn session_get_toggle_option(session_id: SessionID, arg: String) -> Option<b
     }
 }
 
-pub fn session_get_toggle_option_sync(session_id: SessionID, arg: String) -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn session_get_toggle_option_sync(session_id: SessionID, arg: String) -> bool {
     let res = session_get_toggle_option(session_id, arg) == Some(true);
-    SyncReturn(res)
+    (res)
 }
 
 pub fn session_get_option(session_id: SessionID, arg: String) -> Option<String> {
@@ -286,17 +915,19 @@ pub fn session_send2fa(session_id: SessionID, code: String, trust_this_device: b
     }
 }
 
-pub fn session_get_enable_trusted_devices(session_id: SessionID) -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn session_get_enable_trusted_devices(session_id: SessionID) -> bool {
     let v = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.get_enable_trusted_devices()
     } else {
         false
     };
-    SyncReturn(v)
+    (v)
 }
 
-pub fn will_session_close_close_session(session_id: SessionID) -> SyncReturn<bool> {
-    SyncReturn(sessions::would_remove_peer_by_session_id(&session_id))
+#[frb(sync)]
+pub fn will_session_close_close_session(session_id: SessionID) -> bool {
+    (sessions::would_remove_peer_by_session_id(&session_id))
 }
 
 pub fn session_close(session_id: SessionID) {
@@ -329,11 +960,12 @@ pub fn session_handle_screenshot(
     crate::client::screenshot::handle_screenshot(action)
 }
 
-pub fn session_is_multi_ui_session(session_id: SessionID) -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn session_is_multi_ui_session(session_id: SessionID) -> bool {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(session.is_multi_ui_session())
+        (session.is_multi_ui_session())
     } else {
-        SyncReturn(false)
+        (false)
     }
 }
 
@@ -343,11 +975,12 @@ pub fn session_record_screen(session_id: SessionID, start: bool) {
     }
 }
 
-pub fn session_get_is_recording(session_id: SessionID) -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn session_get_is_recording(session_id: SessionID) -> bool {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(session.is_recording())
+        (session.is_recording())
     } else {
-        SyncReturn(false)
+        (false)
     }
 }
 
@@ -398,21 +1031,24 @@ pub fn session_set_flutter_option(session_id: SessionID, k: String, v: String) {
     }
 }
 
-pub fn get_next_texture_key() -> SyncReturn<i32> {
+#[frb(sync)]
+pub fn get_next_texture_key() -> i32 {
     let k = TEXTURE_RENDER_KEY.fetch_add(1, Ordering::SeqCst) + 1;
-    SyncReturn(k)
+    (k)
 }
 
-pub fn get_local_flutter_option(k: String) -> SyncReturn<String> {
-    SyncReturn(ui_interface::get_local_flutter_option(k))
+#[frb(sync)]
+pub fn get_local_flutter_option(k: String) -> String {
+    (ui_interface::get_local_flutter_option(k))
 }
 
 pub fn set_local_flutter_option(k: String, v: String) {
     ui_interface::set_local_flutter_option(k, v);
 }
 
-pub fn get_local_kb_layout_type() -> SyncReturn<String> {
-    SyncReturn(ui_interface::get_kb_layout_type())
+#[frb(sync)]
+pub fn get_local_kb_layout_type() -> String {
+    (ui_interface::get_kb_layout_type())
 }
 
 pub fn set_local_kb_layout_type(kb_layout_type: String) {
@@ -496,13 +1132,14 @@ pub fn session_set_keyboard_mode(session_id: SessionID, value: String) {
     }
 }
 
-pub fn session_get_reverse_mouse_wheel_sync(session_id: SessionID) -> SyncReturn<Option<String>> {
+#[frb(sync)]
+pub fn session_get_reverse_mouse_wheel_sync(session_id: SessionID) -> Option<String> {
     let res = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         Some(session.get_reverse_mouse_wheel())
     } else {
         None
     };
-    SyncReturn(res)
+    (res)
 }
 
 pub fn session_set_reverse_mouse_wheel(session_id: SessionID, value: String) {
@@ -511,13 +1148,14 @@ pub fn session_set_reverse_mouse_wheel(session_id: SessionID, value: String) {
     }
 }
 
+#[frb(sync)]
 pub fn session_get_displays_as_individual_windows(
     session_id: SessionID,
-) -> SyncReturn<Option<String>> {
+) -> Option<String> {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(Some(session.get_displays_as_individual_windows()))
+        (Some(session.get_displays_as_individual_windows()))
     } else {
-        SyncReturn(None)
+        (None)
     }
 }
 
@@ -527,15 +1165,16 @@ pub fn session_set_displays_as_individual_windows(session_id: SessionID, value: 
     }
 }
 
+#[frb(sync)]
 pub fn session_get_use_all_my_displays_for_the_remote_session(
     session_id: SessionID,
-) -> SyncReturn<Option<String>> {
+) -> Option<String> {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(Some(
+        (Some(
             session.get_use_all_my_displays_for_the_remote_session(),
         ))
     } else {
-        SyncReturn(None)
+        (None)
     }
 }
 
@@ -556,11 +1195,12 @@ pub fn session_get_custom_image_quality(session_id: SessionID) -> Option<Vec<i32
     }
 }
 
-pub fn session_is_keyboard_mode_supported(session_id: SessionID, mode: String) -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn session_is_keyboard_mode_supported(session_id: SessionID, mode: String) -> bool {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(session.is_keyboard_mode_supported(mode))
+        (session.is_keyboard_mode_supported(mode))
     } else {
-        SyncReturn(false)
+        (false)
     }
 }
 
@@ -650,7 +1290,8 @@ pub fn session_handle_flutter_raw_key_event(
 // session_enter_or_leave() will be called then.
 // As Rust is multi-threaded, enter() can be called before leave().
 // The Rust-side grab ownership state filters stale transitions.
-pub fn session_enter_or_leave(_session_id: SessionID, _enter: bool) -> SyncReturn<()> {
+#[frb(sync)]
+pub fn session_enter_or_leave(_session_id: SessionID, _enter: bool) -> () {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if let Some(session) = sessions::get_session_by_session_id(&_session_id) {
         let keyboard_mode = session.get_keyboard_mode();
@@ -672,7 +1313,7 @@ pub fn session_enter_or_leave(_session_id: SessionID, _enter: bool) -> SyncRetur
             );
         }
     }
-    SyncReturn(())
+    (())
 }
 
 pub fn session_input_key(
@@ -754,187 +1395,6 @@ pub fn session_input_os_password(session_id: SessionID, value: String) {
     }
 }
 
-// File Action
-pub fn session_read_remote_dir(session_id: SessionID, path: String, include_hidden: bool) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.read_remote_dir(path, include_hidden);
-    }
-}
-
-pub fn session_send_files(
-    session_id: SessionID,
-    act_id: i32,
-    path: String,
-    to: String,
-    file_num: i32,
-    include_hidden: bool,
-    is_remote: bool,
-    _is_dir: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.send_files(
-            act_id,
-            fs::JobType::Generic.into(),
-            path,
-            to,
-            file_num,
-            include_hidden,
-            is_remote,
-        );
-    }
-}
-
-pub fn session_set_confirm_override_file(
-    session_id: SessionID,
-    act_id: i32,
-    file_num: i32,
-    need_override: bool,
-    remember: bool,
-    is_upload: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.set_confirm_override_file(act_id, file_num, need_override, remember, is_upload);
-    }
-}
-
-pub fn session_remove_file(
-    session_id: SessionID,
-    act_id: i32,
-    path: String,
-    file_num: i32,
-    is_remote: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.remove_file(act_id, path, file_num, is_remote);
-    }
-}
-
-pub fn session_read_dir_to_remove_recursive(
-    session_id: SessionID,
-    act_id: i32,
-    path: String,
-    is_remote: bool,
-    show_hidden: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.remove_dir_all(act_id, path, is_remote, show_hidden);
-    }
-}
-
-pub fn session_remove_all_empty_dirs(
-    session_id: SessionID,
-    act_id: i32,
-    path: String,
-    is_remote: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.remove_dir(act_id, path, is_remote);
-    }
-}
-
-pub fn session_cancel_job(session_id: SessionID, act_id: i32) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.cancel_job(act_id);
-    }
-}
-
-pub fn session_create_dir(session_id: SessionID, act_id: i32, path: String, is_remote: bool) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.create_dir(act_id, path, is_remote);
-    }
-}
-
-pub fn session_read_local_dir_sync(
-    _session_id: SessionID,
-    path: String,
-    show_hidden: bool,
-) -> String {
-    if let Ok(fd) = fs::read_dir(&fs::get_path(&path), show_hidden) {
-        return make_fd_to_json(fd.id, path, &fd.entries);
-    }
-    "".to_string()
-}
-
-pub fn session_read_local_empty_dirs_recursive_sync(
-    _session_id: SessionID,
-    path: String,
-    include_hidden: bool,
-) -> String {
-    if let Ok(fds) = fs::get_empty_dirs_recursive(&path, include_hidden) {
-        return make_vec_fd_to_json(&fds);
-    }
-    "".to_string()
-}
-
-pub fn session_read_remote_empty_dirs_recursive_sync(
-    session_id: SessionID,
-    path: String,
-    include_hidden: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.read_empty_dirs(path, include_hidden);
-    }
-}
-
-pub fn session_get_platform(session_id: SessionID, is_remote: bool) -> String {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        return session.get_platform(is_remote);
-    }
-    "".to_string()
-}
-
-pub fn session_load_last_transfer_jobs(session_id: SessionID) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        return session.load_last_jobs();
-    } else {
-        // a tip for flutter dev
-        eprintln!(
-            "cannot load last transfer job from non-existed session. Please ensure session \
-        is connected before calling load last transfer jobs."
-        );
-    }
-}
-
-pub fn session_add_job(
-    session_id: SessionID,
-    act_id: i32,
-    path: String,
-    to: String,
-    file_num: i32,
-    include_hidden: bool,
-    is_remote: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.add_job(
-            act_id,
-            fs::JobType::Generic.into(),
-            path,
-            to,
-            file_num,
-            include_hidden,
-            is_remote,
-        );
-    }
-}
-
-pub fn session_resume_job(session_id: SessionID, act_id: i32, is_remote: bool) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.resume_job(act_id, is_remote);
-    }
-}
-
-pub fn session_rename_file(
-    session_id: SessionID,
-    act_id: i32,
-    path: String,
-    new_name: String,
-    is_remote: bool,
-) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.rename_file(act_id, path, new_name, is_remote);
-    }
-}
-
 pub fn session_elevate_direct(session_id: SessionID) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.elevate_direct();
@@ -976,8 +1436,9 @@ pub fn main_get_sound_inputs() -> Vec<String> {
     vec![String::from("")]
 }
 
-pub fn main_get_login_device_info() -> SyncReturn<String> {
-    SyncReturn(get_login_device_info_json())
+#[frb(sync)]
+pub fn main_get_login_device_info() -> String {
+    (get_login_device_info_json())
 }
 
 pub fn main_change_id(new_id: String) {
@@ -996,8 +1457,9 @@ pub fn main_get_option(key: String) -> String {
     get_option(key)
 }
 
-pub fn main_get_option_sync(key: String) -> SyncReturn<String> {
-    SyncReturn(get_option(key))
+#[frb(sync)]
+pub fn main_get_option_sync(key: String) -> String {
+    (get_option(key))
 }
 
 pub fn main_get_error() -> String {
@@ -1005,6 +1467,60 @@ pub fn main_get_error() -> String {
 }
 
 pub fn main_set_option(key: String, value: String) {
+    if key == "managed-request-reenrollment" {
+        #[cfg(windows)]
+        std::thread::spawn(|| {
+            match crate::ipc::request_directory_reenrollment() {
+                Ok(true) => log::info!("Managed re-enrollment request submitted"),
+                Ok(false) => log::warn!("Managed re-enrollment request was not accepted"),
+                Err(error) => log::warn!(
+                    "Managed re-enrollment request IPC failed: {}",
+                    error
+                ),
+            }
+        });
+        return;
+    }
+    if key == "managed-update-contact-email" {
+        // Unlike reenrollment (a fire-once action with nothing to display),
+        // this value IS shown in the Settings field - fall through to the
+        // generic write below too, so this (GUI) process's own local config
+        // reflects it immediately rather than only the service's cache,
+        // matching how Computer Friendly Name behaves.
+        #[cfg(windows)]
+        {
+            let value_for_service = value.clone();
+            std::thread::spawn(move || {
+                match crate::ipc::update_directory_contact_email(value_for_service) {
+                    Ok(true) => log::info!("Managed contact email updated"),
+                    Ok(false) => log::warn!("Managed contact email update was not accepted"),
+                    Err(error) => log::warn!(
+                        "Managed contact email update IPC failed: {}",
+                        error
+                    ),
+                }
+            });
+        }
+    }
+    // The managed directory worker (heartbeat, enrollment) runs in the Windows
+    // service process, which has its own separate in-memory Config cache from
+    // this GUI process - writing the option here does not make the service see
+    // it. Push the new value over IPC so the service's cache (and thus the next
+    // heartbeat) picks it up without waiting for a service restart.
+    #[cfg(windows)]
+    if key == keys::OPTION_PRESET_DEVICE_NAME {
+        let value_for_service = value.clone();
+        std::thread::spawn(move || {
+            if let Err(error) =
+                crate::ipc::notify_directory_friendly_name_changed(value_for_service)
+            {
+                log::warn!(
+                    "Managed friendly name IPC notify failed: {}",
+                    error
+                );
+            }
+        });
+    }
     #[cfg(target_os = "android")]
     {
         let is_permission_option = key.eq(keys::OPTION_ENABLE_CLIPBOARD)
@@ -1068,12 +1584,13 @@ pub fn main_get_options() -> String {
     get_options()
 }
 
-pub fn main_get_options_sync() -> SyncReturn<String> {
-    SyncReturn(get_options())
+#[frb(sync)]
+pub fn main_get_options_sync() -> String {
+    (get_options())
 }
 
 pub fn main_set_options(json: String) {
-    let mut map: HashMap<String, String> = serde_json::from_str(&json).unwrap_or(HashMap::new());
+    let map: HashMap<String, String> = serde_json::from_str(&json).unwrap_or(HashMap::new());
     #[cfg(target_os = "android")]
     {
         let allow_perm_change_in_accept_window = config::option2bool(
@@ -1121,12 +1638,14 @@ pub fn main_get_app_name() -> String {
     get_app_name()
 }
 
-pub fn main_get_app_name_sync() -> SyncReturn<String> {
-    SyncReturn(get_app_name())
+#[frb(sync)]
+pub fn main_get_app_name_sync() -> String {
+    (get_app_name())
 }
 
-pub fn main_uri_prefix_sync() -> SyncReturn<String> {
-    SyncReturn(crate::get_uri_prefix())
+#[frb(sync)]
+pub fn main_uri_prefix_sync() -> String {
+    (crate::get_uri_prefix())
 }
 
 pub fn main_get_license() -> String {
@@ -1145,9 +1664,10 @@ pub fn main_store_fav(favs: Vec<String>) {
     store_fav(favs)
 }
 
-pub fn main_get_peer_sync(id: String) -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_get_peer_sync(id: String) -> String {
     let conf = get_peer(id);
-    SyncReturn(serde_json::to_string(&conf).unwrap_or("".to_string()))
+    (serde_json::to_string(&conf).unwrap_or("".to_string()))
 }
 
 pub fn main_get_lan_peers() -> String {
@@ -1202,24 +1722,28 @@ pub fn main_deploy_device(token: String, id: String) -> String {
     }
 }
 
-pub fn main_resolve_avatar_url(avatar: String) -> SyncReturn<String> {
-    SyncReturn(resolve_avatar_url(avatar))
+#[frb(sync)]
+pub fn main_resolve_avatar_url(avatar: String) -> String {
+    (resolve_avatar_url(avatar))
 }
 
 pub fn main_http_request(url: String, method: String, body: Option<String>, header: String) {
     http_request(url, method, body, header)
 }
 
-pub fn main_get_local_option(key: String) -> SyncReturn<String> {
-    SyncReturn(get_local_option(key))
+#[frb(sync)]
+pub fn main_get_local_option(key: String) -> String {
+    (get_local_option(key))
 }
 
-pub fn main_get_use_texture_render() -> SyncReturn<bool> {
-    SyncReturn(use_texture_render())
+#[frb(sync)]
+pub fn main_get_use_texture_render() -> bool {
+    (use_texture_render())
 }
 
-pub fn main_get_env(key: String) -> SyncReturn<String> {
-    SyncReturn(std::env::var(key).unwrap_or_default())
+#[frb(sync)]
+pub fn main_get_env(key: String) -> String {
+    (std::env::var(key).unwrap_or_default())
 }
 
 // Dart does not support changing environment variables.
@@ -1227,12 +1751,13 @@ pub fn main_get_env(key: String) -> SyncReturn<String> {
 // `Unsupported operation: Cannot modify unmodifiable map`.
 //
 // And we need to share the environment variables between rust and dart isolates sometimes.
-pub fn main_set_env(key: String, value: Option<String>) -> SyncReturn<()> {
+#[frb(sync)]
+pub fn main_set_env(key: String, value: Option<String>) -> () {
     let is_valid_key = !key.is_empty() && !key.contains('=') && !key.contains('\0');
     debug_assert!(is_valid_key, "Invalid environment variable key: {}", key);
     if !is_valid_key {
         log::error!("Invalid environment variable key: {}", key);
-        return SyncReturn(());
+        return (());
     }
 
     match value {
@@ -1241,14 +1766,14 @@ pub fn main_set_env(key: String, value: Option<String>) -> SyncReturn<()> {
             debug_assert!(is_valid_value, "Invalid environment variable value: {}", v);
             if !is_valid_value {
                 log::error!("Invalid environment variable value: {}", v);
-                return SyncReturn(());
+                return (());
             }
             std::env::set_var(key, v);
         }
         None => std::env::remove_var(key),
     }
 
-    SyncReturn(())
+    (())
 }
 
 pub fn main_set_local_option(key: String, value: String) {
@@ -1310,12 +1835,13 @@ pub fn main_handle_wayland_screencast_restore_token(_key: String, _value: String
     }
 }
 
-pub fn main_get_input_source() -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_get_input_source() -> String {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let input_source = get_cur_session_input_source();
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let input_source = "".to_owned();
-    SyncReturn(input_source)
+    (input_source)
 }
 
 pub fn main_set_input_source(session_id: SessionID, value: String) {
@@ -1337,15 +1863,16 @@ pub fn main_set_input_source(session_id: SessionID, value: String) {
 /// # Platform behavior
 /// - Windows/macOS/Linux: attempts to move the cursor to (x, y)
 /// - Android/iOS: no-op, always returns `false`
-pub fn main_set_cursor_position(x: i32, y: i32) -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn main_set_cursor_position(x: i32, y: i32) -> bool {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        SyncReturn(crate::set_cursor_pos(x, y))
+        (crate::set_cursor_pos(x, y))
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (x, y);
-        SyncReturn(false)
+        (false)
     }
 }
 
@@ -1365,13 +1892,14 @@ pub fn main_set_cursor_position(x: i32, y: i32) -> SyncReturn<bool> {
 ///   the rect coordinates are ignored (only Some/None matters)
 /// - Linux: no-op, always returns `true`; use pointer warping for similar effect
 /// - Android/iOS: no-op, always returns `false`
+#[frb(sync)]
 pub fn main_clip_cursor(
     left: i32,
     top: i32,
     right: i32,
     bottom: i32,
     enable: bool,
-) -> SyncReturn<bool> {
+) -> bool {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let rect = if enable {
@@ -1379,12 +1907,12 @@ pub fn main_clip_cursor(
         } else {
             None
         };
-        SyncReturn(crate::clip_cursor(rect))
+        (crate::clip_cursor(rect))
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (left, top, right, bottom, enable);
-        SyncReturn(false)
+        (false)
     }
 }
 
@@ -1400,28 +1928,32 @@ pub fn main_get_peer_option(id: String, key: String) -> String {
     get_peer_option(id, key)
 }
 
-pub fn main_get_peer_option_sync(id: String, key: String) -> SyncReturn<String> {
-    SyncReturn(get_peer_option(id, key))
+#[frb(sync)]
+pub fn main_get_peer_option_sync(id: String, key: String) -> String {
+    (get_peer_option(id, key))
 }
 
 // Sometimes we need to get the flutter option of a peer by reading the file.
 // Because the session may not be established yet.
-pub fn main_get_peer_flutter_option_sync(id: String, k: String) -> SyncReturn<String> {
-    SyncReturn(get_peer_flutter_option(id, k))
+#[frb(sync)]
+pub fn main_get_peer_flutter_option_sync(id: String, k: String) -> String {
+    (get_peer_flutter_option(id, k))
 }
 
-pub fn main_set_peer_flutter_option_sync(id: String, k: String, v: String) -> SyncReturn<()> {
+#[frb(sync)]
+pub fn main_set_peer_flutter_option_sync(id: String, k: String, v: String) -> () {
     set_peer_flutter_option(id, k, v);
-    SyncReturn(())
+    (())
 }
 
 pub fn main_set_peer_option(id: String, key: String, value: String) {
     set_peer_option(id, key, value)
 }
 
-pub fn main_set_peer_option_sync(id: String, key: String, value: String) -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn main_set_peer_option_sync(id: String, key: String, value: String) -> bool {
     set_peer_option(id, key, value);
-    SyncReturn(true)
+    (true)
 }
 
 pub fn main_set_peer_alias(id: String, alias: String) {
@@ -1620,27 +2152,31 @@ pub fn main_change_language(lang: String) {
     send_to_cm(&crate::ipc::Data::Language(lang));
 }
 
-pub fn main_video_save_directory(root: bool) -> SyncReturn<String> {
-    SyncReturn(video_save_directory(root))
+#[frb(sync)]
+pub fn main_video_save_directory(root: bool) -> String {
+    (video_save_directory(root))
 }
 
 pub fn main_set_user_default_option(key: String, value: String) {
     set_user_default_option(key, value);
 }
 
-pub fn main_get_user_default_option(key: String) -> SyncReturn<String> {
-    SyncReturn(get_user_default_option(key))
+#[frb(sync)]
+pub fn main_get_user_default_option(key: String) -> String {
+    (get_user_default_option(key))
 }
 
 pub fn main_handle_relay_id(id: String) -> String {
     handle_relay_id(&id).to_owned()
 }
 
-pub fn main_is_option_fixed(key: String) -> SyncReturn<bool> {
-    SyncReturn(is_option_fixed(&key))
+#[frb(sync)]
+pub fn main_is_option_fixed(key: String) -> bool {
+    (is_option_fixed(&key))
 }
 
-pub fn main_get_main_display() -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_get_main_display() -> String {
     #[cfg(target_os = "ios")]
     let display_info = "".to_owned();
     #[cfg(not(target_os = "ios"))]
@@ -1680,12 +2216,13 @@ pub fn main_get_main_display() -> SyncReturn<String> {
             }
         }
     }
-    SyncReturn(display_info)
+    (display_info)
 }
 
 // No need to check if is on Wayland in this function.
 // The Flutter side gets display information on Wayland using a different method.
-pub fn main_get_displays() -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_get_displays() -> String {
     #[cfg(target_os = "ios")]
     let display_info = "".to_owned();
     #[cfg(not(target_os = "ios"))]
@@ -1705,7 +2242,7 @@ pub fn main_get_displays() -> SyncReturn<String> {
             .collect::<Vec<_>>();
         display_info = serde_json::to_string(&displays).unwrap_or_default();
     }
-    SyncReturn(display_info)
+    (display_info)
 }
 
 pub fn session_add_port_forward(
@@ -1743,11 +2280,12 @@ pub fn session_close_voice_call(session_id: SessionID) {
     }
 }
 
-pub fn session_get_conn_token(session_id: SessionID) -> SyncReturn<Option<String>> {
+#[frb(sync)]
+pub fn session_get_conn_token(session_id: SessionID) -> Option<String> {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(session.get_conn_token())
+        (session.get_conn_token())
     } else {
-        SyncReturn(None)
+        (None)
     }
 }
 
@@ -1842,32 +2380,36 @@ pub fn main_remove_peer(id: String) {
     PeerConfig::remove(&id);
 }
 
-pub fn main_has_hwcodec() -> SyncReturn<bool> {
-    SyncReturn(has_hwcodec())
+#[frb(sync)]
+pub fn main_has_hwcodec() -> bool {
+    (has_hwcodec())
 }
 
-pub fn main_has_vram() -> SyncReturn<bool> {
-    SyncReturn(has_vram())
+#[frb(sync)]
+pub fn main_has_vram() -> bool {
+    (has_vram())
 }
 
-pub fn main_supported_hwdecodings() -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_supported_hwdecodings() -> String {
     let decoding = supported_hwdecodings();
     let msg = HashMap::from([("h264", decoding.0), ("h265", decoding.1)]);
 
-    SyncReturn(serde_json::ser::to_string(&msg).unwrap_or("".to_owned()))
+    (serde_json::ser::to_string(&msg).unwrap_or("".to_owned()))
 }
 
 pub fn main_is_root() -> bool {
     is_root()
 }
 
-pub fn get_double_click_time() -> SyncReturn<i32> {
+#[frb(sync)]
+pub fn get_double_click_time() -> i32 {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        return SyncReturn(crate::platform::get_double_click_time() as _);
+        return (crate::platform::get_double_click_time() as _);
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    SyncReturn(500i32)
+    (500i32)
 }
 
 pub fn main_start_dbus_server() {
@@ -2059,13 +2601,14 @@ pub fn session_restart_remote_device(session_id: SessionID) {
     }
 }
 
-pub fn session_get_audit_server_sync(session_id: SessionID, typ: String) -> SyncReturn<String> {
+#[frb(sync)]
+pub fn session_get_audit_server_sync(session_id: SessionID, typ: String) -> String {
     let res = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.get_audit_server(typ)
     } else {
         "".to_owned()
     };
-    SyncReturn(res)
+    (res)
 }
 
 pub fn session_send_note(session_id: SessionID, note: String) {
@@ -2074,11 +2617,12 @@ pub fn session_send_note(session_id: SessionID, note: String) {
     }
 }
 
-pub fn session_get_last_audit_note(session_id: SessionID) -> SyncReturn<String> {
+#[frb(sync)]
+pub fn session_get_last_audit_note(session_id: SessionID) -> String {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(session.last_audit_note.lock().unwrap().clone())
+        (session.last_audit_note.lock().unwrap().clone())
     } else {
-        SyncReturn("".to_owned())
+        ("".to_owned())
     }
 }
 
@@ -2088,19 +2632,21 @@ pub fn session_set_audit_guid(session_id: SessionID, guid: String) {
     }
 }
 
-pub fn session_get_audit_guid(session_id: SessionID) -> SyncReturn<String> {
+#[frb(sync)]
+pub fn session_get_audit_guid(session_id: SessionID) -> String {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(session.audit_guid.lock().unwrap().clone())
+        (session.audit_guid.lock().unwrap().clone())
     } else {
-        SyncReturn("".to_owned())
+        ("".to_owned())
     }
 }
 
-pub fn session_get_conn_session_id(session_id: SessionID) -> SyncReturn<String> {
+#[frb(sync)]
+pub fn session_get_conn_session_id(session_id: SessionID) -> String {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        SyncReturn(session.lc.read().unwrap().session_id.to_string())
+        (session.lc.read().unwrap().session_id.to_string())
     } else {
-        SyncReturn("".to_owned())
+        ("".to_owned())
     }
 }
 
@@ -2150,7 +2696,8 @@ pub fn main_set_home_dir(_home: String) {
 }
 
 // This is a temporary method to get data dir for ios
-pub fn main_get_data_dir_ios(app_dir: String) -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_get_data_dir_ios(app_dir: String) -> String {
     *config::APP_DIR.write().unwrap() = app_dir;
     let data_dir = config::Config::path("data");
     if !data_dir.exists() {
@@ -2158,7 +2705,7 @@ pub fn main_get_data_dir_ios(app_dir: String) -> SyncReturn<String> {
             log::warn!("Failed to create data dir {}", e);
         }
     }
-    SyncReturn(data_dir.to_string_lossy().to_string())
+    (data_dir.to_string_lossy().to_string())
 }
 
 pub fn main_stop_service() {
@@ -2186,12 +2733,14 @@ pub fn main_check_super_user_permission() -> bool {
     check_super_user_permission()
 }
 
-pub fn main_get_unlock_pin() -> SyncReturn<String> {
-    SyncReturn(get_unlock_pin())
+#[frb(sync)]
+pub fn main_get_unlock_pin() -> String {
+    (get_unlock_pin())
 }
 
-pub fn main_set_unlock_pin(pin: String) -> SyncReturn<String> {
-    SyncReturn(set_unlock_pin(pin))
+#[frb(sync)]
+pub fn main_set_unlock_pin(pin: String) -> String {
+    (set_unlock_pin(pin))
 }
 
 pub fn main_check_mouse_time() {
@@ -2270,8 +2819,9 @@ pub fn cm_switch_permission(conn_id: i32, name: String, enabled: bool) {
     crate::ui_cm_interface::switch_permission(conn_id, name, enabled)
 }
 
-pub fn cm_can_elevate() -> SyncReturn<bool> {
-    SyncReturn(crate::ui_cm_interface::can_elevate())
+#[frb(sync)]
+pub fn cm_can_elevate() -> bool {
+    (crate::ui_cm_interface::can_elevate())
 }
 
 pub fn cm_elevate_portable(conn_id: i32) {
@@ -2303,34 +2853,49 @@ pub fn main_get_build_date() -> String {
     crate::BUILD_DATE.to_string()
 }
 
-pub fn translate(name: String, locale: String) -> SyncReturn<String> {
-    SyncReturn(crate::client::translate_locale(name, &locale))
+pub fn main_get_managed_build_number() -> u64 {
+    crate::hbbs_http::directory_enrollment::managed_build_number()
 }
 
-pub fn session_get_rgba_size(session_id: SessionID, display: usize) -> SyncReturn<usize> {
-    SyncReturn(super::flutter::session_get_rgba_size(session_id, display))
+pub fn main_get_managed_ops_console_url() -> String {
+    crate::hbbs_http::directory_enrollment::managed_ops_console_url()
+        .unwrap_or_default()
+        .to_string()
 }
 
-pub fn session_next_rgba(session_id: SessionID, display: usize) -> SyncReturn<()> {
-    SyncReturn(super::flutter::session_next_rgba(session_id, display))
+#[frb(sync)]
+pub fn translate(name: String, locale: String) -> String {
+    (crate::client::translate_locale(name, &locale))
 }
 
+#[frb(sync)]
+pub fn session_get_rgba_size(session_id: SessionID, display: usize) -> usize {
+    (super::flutter::session_get_rgba_size(session_id, display))
+}
+
+#[frb(sync)]
+pub fn session_next_rgba(session_id: SessionID, display: usize) -> () {
+    (super::flutter::session_next_rgba(session_id, display))
+}
+
+#[frb(sync)]
 pub fn session_register_pixelbuffer_texture(
     session_id: SessionID,
     display: usize,
     ptr: usize,
-) -> SyncReturn<()> {
-    SyncReturn(super::flutter::session_register_pixelbuffer_texture(
+) -> () {
+    (super::flutter::session_register_pixelbuffer_texture(
         session_id, display, ptr,
     ))
 }
 
+#[frb(sync)]
 pub fn session_register_gpu_texture(
     session_id: SessionID,
     display: usize,
     ptr: usize,
-) -> SyncReturn<()> {
-    SyncReturn(super::flutter::session_register_gpu_texture(
+) -> () {
+    (super::flutter::session_register_gpu_texture(
         session_id, display, ptr,
     ))
 }
@@ -2339,64 +2904,76 @@ pub fn query_onlines(ids: Vec<String>) {
     let _ = flutter::async_tasks::query_onlines(ids);
 }
 
-pub fn version_to_number(v: String) -> SyncReturn<i64> {
-    SyncReturn(hbb_common::get_version_number(&v))
+#[frb(sync)]
+pub fn version_to_number(v: String) -> i64 {
+    (hbb_common::get_version_number(&v))
 }
 
 pub fn option_synced() -> bool {
     crate::ui_interface::option_synced()
 }
 
-pub fn main_is_installed() -> SyncReturn<bool> {
-    SyncReturn(is_installed())
+#[frb(sync)]
+pub fn main_is_installed() -> bool {
+    (is_installed())
 }
 
-pub fn main_init_input_source() -> SyncReturn<()> {
+#[frb(sync)]
+pub fn main_init_input_source() -> () {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     crate::keyboard::input_source::init_input_source();
-    SyncReturn(())
+    (())
 }
 
-pub fn main_is_installed_lower_version() -> SyncReturn<bool> {
-    SyncReturn(is_installed_lower_version())
+#[frb(sync)]
+pub fn main_is_installed_lower_version() -> bool {
+    (is_installed_lower_version())
 }
 
-pub fn main_is_installed_daemon(prompt: bool) -> SyncReturn<bool> {
-    SyncReturn(is_installed_daemon(prompt))
+#[frb(sync)]
+pub fn main_is_installed_daemon(prompt: bool) -> bool {
+    (is_installed_daemon(prompt))
 }
 
-pub fn main_is_process_trusted(prompt: bool) -> SyncReturn<bool> {
-    SyncReturn(is_process_trusted(prompt))
+#[frb(sync)]
+pub fn main_is_process_trusted(prompt: bool) -> bool {
+    (is_process_trusted(prompt))
 }
 
-pub fn main_is_can_screen_recording(prompt: bool) -> SyncReturn<bool> {
-    SyncReturn(is_can_screen_recording(prompt))
+#[frb(sync)]
+pub fn main_is_can_screen_recording(prompt: bool) -> bool {
+    (is_can_screen_recording(prompt))
 }
 
-pub fn main_is_can_input_monitoring(prompt: bool) -> SyncReturn<bool> {
-    SyncReturn(is_can_input_monitoring(prompt))
+#[frb(sync)]
+pub fn main_is_can_input_monitoring(prompt: bool) -> bool {
+    (is_can_input_monitoring(prompt))
 }
 
-pub fn main_is_share_rdp() -> SyncReturn<bool> {
-    SyncReturn(is_share_rdp())
+#[frb(sync)]
+pub fn main_is_share_rdp() -> bool {
+    (is_share_rdp())
 }
 
 pub fn main_set_share_rdp(enable: bool) {
     set_share_rdp(enable)
 }
 
-pub fn main_goto_install() -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn main_goto_install() -> bool {
     goto_install();
-    SyncReturn(true)
+    (true)
 }
 
-pub fn main_get_new_version() -> SyncReturn<String> {
-    SyncReturn(get_new_version())
+#[frb(sync)]
+pub fn main_get_new_version() -> String {
+    (get_new_version())
 }
 
-pub fn main_update_me() -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn main_update_me() -> bool {
     update_me("".to_owned());
-    SyncReturn(true)
+    (true)
 }
 
 pub fn set_cur_session_id(session_id: SessionID) {
@@ -2411,24 +2988,422 @@ fn set_cur_session_id_(session_id: SessionID, _keyboard_mode: &str) {
     crate::keyboard::update_grab_get_key_name(_keyboard_mode);
 }
 
-pub fn install_show_run_without_install() -> SyncReturn<bool> {
-    SyncReturn(show_run_without_install())
+fn managed_installer_auth_hex<const N: usize>(
+    value: &str,
+) -> Option<[u8; N]> {
+    let value = value.trim();
+
+    if value.len() != N * 2 || !value.is_ascii() {
+        return None;
+    }
+
+    let mut output = [0u8; N];
+
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = match pair[0] {
+            b'0'..=b'9' => pair[0] - b'0',
+            b'a'..=b'f' => pair[0] - b'a' + 10,
+            b'A'..=b'F' => pair[0] - b'A' + 10,
+            _ => return None,
+        };
+
+        let low = match pair[1] {
+            b'0'..=b'9' => pair[1] - b'0',
+            b'a'..=b'f' => pair[1] - b'a' + 10,
+            b'A'..=b'F' => pair[1] - b'A' + 10,
+            _ => return None,
+        };
+
+        output[index] = (high << 4) | low;
+    }
+
+    Some(output)
+}
+
+pub(crate) fn managed_installer_auth_matches(candidate: &str) -> bool {
+    let Some(salt_hex) = option_env!("RUSTDESK_INSTALLER_AUTH_SALT_HEX")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let Some(expected_hex) =
+        option_env!("RUSTDESK_INSTALLER_AUTH_PBKDF2_HEX")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let Some(iterations) =
+        option_env!("RUSTDESK_INSTALLER_AUTH_PBKDF2_ITERATIONS")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value >= 100_000)
+    else {
+        return false;
+    };
+
+    let Some(salt) = managed_installer_auth_hex::<16>(salt_hex) else {
+        return false;
+    };
+
+    let Some(expected) =
+        managed_installer_auth_hex::<32>(expected_hex)
+    else {
+        return false;
+    };
+
+    let mut derived = [0u8; 32];
+
+    pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha256>>(
+        candidate.as_bytes(),
+        &salt,
+        iterations,
+        &mut derived,
+    );
+
+    let mut difference = 0u8;
+
+    for (left, right) in derived.iter().zip(expected.iter()) {
+        difference |= *left ^ *right;
+    }
+
+    derived.fill(0);
+
+    difference == 0
+}
+
+fn apply_managed_client_build_defaults() {
+    if let Some(server) = option_env!("RUSTDESK_MANAGED_SERVER")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config::Config::set_option(
+            "custom-rendezvous-server".to_owned(),
+            server.to_owned(),
+        );
+    }
+
+    if let Some(key) = option_env!("RUSTDESK_MANAGED_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config::Config::set_option(
+            "key".to_owned(),
+            key.to_owned(),
+        );
+    }
+}
+
+#[frb(sync)]
+pub fn install_validate_authorization_password(
+    password: String,
+) -> bool {
+    (managed_installer_auth_matches(&password))
+}
+#[frb(sync)]
+pub fn main_get_managed_directory_status(
+) -> String {
+    let managed = option_env!(
+        "RUSTDESK_MANAGED_DIRECTORY_BASE"
+    )
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .is_some();
+
+    if !managed {
+        return (String::new());
+    }
+
+    #[cfg(windows)]
+    {
+        match crate::ipc::get_directory_status_from_service() {
+            Ok((state, text, snapshot)) => {
+                let mut value = serde_json::json!({
+                    "state": state,
+                    "text": text,
+                    "devices": [],
+                });
+                if !snapshot.is_empty() {
+                    if let Ok(snapshot_value) =
+                        serde_json::from_str::<serde_json::Value>(&snapshot)
+                    {
+                        if let Some(map) = snapshot_value.as_object() {
+                            for (key, item) in map {
+                                value[key] = item.clone();
+                            }
+                        }
+                    }
+                }
+                (value.to_string())
+            }
+
+            Err(_) => (
+                serde_json::json!({
+                    "state": "unavailable",
+                    "text": "",
+                })
+                .to_string()
+            ),
+        }
+    }
+
+    // Non-Windows managed clients have no SYSTEM-service IPC to query for a
+    // live status (that architecture is Windows-only), but callers here just
+    // need "is this a managed build at all" (see isManagedClient checks in
+    // desktop_setting_page.dart / mobile's settings_page.dart) - return the
+    // same minimal non-empty shape the Windows Err(_) branch above does, so
+    // `.isNotEmpty` stays a valid managed-build check on every platform.
+    #[cfg(not(windows))]
+    {
+        (
+            serde_json::json!({
+                "state": "unavailable",
+                "text": "",
+            })
+            .to_string()
+        )
+    }
+}
+
+// Launches this same binary with --rustdrop as a normal (non-elevated,
+// detached) user process from a running RDC session - both the
+// controller's own toolbar button (remote_toolbar.dart) and the controlled
+// machine's own connection-status window (server_page.dart) call this. No
+// cross-machine signaling needed: each side only ever launches its own
+// machine's own instance, exactly like the user opening RustDrop
+// themselves. RustDrop is now a mode of this same binary rather than a
+// separate RustDrop.exe (superseded by the native Flutter/Rust rewrite,
+// see main.dart's runRustDropScreen()) - non-elevated is still correct
+// because it never touches the ACL'd enrollment credential or keypair
+// directly, only via IPC to --server (see
+// ipc::Data::RustDropKeypairRequest's doc comment). Does nothing if a
+// --rustdrop window is already running in this session, same "don't spawn
+// a second one" behavior --tray already has.
+#[frb(sync)]
+pub fn main_launch_rustdrop() -> bool {
+    #[cfg(windows)]
+    {
+        if crate::check_process("--rustdrop", true) {
+            // A window that already exists but lost focus, got minimized,
+            // or was pushed behind another window used to make every
+            // subsequent "Drop" click a complete silent no-op - nothing
+            // here ever brought it back. See main.dart's
+            // windowManager.setTitle('RustDrop') for the exact title this
+            // matches.
+            crate::platform::windows::bring_window_to_front(
+                &crate::platform::FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
+                "RustDrop",
+            );
+            return true;
+        }
+        let Ok(current_exe) = std::env::current_exe() else {
+            return false;
+        };
+        // If this call is itself running as LocalSystem - the SYSTEM
+        // service's own --server child, attached to the interactive session
+        // with as_user=FALSE purely for screen-capture access (see
+        // launch_privileged_process) - a plain Command::spawn() hands the
+        // RustDrop child that SAME LocalSystem token instead of the real
+        // user's, landing its downloads/desktop resolution under
+        // C:\Windows\System32\config\systemprofile /
+        // ...\ServiceProfiles\LocalService instead of the user's own
+        // profile. Confirmed live 2026-09-23: this produced a broken
+        // file-save dialog on a managed client, defaulting into
+        // ServiceProfiles\LocalService\Downloads and erroring on
+        // systemprofile\Desktop. Launch into the real interactive user's
+        // session instead, the same de-elevating mechanism already used to
+        // restore the tray/main window after an update.
+        if crate::platform::is_root() {
+            let Some(exe_str) = current_exe.to_str() else {
+                return false;
+            };
+            // This process's own session, not the active *console* session:
+            // the service attaches --server to the session the user is
+            // actually in, which for an RDP user is not the console (that
+            // one may have no user at all, so the launch failed silently).
+            let session_id = crate::platform::windows::get_current_process_session_id()
+                .unwrap_or_else(|| crate::platform::windows::get_current_session_id(false));
+            // `show` must be true here: LaunchProcessWin only sets
+            // si.lpDesktop = "winsta0\\default" when show is true, so a
+            // false here leaves the child unattached to the interactive
+            // desktop - it runs, but any window it creates is unreachable.
+            // Every other run_exe_in_session call site (tray/main-window
+            // restore) already passes true; this one was the one exception.
+            return match crate::platform::windows::run_exe_in_session(
+                exe_str,
+                vec!["--rustdrop"],
+                session_id,
+                true,
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    log::error!("rustdrop: launch in session {} failed: {}", session_id, error);
+                    false
+                }
+            };
+        }
+        (std::process::Command::new(current_exe)
+            .arg("--rustdrop")
+            .spawn()
+            .is_ok())
+    }
+    #[cfg(not(windows))]
+    {
+        (false)
+    }
+}
+
+/// JSON {"build_number":N,"version":"..."} if the background daily check has
+/// already found and signature-verified a newer managed-update build, or ""
+/// if none is pending. Cheap to poll every second - does not touch the
+/// network or the (up to 23MB) update file itself.
+///
+/// The check that sets this state runs in the SYSTEM service process, a
+/// separate process from this GUI with its own memory, so it must be asked
+/// over IPC rather than read directly - same reason main_get_managed_directory_status
+/// above goes through the service instead of reading local state.
+#[frb(sync)]
+pub fn main_get_pending_managed_update() -> String {
+    #[cfg(windows)]
+    {
+        let result = crate::ipc::get_pending_managed_update_from_service()
+            .ok()
+            .flatten()
+            .map(|(build_number, version)| {
+                serde_json::json!({
+                    "build_number": build_number,
+                    "version": version,
+                })
+                .to_string()
+            })
+            .unwrap_or_default();
+        (result)
+    }
+    #[cfg(not(windows))]
+    {
+        (String::new())
+    }
+}
+
+/// "Update Now" button: apply the already-verified pending update
+/// immediately instead of waiting for an idle moment on the daily timer.
+/// Fire-and-forget - the UI observes completion via
+/// main_get_pending_managed_update() clearing once applied.
+pub fn main_trigger_managed_update_now() {
+    #[cfg(windows)]
+    {
+        // This GUI process normally runs with a filtered admin token (even
+        // when launched by an admin account) and cannot read the
+        // machine-secret directory-state file the update check needs - ask
+        // the --server process (already running the background checker in
+        // the correct interactive session) to run the check-and-apply
+        // instead of doing it here, or an enrolled device would spuriously
+        // look unenrolled. Deliberately NOT routed through the SYSTEM
+        // service - see trigger_managed_update_now_via_server.
+        let _ = crate::ipc::trigger_managed_update_now_via_server();
+    }
+}
+
+#[frb(sync)]
+pub fn install_show_run_without_install() -> bool {
+    (show_run_without_install())
 }
 
 pub fn install_run_without_install() {
     run_without_install();
 }
 
-pub fn install_install_me(options: String, path: String) {
+pub fn install_install_me(
+    options: String,
+    path: String,
+    friendly_name: String,
+    contact_email: String,
+    password: String,
+    authorization_password: String,
+    enrollment_password: String,
+) {
+    let friendly_name = friendly_name.trim();
+    let contact_email = contact_email.trim();
+    let password = if password.trim().is_empty() {
+        String::new()
+    } else {
+        password
+    };
+
+    if !managed_installer_auth_matches(&authorization_password) {
+        log::error!("Installer authorization failed");
+        return;
+    }
+
+    if enrollment_password.trim().is_empty() {
+        log::error!("Directory enrollment password is required");
+        return;
+    }
+    if friendly_name.is_empty() {
+        log::error!("Friendly computer name is required");
+        return;
+    }
+    if contact_email.is_empty() {
+        log::error!("Contact email address is required");
+        return;
+    }
+    if !contact_email.contains('@') || contact_email.contains(' ') {
+        log::error!("Contact email address is invalid");
+        return;
+    }
+
+    if !password.is_empty() {
+        if password.chars().count() < 8 {
+            log::error!("Permanent access password must be at least 8 characters");
+            return;
+        }
+
+        if !has_valid_2fa() {
+            log::error!(
+                "Two-factor authentication is required with a permanent access password"
+            );
+            return;
+        }
+    }
+    apply_managed_client_build_defaults();
+
+    config::Config::set_option(
+        keys::OPTION_PRESET_DEVICE_NAME.to_string(),
+        friendly_name.to_owned(),
+    );
+    config::Config::set_option(
+        keys::OPTION_PRESET_DEVICE_EMAIL.to_string(),
+        contact_email.to_owned(),
+    );
+
+    if !config::Config::set_permanent_password(&password) {
+        log::error!("Failed to store the permanent access password");
+        return;
+    }
+
+    #[cfg(windows)]
+    crate::ui_interface::install_me_managed(
+        options,
+        path,
+        false,
+        false,
+        enrollment_password,
+    );
+
+    #[cfg(not(windows))]
     install_me(options, path, false, false);
 }
 
-pub fn install_install_path() -> SyncReturn<String> {
-    SyncReturn(install_path())
+#[frb(sync)]
+pub fn install_install_path() -> String {
+    (install_path())
 }
 
-pub fn install_install_options() -> SyncReturn<String> {
-    SyncReturn(install_options())
+#[frb(sync)]
+pub fn install_install_options() -> String {
+    (install_options())
 }
 
 pub fn main_account_auth(op: String, remember_me: bool) {
@@ -2451,27 +3426,32 @@ pub fn main_on_main_window_close() {
     crate::portable_service::client::drop_portable_service_shared_memory();
 }
 
-pub fn main_current_is_wayland() -> SyncReturn<bool> {
-    SyncReturn(current_is_wayland())
+#[frb(sync)]
+pub fn main_current_is_wayland() -> bool {
+    (current_is_wayland())
 }
 
-pub fn main_is_login_wayland() -> SyncReturn<bool> {
-    SyncReturn(is_login_wayland())
+#[frb(sync)]
+pub fn main_is_login_wayland() -> bool {
+    (is_login_wayland())
 }
 
-pub fn main_hide_dock() -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn main_hide_dock() -> bool {
     #[cfg(target_os = "macos")]
     crate::platform::macos::hide_dock();
-    SyncReturn(true)
+    (true)
 }
 
-pub fn main_has_file_clipboard() -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn main_has_file_clipboard() -> bool {
     let ret = cfg!(any(target_os = "windows", feature = "unix-file-copy-paste",));
-    SyncReturn(ret)
+    (ret)
 }
 
-pub fn main_has_gpu_texture_render() -> SyncReturn<bool> {
-    SyncReturn(cfg!(feature = "vram"))
+#[frb(sync)]
+pub fn main_has_gpu_texture_render() -> bool {
+    (cfg!(feature = "vram"))
 }
 
 pub fn cm_init() {
@@ -2486,6 +3466,36 @@ pub fn cm_init() {
 pub fn main_start_ipc_url_server() {
     #[cfg(target_os = "macos")]
     std::thread::spawn(move || crate::server::start_ipc_url_server());
+}
+
+/// Start an ipc listener for relaying incoming managed chat messages from
+/// --server (the only process with permission to read the enrollment
+/// credential the actual websocket connection needs).
+///
+/// * Should only be called in the main flutter window - it's the only
+///   process with a Flutter engine for push_global_event to reach.
+/// * Windows only - see ipc::Data::ManagedChatIncomingMessage's doc
+///   comment for why this exists at all.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn managed_chat_start_push_listener() {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The main window and every chat sub-window share this process and
+        // each calls this at startup, but the pipe takes one listener per
+        // process - a second start only fails with "Access is denied". The
+        // flag is cleared if the listener ever exits so it can be restarted.
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        if RUNNING.swap(true, Ordering::SeqCst) {
+            log::debug!("managed chat: push listener already running in this process");
+            return;
+        }
+        log::info!("managed chat: starting push listener in GUI process");
+        std::thread::spawn(move || {
+            crate::server::start_managed_chat_push_listener();
+            RUNNING.store(false, Ordering::SeqCst);
+        });
+    }
 }
 
 pub fn main_test_wallpaper(_second: u64) {
@@ -2504,37 +3514,54 @@ pub fn main_support_remove_wallpaper() -> bool {
     support_remove_wallpaper()
 }
 
-pub fn is_incoming_only() -> SyncReturn<bool> {
-    SyncReturn(config::is_incoming_only())
+#[frb(sync)]
+pub fn is_incoming_only() -> bool {
+    (config::is_incoming_only())
 }
 
-pub fn is_outgoing_only() -> SyncReturn<bool> {
-    SyncReturn(config::is_outgoing_only())
+#[frb(sync)]
+pub fn is_outgoing_only() -> bool {
+    (config::is_outgoing_only())
 }
 
-pub fn is_custom_client() -> SyncReturn<bool> {
-    SyncReturn(crate::common::is_custom_client())
+#[frb(sync)]
+pub fn is_custom_client() -> bool {
+    (crate::common::is_custom_client())
 }
 
-pub fn is_disable_settings() -> SyncReturn<bool> {
-    SyncReturn(config::is_disable_settings())
+#[frb(sync)]
+pub fn is_disable_settings() -> bool {
+    (config::is_disable_settings())
 }
 
-pub fn is_disable_ab() -> SyncReturn<bool> {
-    SyncReturn(config::is_disable_ab())
+#[frb(sync)]
+pub fn is_disable_ab() -> bool {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return (true);
+    }
+    (config::is_disable_ab())
 }
 
-pub fn is_disable_account() -> SyncReturn<bool> {
-    SyncReturn(config::is_disable_account())
+#[frb(sync)]
+pub fn is_disable_account() -> bool {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return (true);
+    }
+    (config::is_disable_account())
 }
 
-pub fn is_disable_group_panel() -> SyncReturn<bool> {
-    SyncReturn(LocalConfig::get_option("disable-group-panel") == "Y")
+#[frb(sync)]
+pub fn is_disable_group_panel() -> bool {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return (true);
+    }
+    (LocalConfig::get_option("disable-group-panel") == "Y")
 }
 
 // windows only
-pub fn is_disable_installation() -> SyncReturn<bool> {
-    SyncReturn(config::is_disable_installation())
+#[frb(sync)]
+pub fn is_disable_installation() -> bool {
+    (config::is_disable_installation())
 }
 
 pub fn is_preset_password() -> bool {
@@ -2549,8 +3576,9 @@ pub fn is_preset_password() -> bool {
 
 // Don't call this function for desktop version.
 // We need this function because we want a sync return for mobile version.
-pub fn is_preset_password_mobile_only() -> SyncReturn<bool> {
-    SyncReturn(is_preset_password())
+#[frb(sync)]
+pub fn is_preset_password_mobile_only() -> bool {
+    (is_preset_password())
 }
 
 /// Send a url scheme through the ipc.
@@ -2562,44 +3590,273 @@ pub fn send_url_scheme(_url: String) {
     std::thread::spawn(move || crate::handle_url_scheme(_url));
 }
 
-pub fn is_support_multi_ui_session(version: String) -> SyncReturn<bool> {
-    SyncReturn(crate::common::is_support_multi_ui_session(&version))
+#[inline]
+pub fn plugin_event(_id: String, _peer: String, _event: Vec<u8>) {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        allow_err!(crate::plugin::handle_ui_event(&_id, &_peer, &_event));
+    }
 }
 
-pub fn is_selinux_enforcing() -> SyncReturn<bool> {
+pub fn plugin_register_event_stream(_id: String, _event2ui: StreamSink<EventToUI>) {
+    #[cfg(feature = "plugin_framework")]
+    {
+        crate::plugin::native_handlers::session::session_register_event_stream(_id, _event2ui);
+    }
+}
+
+#[inline]
+#[frb(sync)]
+pub fn plugin_get_session_option(
+    _id: String,
+    _peer: String,
+    _key: String,
+) -> Option<String> {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        (crate::plugin::PeerConfig::get(&_id, &_peer, &_key))
+    }
+    #[cfg(any(
+        not(feature = "plugin_framework"),
+        target_os = "android",
+        target_os = "ios"
+    ))]
+    {
+        (None)
+    }
+}
+
+#[inline]
+pub fn plugin_set_session_option(_id: String, _peer: String, _key: String, _value: String) {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _res = crate::plugin::PeerConfig::set(&_id, &_peer, &_key, &_value);
+    }
+}
+
+#[inline]
+#[frb(sync)]
+pub fn plugin_get_shared_option(_id: String, _key: String) -> Option<String> {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        (crate::plugin::ipc::get_config(&_id, &_key).unwrap_or(None))
+    }
+    #[cfg(any(
+        not(feature = "plugin_framework"),
+        target_os = "android",
+        target_os = "ios"
+    ))]
+    {
+        (None)
+    }
+}
+
+#[inline]
+pub fn plugin_set_shared_option(_id: String, _key: String, _value: String) {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        allow_err!(crate::plugin::ipc::set_config(&_id, &_key, _value));
+    }
+}
+
+#[inline]
+pub fn plugin_reload(_id: String) {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        allow_err!(crate::plugin::ipc::reload_plugin(&_id,));
+        allow_err!(crate::plugin::reload_plugin(&_id));
+    }
+}
+
+#[inline]
+#[frb(sync)]
+pub fn plugin_enable(_id: String, _v: bool) -> () {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        allow_err!(crate::plugin::ipc::set_manager_plugin_config(
+            &_id,
+            "enabled",
+            _v.to_string()
+        ));
+        if _v {
+            allow_err!(crate::plugin::load_plugin(&_id));
+        } else {
+            crate::plugin::unload_plugin(&_id);
+        }
+    }
+    (())
+}
+
+#[frb(sync)]
+pub fn plugin_is_enabled(_id: String) -> bool {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        (
+            match crate::plugin::ipc::get_manager_plugin_config(&_id, "enabled") {
+                Ok(Some(enabled)) => bool::from_str(&enabled).unwrap_or(false),
+                _ => false,
+            }
+        )
+    }
+    #[cfg(any(
+        not(feature = "plugin_framework"),
+        target_os = "android",
+        target_os = "ios"
+    ))]
+    {
+        (false)
+    }
+}
+
+#[frb(sync)]
+pub fn plugin_feature_is_enabled() -> bool {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        #[cfg(debug_assertions)]
+        let enabled = true;
+        #[cfg(not(debug_assertions))]
+        let enabled = is_installed();
+        (enabled)
+    }
+    #[cfg(any(
+        not(feature = "plugin_framework"),
+        target_os = "android",
+        target_os = "ios"
+    ))]
+    {
+        (false)
+    }
+}
+
+pub fn plugin_sync_ui(_sync_to: String) {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if plugin_feature_is_enabled().0 {
+            crate::plugin::sync_ui(_sync_to);
+        }
+    }
+}
+
+pub fn plugin_list_reload() {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        crate::plugin::load_plugin_list();
+    }
+}
+
+pub fn plugin_install(_id: String, _b: bool) {
+    #[cfg(feature = "plugin_framework")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if _b {
+            if let Err(e) = crate::plugin::install_plugin(&_id) {
+                log::error!("Failed to install plugin '{}': {}", _id, e);
+            }
+        } else {
+            crate::plugin::uninstall_plugin(&_id, true);
+        }
+    }
+}
+
+#[frb(sync)]
+pub fn is_support_multi_ui_session(version: String) -> bool {
+    crate::common::is_support_multi_ui_session(&version)
+}
+
+#[frb(sync)]
+pub fn is_selinux_enforcing() -> bool {
     #[cfg(target_os = "linux")]
     {
-        SyncReturn(crate::platform::linux::is_selinux_enforcing())
+        (crate::platform::linux::is_selinux_enforcing())
     }
     #[cfg(not(target_os = "linux"))]
     {
-        SyncReturn(false)
+        (false)
     }
 }
 
-pub fn main_default_privacy_mode_impl() -> SyncReturn<String> {
-    SyncReturn(crate::privacy_mode::DEFAULT_PRIVACY_MODE_IMPL.to_owned())
+#[frb(sync)]
+pub fn main_default_privacy_mode_impl() -> String {
+    (crate::privacy_mode::DEFAULT_PRIVACY_MODE_IMPL.to_owned())
 }
 
-pub fn main_supported_privacy_mode_impls() -> SyncReturn<String> {
-    SyncReturn(
+#[frb(sync)]
+pub fn main_supported_privacy_mode_impls() -> String {
+    (
         serde_json::to_string(&crate::privacy_mode::get_supported_privacy_mode_impl())
-            .unwrap_or_default(),
+            .unwrap_or_default()
     )
 }
 
-pub fn main_supported_input_source() -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_supported_input_source() -> String {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        SyncReturn("".to_owned())
+        ("".to_owned())
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        SyncReturn(
+        (
             serde_json::to_string(&crate::keyboard::input_source::get_supported_input_source())
-                .unwrap_or_default(),
+                .unwrap_or_default()
         )
     }
+}
+
+// Reinstalling over an already-installed, already-running instance leaves
+// its service (and the "" IPC pipe it owns) alive, which blocks the
+// installer's own listener below from binding and would even reject a
+// connection to the *existing* service's listener (a different executable
+// path than this temp-extracted installer - a legitimate identity check,
+// not a bug). Stop it first so there's nothing left to conflict with.
+// flutter_rust_bridge's codegen walks this file's AST without evaluating
+// #[cfg(...)] on top-level items - two separate #[cfg]-gated fns of the
+// same name (as this used to be) parse as a duplicate symbol and fail
+// codegen outright, regardless of target. The single-declaration,
+// cfg-inside-the-body shape (matching main_supported_input_source()
+// above) is what this file uses everywhere else for exactly this reason.
+// This install-over-a-running-instance scenario is specific to the
+// Windows self-extracting installer flow (there is no equivalent
+// runInstallPage path on Android, which installs/updates APKs through
+// the OS package manager instead), so the non-Windows arm is a harmless
+// no-op.
+pub fn install_stop_running_instance() {
+    #[cfg(windows)]
+    {
+        crate::platform::windows::stop_running_instance_before_install();
+    }
+}
+
+// The installer's own process (runInstallPage in main.dart) never calls
+// start_server(), so it never spawns the "" (main) IPC listener that a
+// normally-running app/service already has. 2FA setup during install goes
+// through verify2fa() -> set_2fa_with_ack(), which requires that listener to
+// durably persist the verified secret - without it, the ack round-trip can
+// never succeed even when the entered code is genuinely correct, and the
+// user just sees a generic "wrong code" error. Start the same listener the
+// normal app uses (ipc::start(""), already sync-callable via its own
+// #[tokio::main]) once, early, before any install-time 2FA prompt.
+pub fn install_ensure_local_ipc() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| {
+            if let Err(err) = crate::ipc::start("") {
+                log::warn!("Installer local IPC listener failed to start: {}", err);
+            }
+        });
+    });
 }
 
 pub fn main_generate2fa() -> String {
@@ -2610,24 +3867,28 @@ pub fn main_verify2fa(code: String) -> bool {
     verify2fa(code)
 }
 
-pub fn main_has_valid_2fa_sync() -> SyncReturn<bool> {
-    SyncReturn(has_valid_2fa())
+#[frb(sync)]
+pub fn main_has_valid_2fa_sync() -> bool {
+    (has_valid_2fa())
 }
 
 pub fn main_verify_bot(token: String) -> String {
     verify_bot(token)
 }
 
-pub fn main_has_valid_bot_sync() -> SyncReturn<bool> {
-    SyncReturn(has_valid_bot())
+#[frb(sync)]
+pub fn main_has_valid_bot_sync() -> bool {
+    (has_valid_bot())
 }
 
-pub fn main_get_hard_option(key: String) -> SyncReturn<String> {
-    SyncReturn(get_hard_option(key))
+#[frb(sync)]
+pub fn main_get_hard_option(key: String) -> String {
+    (get_hard_option(key))
 }
 
-pub fn main_get_buildin_option(key: String) -> SyncReturn<String> {
-    SyncReturn(get_builtin_option(&key))
+#[frb(sync)]
+pub fn main_get_buildin_option(key: String) -> String {
+    (get_builtin_option(&key))
 }
 
 pub fn main_check_hwcodec() {
@@ -2646,8 +3907,9 @@ pub fn main_clear_trusted_devices() {
     clear_trusted_devices()
 }
 
-pub fn main_max_encrypt_len() -> SyncReturn<usize> {
-    SyncReturn(max_encrypt_len())
+#[frb(sync)]
+pub fn main_max_encrypt_len() -> usize {
+    (max_encrypt_len())
 }
 
 pub fn session_request_new_display_init_msgs(session_id: SessionID, display: usize) {
@@ -2656,24 +3918,26 @@ pub fn session_request_new_display_init_msgs(session_id: SessionID, display: usi
     }
 }
 
-pub fn main_audio_support_loopback() -> SyncReturn<bool> {
+#[frb(sync)]
+pub fn main_audio_support_loopback() -> bool {
     #[cfg(target_os = "windows")]
     let is_surpport = true;
     #[cfg(feature = "screencapturekit")]
     let is_surpport = crate::audio_service::is_screen_capture_kit_available();
     #[cfg(not(any(target_os = "windows", feature = "screencapturekit")))]
     let is_surpport = false;
-    SyncReturn(is_surpport)
+    (is_surpport)
 }
 
-pub fn main_get_printer_names() -> SyncReturn<String> {
+#[frb(sync)]
+pub fn main_get_printer_names() -> String {
     #[cfg(target_os = "windows")]
-    return SyncReturn(
+    return (
         serde_json::to_string(&crate::platform::windows::get_printer_names().unwrap_or_default())
-            .unwrap_or_default(),
+            .unwrap_or_default()
     );
     #[cfg(not(target_os = "windows"))]
-    return SyncReturn("".to_owned());
+    return ("".to_owned());
 }
 
 pub fn main_get_common(key: String) -> String {
@@ -2769,8 +4033,9 @@ pub fn main_get_common(key: String) -> String {
     }
 }
 
-pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
-    SyncReturn(main_get_common(key))
+#[frb(sync)]
+pub fn main_get_common_sync(key: String) -> String {
+    (main_get_common(key))
 }
 
 pub fn main_set_common(_key: String, _value: String) {
@@ -2912,12 +4177,13 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
     }
 }
 
+#[frb(sync)]
 pub fn session_get_common_sync(
     session_id: SessionID,
     key: String,
     param: String,
-) -> SyncReturn<Option<String>> {
-    SyncReturn(session_get_common(session_id, key, param))
+) -> Option<String> {
+    (session_get_common(session_id, key, param))
 }
 
 pub fn session_get_common(

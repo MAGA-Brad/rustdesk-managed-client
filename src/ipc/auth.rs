@@ -31,7 +31,14 @@ use windows::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeClientProces
 #[cfg(windows)]
 #[inline]
 pub(crate) fn should_allow_everyone_create_on_windows(postfix: &str) -> bool {
-    postfix.is_empty() || hbb_common::config::is_service_ipc_postfix(postfix)
+    // "_managed_chat_push": the GUI-hosted listener --server connects to
+    // (as a client) to relay an incoming chat message back for
+    // push_global_event - same cross-session-token shape as the ""
+    // channel (GUI connects out to --server there; here --server
+    // connects out to the GUI), so it gets the same security treatment.
+    postfix.is_empty()
+        || postfix == "_managed_chat_push"
+        || hbb_common::config::is_service_ipc_postfix(postfix)
 }
 
 #[cfg(windows)]
@@ -133,6 +140,41 @@ fn windows_portable_service_ipc_allows_logon_helper_executable(
         };
         portable_service_helper_is_trusted(_peer_exe, &expected, &current_exe)
     }
+}
+
+// RustDrop ships as a separate executable installed alongside RustDesk (see
+// rustdrop_architecture doc section 08 - same folder, separate installer) and
+// asks --server for this device's identity over the main ("") IPC channel
+// (Data::GetDeviceCredentialRequest in ipc.rs). It's a different binary, so
+// the default peer == current_exe check below rejects it; this grants the
+// same "installed next to RustDesk.exe" trust as the macOS GUI/service pair
+// above, without a content-hash check since - unlike the portable-service
+// helper, which is a renamed copy of RustDesk.exe itself - there's no
+// single "expected" RustDrop binary to hash against. Path containment
+// (`C:\Program Files\RustDesk\`, Administrators-writable only) is the trust
+// boundary, matching the doc's "no new elevation, no new ACL work" call.
+#[cfg(target_os = "windows")]
+#[inline]
+fn windows_main_ipc_allows_rustdrop_executable(
+    peer_exe: &Path,
+    current_exe: &Path,
+    postfix: &str,
+) -> bool {
+    if !postfix.is_empty() {
+        return false;
+    }
+    let (Some(peer_dir), Some(current_dir)) = (peer_exe.parent(), current_exe.parent()) else {
+        return false;
+    };
+    if !executable_paths_match(peer_dir, current_dir) {
+        return false;
+    }
+    let Some(peer_name) = peer_exe.file_name() else {
+        return false;
+    };
+    let peer_name = peer_name.to_string_lossy();
+    peer_name.eq_ignore_ascii_case("RustDrop.exe")
+        || peer_name.eq_ignore_ascii_case("RustDrop-service.exe")
 }
 
 #[cfg(windows)]
@@ -483,6 +525,10 @@ fn ensure_peer_executable_matches_current_by_pid(peer_pid: u32, postfix: &str) -
     if windows_portable_service_ipc_allows_logon_helper_executable(&peer_exe, postfix) {
         return Ok(());
     }
+    #[cfg(target_os = "windows")]
+    if windows_main_ipc_allows_rustdrop_executable(&peer_exe, &current_exe, postfix) {
+        return Ok(());
+    }
     bail!(
         "Peer executable path mismatch on ipc channel '{}': peer_pid={}, peer_exe='{}', current_exe='{}'",
         postfix,
@@ -559,6 +605,22 @@ pub(crate) fn log_rejected_windows_ipc_connection(
     peer_is_system: Option<bool>,
     peer_is_elevated: Option<bool>,
 ) {
+    {
+        let diag = format!(
+            "[{:?}] postfix={:?} peer_pid={:?} peer_session_id={:?} expected_session_id={:?} peer_is_system={:?} peer_is_elevated={:?}\n",
+            std::time::SystemTime::now(),
+            postfix,
+            peer_pid,
+            peer_session_id,
+            expected_session_id,
+            peer_is_system,
+            peer_is_elevated,
+        );
+        crate::common::append_capped_diag_line(
+            "C:\\ProgramData\\rustdesk-ipc-reject-diag.txt",
+            &diag,
+        );
+    }
     hbb_common::throttled_log!(
         UNAUTHORIZED_IPC_LOG_INTERVAL,
         warn,

@@ -3,7 +3,6 @@
 import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
-import 'dart:typed_data';
 import 'dart:js';
 import 'dart:html';
 import 'dart:async';
@@ -70,7 +69,7 @@ class PlatformFFI {
 
   static final PlatformFFI instance = PlatformFFI._();
 
-  static get localeName => window.navigator.language;
+  static String get localeName => window.navigator.language;
   RustdeskImpl get ffiBind => _ffiBind;
 
   static Future<String> getVersion() async {
@@ -126,8 +125,8 @@ class PlatformFFI {
     throw UnimplementedError();
   }
 
-  int getRgbaSize(SessionID sessionId, int display) =>
-      _ffiBind.sessionGetRgbaSize(sessionId: sessionId, display: display);
+  int getRgbaSize(SessionID sessionId, int display) => _ffiBind
+      .sessionGetRgbaSize(sessionId: sessionId, display: display);
   void nextRgba(SessionID sessionId, int display) =>
       _ffiBind.sessionNextRgba(sessionId: sessionId, display: display);
   void registerPixelbufferTexture(SessionID sessionId, int display, int ptr) =>
@@ -258,7 +257,7 @@ class PlatformFFI {
 
   void setMethodCallHandler(FMethod callback) {}
 
-  invokeMethod(String method, [dynamic arguments]) async {
+  Future<bool> invokeMethod(String method, [dynamic arguments]) async {
     return true;
   }
 

@@ -13,7 +13,7 @@ import 'package:get/get.dart';
 class PortForwardTabPage extends StatefulWidget {
   final Map<String, dynamic> params;
 
-  const PortForwardTabPage({Key? key, required this.params}) : super(key: key);
+  const PortForwardTabPage({super.key, required this.params});
 
   @override
   State<PortForwardTabPage> createState() => _PortForwardTabPageState(params);
@@ -99,7 +99,7 @@ class _PortForwardTabPageState extends State<PortForwardTabPage> {
   @override
   Widget build(BuildContext context) {
     final child = Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.background,
+      backgroundColor: Theme.of(context).colorScheme.surface,
       body: DesktopTab(
         controller: tabController,
         onWindowCloseButton: () async {
@@ -115,7 +115,7 @@ class _PortForwardTabPageState extends State<PortForwardTabPage> {
         ? buildVirtualWindowFrame(
             context,
             Scaffold(
-                backgroundColor: Theme.of(context).colorScheme.background,
+                backgroundColor: Theme.of(context).colorScheme.surface,
                 body: child),
           )
         : workaroundWindowBorder(

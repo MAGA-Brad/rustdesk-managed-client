@@ -1,3 +1,4 @@
+mod frb_generated; /* AUTO INJECTED BY flutter_rust_bridge. This line may not be accurate, and you can change it according to your needs. */
 #[cfg(any(test, not(target_os = "linux")))]
 mod audio_resampler;
 mod keyboard;
@@ -32,8 +33,6 @@ pub mod ui;
 mod version;
 pub use version::*;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
-mod bridge_generated;
-#[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 pub mod flutter;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 pub mod flutter_ffi;
@@ -63,6 +62,27 @@ mod ui_interface;
 mod ui_session_interface;
 
 mod hbbs_http;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod managed_chat_store;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod rustdrop_crypto;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod rustdrop_rds_client;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod rustdrop_keystore;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod rustdrop_save_path;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod rustdrop_service;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod rustdrop_transfer;
 
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub mod clipboard_file;

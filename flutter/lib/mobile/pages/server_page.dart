@@ -23,12 +23,14 @@ class ServerPage extends StatefulWidget implements PageShape {
   final icon = const Icon(Icons.mobile_screen_share);
 
   @override
-  final appBarActions = (!bind.isDisableSettings() &&
-          bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) != 'Y')
+  final appBarActions = (!bind.crateFlutterFfiIsDisableSettings() &&
+          bind.crateFlutterFfiMainGetBuildinOption(
+                  key: kOptionHideSecuritySetting) !=
+              'Y')
       ? [_DropDownAction()]
       : [];
 
-  ServerPage({Key? key}) : super(key: key);
+  ServerPage({super.key});
 
   @override
   State<StatefulWidget> createState() => _ServerPageState();
@@ -145,12 +147,14 @@ class _DropDownAction extends StatelessWidget {
               value == kUseTemporaryPassword ||
               value == kUseBothPasswords) {
             callback() {
-              bind.mainSetOption(key: kOptionVerificationMethod, value: value);
+              bind.crateFlutterFfiMainSetOption(
+                  key: kOptionVerificationMethod, value: value);
               gFFI.serverModel.updatePasswordModel();
             }
 
             if (value == kUsePermanentPassword &&
-                (await bind.mainGetCommon(key: "permanent-password-set")) !=
+                (await bind.crateFlutterFfiMainGetCommon(
+                        key: "permanent-password-set")) !=
                     "true") {
               if (isChangePermanentPasswordDisabled()) {
                 callback();
@@ -228,7 +232,7 @@ void checkService() async {
 }
 
 class ServiceNotRunningNotification extends StatelessWidget {
-  ServiceNotRunningNotification({Key? key}) : super(key: key);
+  ServiceNotRunningNotification({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -249,7 +253,8 @@ class ServiceNotRunningNotification extends StatelessWidget {
                 icon: const Icon(Icons.play_arrow),
                 onPressed: () {
                   if (gFFI.userModel.userName.value.isEmpty &&
-                      bind.mainGetLocalOption(key: "show-scam-warning") !=
+                      bind.crateFlutterFfiMainGetLocalOption(
+                              key: "show-scam-warning") !=
                           "N") {
                     showScamWarning(context, serverModel);
                   } else {
@@ -272,7 +277,7 @@ class ScamWarningDialog extends StatefulWidget {
 }
 
 class ScamWarningDialogState extends State<ScamWarningDialog> {
-  int _countdown = bind.isCustomClient() ? 0 : 12;
+  int _countdown = bind.crateFlutterFfiIsCustomClient() ? 0 : 12;
   bool show_warning = false;
   late Timer _timer;
   late ServerModel _serverModel;
@@ -401,7 +406,7 @@ class ScamWarningDialogState extends State<ScamWarningDialog> {
                                 Navigator.of(context).pop();
                                 _serverModel.toggleService();
                                 if (show_warning) {
-                                  bind.mainSetLocalOption(
+                                  bind.crateFlutterFfiMainSetLocalOption(
                                       key: "show-scam-warning", value: "N");
                                 }
                               },
@@ -458,7 +463,7 @@ class ServerInfo extends StatelessWidget {
   final model = gFFI.serverModel;
   final emptyController = TextEditingController(text: "-");
 
-  ServerInfo({Key? key}) : super(key: key);
+  ServerInfo({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -549,7 +554,8 @@ class ServerInfo extends StatelessWidget {
                       IconButton(
                           visualDensity: VisualDensity.compact,
                           icon: const Icon(Icons.refresh),
-                          onPressed: () => bind.mainUpdateTemporaryPassword()),
+                          onPressed: () => bind
+                              .crateFlutterFfiMainUpdateTemporaryPassword()),
                       IconButton(
                           visualDensity: VisualDensity.compact,
                           icon: Icon(Icons.copy_outlined),
@@ -566,7 +572,7 @@ class ServerInfo extends StatelessWidget {
 }
 
 class PermissionChecker extends StatefulWidget {
-  const PermissionChecker({Key? key}) : super(key: key);
+  const PermissionChecker({super.key});
 
   @override
   State<PermissionChecker> createState() => _PermissionCheckerState();
@@ -578,10 +584,11 @@ class _PermissionCheckerState extends State<PermissionChecker> {
     final serverModel = Provider.of<ServerModel>(context);
     final hasAudioPermission = androidVersion >= 30;
     final hideStopService = isAndroid &&
-        bind.mainGetBuildinOption(key: kOptionHideStopService) == 'Y';
+        bind.crateFlutterFfiMainGetBuildinOption(key: kOptionHideStopService) ==
+            'Y';
     final allowPermChangeInAcceptWindow = option2bool(
         kOptionEnablePermChangeInAcceptWindow,
-        bind.mainGetBuildinOption(
+        bind.crateFlutterFfiMainGetBuildinOption(
           key: kOptionEnablePermChangeInAcceptWindow,
         ));
     final permissionChangeLocked = isAndroid &&
@@ -593,8 +600,7 @@ class _PermissionCheckerState extends State<PermissionChecker> {
           serverModel.mediaOk && !hideStopService
               ? ElevatedButton.icon(
                       style: ButtonStyle(
-                          backgroundColor:
-                              MaterialStateProperty.all(Colors.red)),
+                          backgroundColor: WidgetStateProperty.all(Colors.red)),
                       icon: const Icon(Icons.stop),
                       onPressed: serverModel.toggleService,
                       label: Text(translate("Stop service")))
@@ -606,7 +612,9 @@ class _PermissionCheckerState extends State<PermissionChecker> {
                 serverModel.mediaOk,
                 !serverModel.mediaOk &&
                         gFFI.userModel.userName.value.isEmpty &&
-                        bind.mainGetLocalOption(key: "show-scam-warning") != "N"
+                        bind.crateFlutterFfiMainGetLocalOption(
+                                key: "show-scam-warning") !=
+                            "N"
                     ? () => showScamWarning(context, serverModel)
                     : serverModel.toggleService),
           PermissionRow(
@@ -644,8 +652,7 @@ class _PermissionCheckerState extends State<PermissionChecker> {
 
 class PermissionRow extends StatelessWidget {
   const PermissionRow(this.name, this.isOk, this.onPressed,
-      {Key? key, this.enabled = true})
-      : super(key: key);
+      {super.key, this.enabled = true});
 
   final String name;
   final bool isOk;
@@ -668,7 +675,7 @@ class PermissionRow extends StatelessWidget {
 }
 
 class ConnectionManager extends StatelessWidget {
-  const ConnectionManager({Key? key}) : super(key: key);
+  const ConnectionManager({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -721,10 +728,10 @@ class ConnectionManager extends StatelessWidget {
 
   Widget _buildDisconnectButton(Client client) {
     final disconnectButton = ElevatedButton.icon(
-      style: ButtonStyle(backgroundColor: MaterialStatePropertyAll(Colors.red)),
+      style: ButtonStyle(backgroundColor: WidgetStatePropertyAll(Colors.red)),
       icon: const Icon(Icons.close),
       onPressed: () {
-        bind.cmCloseConnection(connId: client.id);
+        bind.crateFlutterFfiCmCloseConnection(connId: client.id);
         gFFI.invokeMethod("cancel_notification", client.id);
       },
       label: Text(translate("Disconnect")),
@@ -734,12 +741,12 @@ class ConnectionManager extends StatelessWidget {
       buttons.insert(
         0,
         ElevatedButton.icon(
-          style: ButtonStyle(
-              backgroundColor: MaterialStatePropertyAll(Colors.red)),
+          style:
+              ButtonStyle(backgroundColor: WidgetStatePropertyAll(Colors.red)),
           icon: const Icon(Icons.phone),
           label: Text(translate("Stop")),
           onPressed: () {
-            bind.cmCloseVoiceCall(id: client.id);
+            bind.crateFlutterFfiCmCloseVoiceCall(id: client.id);
             gFFI.invokeMethod("cancel_notification", client.id);
           },
         ),
@@ -802,8 +809,8 @@ class ConnectionManager extends StatelessWidget {
 }
 
 class PaddingCard extends StatelessWidget {
-  const PaddingCard({Key? key, required this.child, this.title, this.titleIcon})
-      : super(key: key);
+  const PaddingCard(
+      {super.key, required this.child, this.title, this.titleIcon});
 
   final String? title;
   final Icon? titleIcon;

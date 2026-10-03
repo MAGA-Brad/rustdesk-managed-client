@@ -7,7 +7,50 @@ use std::{
 
 // The generic payload, shared by every customer and compiled in once per release.
 #[cfg(windows)]
-const BIN_DATA: &[u8] = include_bytes!("../data.bin");
+const BIN_DATA_X64: &[u8] = include_bytes!("../data_x64.bin");
+#[cfg(windows)]
+const BIN_DATA_ARM64: &[u8] = include_bytes!("../data_arm64.bin");
+
+// The launcher itself is built for x64 so it also runs (emulated) on ARM64 Windows.
+// GetNativeSystemInfo was found (2026-10-01, real ARM64 hardware) to still report
+// the emulated x64 environment for an x64 process running under ARM64 Windows's
+// x64-emulation layer - it predates that emulation subsystem and isn't reliable
+// here. IsWow64Process2's pnativemachine out-param is the API Microsoft actually
+// documents for this exact "true host arch from a possibly-emulated process" case.
+// Looked up at runtime: a static import would stop the launcher from loading at
+// all on Windows versions older than 10 1511, which lack the export. Every
+// ARM64 Windows has it, so "missing" means x64.
+#[cfg(windows)]
+fn is_native_arm64() -> bool {
+    use windows::Win32::System::{
+        SystemInformation::IMAGE_FILE_MACHINE_ARM64, Threading::GetCurrentProcess,
+    };
+    use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+    type IsWow64Process2Fn =
+        unsafe extern "system" fn(*mut std::ffi::c_void, *mut u16, *mut u16) -> i32;
+    unsafe {
+        let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr() as _);
+        if kernel32.is_null() {
+            return false;
+        }
+        let proc = GetProcAddress(kernel32, b"IsWow64Process2\0".as_ptr() as _);
+        if proc.is_null() {
+            return false;
+        }
+        let is_wow64_process2: IsWow64Process2Fn = std::mem::transmute(proc);
+        let mut process_machine = 0u16;
+        let mut native_machine = 0u16;
+        if is_wow64_process2(
+            GetCurrentProcess().0,
+            &mut process_machine,
+            &mut native_machine,
+        ) == 0
+        {
+            return false;
+        }
+        native_machine == IMAGE_FILE_MACHINE_ARM64.0
+    }
+}
 
 // The per-customer payload, injected into the RCDATA resource after the template
 // has been built, so that customizing a client needs no recompilation.
@@ -138,7 +181,12 @@ fn parse(blob: &'static [u8]) -> Option<(Vec<BinaryData>, String)> {
 
 #[cfg(windows)]
 fn read_embedded() -> Result<(Vec<BinaryData>, String), String> {
-    parse(BIN_DATA).ok_or_else(|| "bin file is not valid!".to_owned())
+    let bin_data: &'static [u8] = if is_native_arm64() {
+        BIN_DATA_ARM64
+    } else {
+        BIN_DATA_X64
+    };
+    parse(bin_data).ok_or_else(|| "bin file is not valid!".to_owned())
 }
 
 #[cfg(not(windows))]
@@ -230,7 +278,28 @@ impl BinaryData {
                 println!("{} -> {}", md5_record, digest)
             }
         }
-        let _ = fs::write(p, self.decompress());
+        // If `p` is currently locked (in-use/memory-mapped by a running
+        // process), a plain fs::write() fails silently when its Result is
+        // ignored - the stale file is left in place with no error anywhere,
+        // exactly the XCOPY /C bug documented for copy_raw_cmd() in
+        // platform/windows.rs, just never patched here too since this is a
+        // separate embedded-data-extraction path, not a disk-to-disk copy.
+        // Renaming a locked file aside always succeeds on Windows (the
+        // process's existing handle keeps the data alive via the old
+        // directory entry), so do that first, then write fresh, then clean
+        // up the aside copy - matching the same pattern already proven
+        // there.
+        if p.exists() {
+            let aside = p.with_extension(format!(
+                "{}.rdupdatebak",
+                p.extension().and_then(|e| e.to_str()).unwrap_or("")
+            ));
+            let _ = fs::remove_file(&aside);
+            let _ = fs::rename(&p, &aside);
+        }
+        if let Err(e) = fs::write(&p, self.decompress()) {
+            println!("failed to write {}: {}", p.display(), e);
+        }
     }
 }
 

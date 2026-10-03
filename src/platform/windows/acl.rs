@@ -2,6 +2,20 @@
 
 use super::{read_token_user_buffer, wide_string, ResultType};
 use hbb_common::{anyhow::anyhow, bail};
+use winapi::{
+    shared::{
+        sddl::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SDDL_REVISION_1,
+        },
+        winerror::ERROR_ALREADY_EXISTS,
+    },
+    um::{
+        errhandlingapi::GetLastError,
+        fileapi::CreateDirectoryW,
+        minwinbase::SECURITY_ATTRIBUTES,
+    },
+};
 use std::{
     fs, io,
     os::windows::{ffi::OsStrExt, fs::MetadataExt},
@@ -507,6 +521,231 @@ fn set_path_permission_for_portable_service_shmem_impl(
     Ok(())
 }
 
+
+/// Atomically creates a directory with a protected DACL granting full control
+/// only to LocalSystem and Built-in Administrators.
+///
+/// The parent may be created normally because no secret data is stored there.
+/// The final machine-secret directory itself receives its restrictive security
+/// descriptor at CreateDirectoryW time.
+pub fn create_machine_secret_directory(path: &Path) -> ResultType<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow!(
+            "Machine-secret directory has no parent: '{}'",
+            path.display()
+        )
+    })?;
+
+    fs::create_dir_all(parent).map_err(|error| {
+        anyhow!(
+            "Failed to create machine-secret parent directory '{}': {}",
+            parent.display(),
+            error
+        )
+    })?;
+
+    // D:P = protected DACL.
+    // SY = LocalSystem, BA = Built-in Administrators.
+    // OICI = inherit this protection to child files/directories.
+    // FA = full access.
+    let sddl = wide_string(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    );
+
+    let mut security_descriptor: winapi::um::winnt::PSECURITY_DESCRIPTOR =
+        std::ptr::null_mut();
+
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1 as u32,
+            &mut security_descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if converted == 0 {
+        return Err(anyhow!(
+            "Failed to create machine-secret security descriptor: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    if security_descriptor.is_null() {
+        bail!("Machine-secret security descriptor is null");
+    }
+
+    let _sd_guard =
+        LocalAllocGuard(security_descriptor as *mut std::ffi::c_void);
+
+    let mut security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor,
+        bInheritHandle: 0,
+    };
+
+    let path_utf16: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let created = unsafe {
+        CreateDirectoryW(
+            path_utf16.as_ptr(),
+            &mut security_attributes,
+        )
+    };
+
+    if created == 0 {
+        let error = unsafe { GetLastError() };
+
+        if error != ERROR_ALREADY_EXISTS {
+            return Err(anyhow!(
+                "CreateDirectoryW failed for machine-secret directory '{}': {}",
+                path.display(),
+                io::Error::from_raw_os_error(error as i32)
+            ));
+        }
+    }
+
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        anyhow!(
+            "Failed to inspect machine-secret directory '{}': {}",
+            path.display(),
+            error
+        )
+    })?;
+
+    if is_reparse_point(&metadata) {
+        bail!(
+            "Machine-secret directory is a reparse point and is rejected: '{}'",
+            path.display()
+        );
+    }
+
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "Machine-secret path is not a directory: '{}'",
+            path.display()
+        );
+    }
+
+    // For an existing legitimate directory, restore the exact protected ACL.
+    // For a newly created directory this is redundant but verifies our desired
+    // final ACL state before any secret file is written.
+    set_path_permission_for_machine_secret(path, true)?;
+
+    Ok(())
+}
+/// Applies a protected machine-secret DACL containing only:
+/// - LocalSystem: full control
+/// - Built-in Administrators: full control
+///
+/// No inherited or broad user/group ACEs are retained.
+pub fn set_path_permission_for_machine_secret(
+    path: &Path,
+    expect_dir: bool,
+) -> ResultType<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        anyhow!(
+            "Failed to inspect machine-secret ACL target '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    if is_reparse_point(&metadata) {
+        bail!(
+            "Machine-secret ACL target is a reparse point and is rejected: '{}'",
+            path.display()
+        );
+    }
+
+    if expect_dir != metadata.file_type().is_dir() {
+        bail!(
+            "Machine-secret ACL target has unexpected type: '{}'",
+            path.display()
+        );
+    }
+
+    let local_system_sid = sid_string_to_local_alloc_guard("S-1-5-18")?;
+    let administrators_sid =
+        sid_string_to_local_alloc_guard("S-1-5-32-544")?;
+
+    let inheritance = if expect_dir {
+        ACE_FLAGS(OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0)
+    } else {
+        NO_INHERITANCE
+    };
+
+    let entries = [
+        make_sid_trustee_entry(
+            local_system_sid.as_sid_ptr(),
+            FILE_ALL_ACCESS.0,
+            inheritance,
+            false,
+        ),
+        make_sid_trustee_entry(
+            administrators_sid.as_sid_ptr(),
+            FILE_ALL_ACCESS.0,
+            inheritance,
+            true,
+        ),
+    ];
+
+    let mut new_acl: *mut ACL = std::ptr::null_mut();
+    let result =
+        unsafe { SetEntriesInAclW(Some(entries.as_slice()), None, &mut new_acl) };
+
+    if result.0 != 0 {
+        bail!(
+            "SetEntriesInAclW failed for machine-secret path '{}': win32_error={}",
+            path.display(),
+            result.0
+        );
+    }
+
+    if new_acl.is_null() {
+        bail!(
+            "SetEntriesInAclW returned null ACL for machine-secret path '{}'",
+            path.display()
+        );
+    }
+
+    let _acl_guard = LocalAllocGuard(new_acl as *mut std::ffi::c_void);
+
+    let path_utf16: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let security_info =
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR::from_raw(path_utf16.as_ptr()),
+            SE_FILE_OBJECT,
+            security_info,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    };
+
+    if result.0 != 0 {
+        bail!(
+            "SetNamedSecurityInfoW failed for machine-secret path '{}': win32_error={}",
+            path.display(),
+            result.0
+        );
+    }
+
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::{

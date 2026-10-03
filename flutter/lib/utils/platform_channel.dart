@@ -21,7 +21,7 @@ class RdPlatformChannel {
     // No debug output; this call is too chatty.
 
     bool? result = await _hostMethodChannel
-      .invokeMethod("bumpMouse", {"dx": dx, "dy": dy});
+        .invokeMethod("bumpMouse", {"dx": dx, "dy": dy});
 
     return result ?? false;
   }

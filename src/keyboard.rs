@@ -447,6 +447,8 @@ pub mod client {
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn ctrl_alt_del() {
+        #[cfg(target_os = "windows")]
+        crate::server::input_service::diag_write("client::ctrl_alt_del() called (button clicked)");
         send_key_event(&event_ctrl_alt_del());
     }
 }

@@ -7,8 +7,7 @@ import 'package:flutter_hbb/desktop/pages/terminal_tab_page.dart';
 class DesktopTerminalScreen extends StatelessWidget {
   final Map<String, dynamic> params;
 
-  const DesktopTerminalScreen({Key? key, required this.params})
-      : super(key: key);
+  const DesktopTerminalScreen({super.key, required this.params});
 
   @override
   Widget build(BuildContext context) {

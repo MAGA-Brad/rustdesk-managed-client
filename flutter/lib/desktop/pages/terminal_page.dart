@@ -10,7 +10,7 @@ import 'terminal_connection_manager.dart';
 
 class TerminalPage extends StatefulWidget {
   TerminalPage({
-    Key? key,
+    super.key,
     required this.id,
     required this.password,
     required this.tabController,
@@ -21,7 +21,7 @@ class TerminalPage extends StatefulWidget {
     this.connToken,
     this.onClipboardWriteBlocked,
     this.onClipboardWriteSucceeded,
-  }) : super(key: key);
+  });
   final String id;
   final String? password;
   final DesktopTabController tabController;
@@ -62,7 +62,8 @@ class _TerminalPageState extends State<TerminalPage>
     super.initState();
 
     // Listen for tab selection changes to request focus
-    _tabStateSubscription = widget.tabController.state.listen(_onTabStateChanged);
+    _tabStateSubscription =
+        widget.tabController.state.listen(_onTabStateChanged);
 
     // Use shared FFI instance from connection manager
     _ffi = TerminalConnectionManager.getConnection(
@@ -158,7 +159,11 @@ class _TerminalPageState extends State<TerminalPage>
     // Use post-frame callback to ensure widget is fully laid out in focus tree
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // Re-check conditions after frame: mounted, focusable, still selected, not already focused
-      if (!mounted || !_terminalFocusNode.canRequestFocus || _terminalFocusNode.hasFocus) return;
+      if (!mounted ||
+          !_terminalFocusNode.canRequestFocus ||
+          _terminalFocusNode.hasFocus) {
+        return;
+      }
       final state = widget.tabController.state.value;
       if (state.selected >= 0 && state.selected < state.tabs.length) {
         if (state.tabs[state.selected].key == widget.tabKey) {

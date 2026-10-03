@@ -12,6 +12,9 @@ rust-version = "1.75"
 name = "librustdesk"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(frb_expand)"] }
+
 [[bin]]
 name = "naming"
 path = "src/naming.rs"
@@ -46,6 +49,7 @@ unix-file-copy-paste = [
     "clipboard/unix-file-copy-paste",
 ]
 screencapturekit = ["cpal/screencapturekit"]
+flutter_rust_bridge = ["dep:flutter_rust_bridge"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -61,6 +65,11 @@ serde_repr = "0.1"
 cfg-if = "1.0"
 lazy_static = "1.4"
 sha2 = "0.10"
+pbkdf2 = "0.11"
+hmac = "0.12"
+hkdf = "0.12"
+sodiumoxide = "0.2"
+futures = "0.3"
 repng = "0.2"
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -75,7 +84,7 @@ num_cpus = "1.15"
 bytes = { version = "1.4", features = ["serde"] }
 default-net = "0.14"
 wol-rs = "1.0"
-flutter_rust_bridge = { version = "=1.80", features = ["uuid"], optional = true}
+flutter_rust_bridge = { version = "=2.12.0", features = ["uuid"], optional = true }
 errno = "0.3"
 rdev = { git = "https://github.com/rustdesk-org/rdev" }
 url = { version = "2.3", features = ["serde"] }
@@ -88,7 +97,14 @@ shutdown_hooks = "0.1"
 totp-rs = { version = "5.4", default-features = false, features = ["gen_secret", "otpauth"] }
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys", branch = "rustdesk-patches" }
-reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd"], default-features=false }
+# "stream" (beyond upstream's own feature set) is needed for RustDrop's chunked
+# upload/download bodies (rustdrop_rds_client.rs).
+reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd", "stream"], default-features=false }
+# Not part of upstream's own direct dependencies (they get tungstenite transitively -
+# see the tungstenite patch note below); managed_chat.rs uses tokio_tungstenite directly.
+tokio-tungstenite = { version = "0.26", features = ["native-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# Local, per-device managed-chat history store (bundled: no system sqlite3 dependency).
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
@@ -114,6 +130,10 @@ qrcode-generator = "4.1"
 winapi = { version = "0.3", features = [
     "winuser",
     "wincrypt",
+    "dpapi",
+    "sddl",
+    "minwinbase",
+    "fileapi",
     "shellscalingapi",
     "pdh",
     "synchapi",
@@ -141,6 +161,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
@@ -217,8 +238,18 @@ exclude = ["vdi/host"]
 
 # Patch libxdo-sys to use a stub implementation that doesn't require libxdo
 # This allows building and running on systems without libxdo installed (e.g., Wayland-only)
+#
+# libsodium-sys: adds SODIUM_LIB_DIR_<TARGET> (checked before plain
+# SODIUM_LIB_DIR) so a real x64-host cross-compile to aarch64-pc-windows-msvc
+# can point the host-arch build (a build-dependency, always native) and the
+# target-arch build (the actual arm64 binary) at two different libsodium
+# libs - upstream's single global SODIUM_LIB_DIR can't distinguish them, and
+# aarch64 Windows has no libsodium prebuilt/from-source path otherwise, only
+# the vcpkg-built static lib. See libs/libsodium-sys-patched/build.rs.
 [patch.crates-io]
 libxdo-sys = { path = "libs/libxdo-sys-stub" }
+libsodium-sys = { path = "libs/libsodium-sys-patched" }
+
 # Upstream reserves a frame's whole declared length as soon as its header is in, so a header alone
 # buys an allocation the size it names, bounded only by max_frame_size. This fork grows the read
 # buffer one read_buffer_size chunk at a time as the bytes actually arrive. Patched rather than
@@ -252,6 +283,13 @@ tungstenite = { git = "https://github.com/rustdesk-org/tungstenite-rs", rev = "e
 webrtc = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
 webrtc-util = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
 webrtc-sctp = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+
+# Vendored hwcodec (pinned upstream commit 778df1f9) with two build fixes for
+# newer FFmpeg (post FF_API_FRAME_KEY / FF_PROFILE_* removal): key_frame now
+# read via AV_FRAME_FLAG_KEY, and AV_PROFILE_H264_HIGH/AV_PROFILE_HEVC_MAIN
+# replace the removed FF_PROFILE_* constants. Not yet upstreamed.
+[patch."https://github.com/rustdesk-org/hwcodec"]
+hwcodec = { path = "libs/hwcodec-patched" }
 
 [package.metadata.winres]
 LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."

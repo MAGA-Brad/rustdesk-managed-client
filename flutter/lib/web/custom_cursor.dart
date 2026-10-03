@@ -80,8 +80,7 @@ class FlutterCustomMemoryImageCursor extends MouseCursor {
 
 class _FlutterCustomMemoryImageCursorSession extends MouseCursorSession {
   _FlutterCustomMemoryImageCursorSession(
-      FlutterCustomMemoryImageCursor cursor, int device)
-      : super(cursor, device);
+      FlutterCustomMemoryImageCursor super.cursor, super.device);
 
   @override
   FlutterCustomMemoryImageCursor get cursor =>
@@ -96,8 +95,9 @@ class _FlutterCustomMemoryImageCursorSession extends MouseCursorSession {
   void dispose() {}
 }
 
-deleteCustomCursor(String key) => CursorManager.instance.deleteCursor(key);
-resetSystemCursor() => CursorManager.instance.resetSystemCursor();
+Future<void> deleteCustomCursor(String key) =>
+    CursorManager.instance.deleteCursor(key);
+Future<void> resetSystemCursor() => CursorManager.instance.resetSystemCursor();
 
 MouseCursor buildCursorOfCache(
     model.CursorModel cursor, double scale, model.CursorData? cache) {

@@ -35,7 +35,6 @@ Pointer<win32.OSVERSIONINFOEX> _getOSVERSIONINFOEXPointer() {
     ..wServicePackMajor = 0
     ..wServicePackMinor = 0
     ..wSuiteMask = 0
-    ..wProductType = 0
-    ..wReserved = 0;
+    ..wProductType = 0;
   return pointer;
 }

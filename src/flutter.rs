@@ -3,7 +3,7 @@ use crate::{
     flutter_ffi::{EventToUI, SessionID},
     ui_session_interface::{io_loop, InvokeUiSession, Session},
 };
-use flutter_rust_bridge::StreamSink;
+use crate::frb_generated::StreamSink;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::dlopen::{
     symbor::{Library, Symbol},
@@ -595,7 +595,7 @@ impl FlutterHandler {
             }
             if push {
                 if let Some(stream) = &session.event_stream {
-                    stream.add(EventToUI::Event(out.clone()));
+                    let _ = stream.add(EventToUI::Event(out.clone()));
                 }
             }
         }
@@ -1208,7 +1208,7 @@ impl FlutterHandler {
                 }
             }
             if let Some(stream) = &h.event_stream {
-                stream.add(EventToUI::Rgba(display));
+                let _ = stream.add(EventToUI::Rgba(display));
                 is_sent = true;
             }
         }
@@ -1238,7 +1238,7 @@ impl FlutterHandler {
             if use_texture_render || session.displays.len() > 1 {
                 if session.renderer.on_rgba(display, rgba) {
                     if let Some(stream) = &session.event_stream {
-                        stream.add(EventToUI::Texture(display, false));
+                        let _ = stream.add(EventToUI::Texture(display, false));
                     }
                 }
             }
@@ -1407,7 +1407,7 @@ pub fn session_start_(
 #[inline]
 fn try_send_close_event(event_stream: &Option<StreamSink<EventToUI>>) {
     if let Some(stream) = &event_stream {
-        stream.add(EventToUI::Event("close".to_owned()));
+        let _ = stream.add(EventToUI::Event("close".to_owned()));
     }
 }
 
@@ -1568,7 +1568,7 @@ pub mod connection_manager {
             h.insert("name", json!(name));
 
             if let Some(s) = GLOBAL_EVENT_STREAM.read().unwrap().get(super::APP_TYPE_CM) {
-                s.add(serde_json::ser::to_string(&h).unwrap_or("".to_owned()));
+                let _ = s.add(serde_json::ser::to_string(&h).unwrap_or("".to_owned()));
             } else {
                 println!(
                     "Push event {} failed. No {} event stream found.",
@@ -1590,6 +1590,23 @@ pub mod connection_manager {
             ui_handler: FlutterHandler {},
         };
         std::thread::spawn(move || start_ipc(cm));
+    }
+
+    // Used by the `--cm-no-ui` headless entry point (core_main.rs): runs the
+    // connection-manager IPC listener on the current thread instead of a
+    // spawned one, since that process has no other work to do afterward.
+    #[inline]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn start_cm_no_ui() {
+        use crate::ui_cm_interface::{start_ipc, ConnectionManager};
+
+        #[cfg(target_os = "linux")]
+        std::thread::spawn(crate::ipc::start_pa);
+
+        let cm = ConnectionManager {
+            ui_handler: FlutterHandler {},
+        };
+        start_ipc(cm);
     }
 
     #[inline]
@@ -1816,7 +1833,14 @@ pub fn push_session_event(session_id: &SessionID, name: &str, event: Vec<(&str, 
 
 #[inline]
 pub fn push_global_event(channel: &str, event: String) -> Option<bool> {
-    Some(GLOBAL_EVENT_STREAM.read().unwrap().get(channel)?.add(event))
+    Some(
+        GLOBAL_EVENT_STREAM
+            .read()
+            .unwrap()
+            .get(channel)?
+            .add(event)
+            .is_ok(),
+    )
 }
 
 #[inline]

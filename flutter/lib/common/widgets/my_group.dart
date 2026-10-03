@@ -11,7 +11,7 @@ import '../../common.dart';
 
 class MyGroup extends StatefulWidget {
   final EdgeInsets? menuPadding;
-  const MyGroup({Key? key, this.menuPadding}) : super(key: key);
+  const MyGroup({super.key, this.menuPadding});
 
   @override
   State<StatefulWidget> createState() {
@@ -63,8 +63,7 @@ class _MyGroupState extends State<MyGroup> {
         Container(
           decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(12),
-              border:
-                  Border.all(color: Theme.of(context).colorScheme.background)),
+              border: Border.all(color: Theme.of(context).colorScheme.surface)),
           child: Container(
             width: 150,
             height: double.infinity,
@@ -99,8 +98,7 @@ class _MyGroupState extends State<MyGroup> {
         Container(
           decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(6),
-              border:
-                  Border.all(color: Theme.of(context).colorScheme.background)),
+              border: Border.all(color: Theme.of(context).colorScheme.surface)),
           child: Container(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -196,10 +194,9 @@ class _MyGroupState extends State<MyGroup> {
     final username = user.name;
     final dn = user.displayNameOrName;
     final isDuplicate = (displayNameCount[dn] ?? 0) > 1;
-    final displayName =
-        isDuplicate && user.displayName.trim().isNotEmpty
-            ? '${user.displayName} (@$username)'
-            : dn;
+    final displayName = isDuplicate && user.displayName.trim().isNotEmpty
+        ? '${user.displayName} (@$username)'
+        : dn;
     return InkWell(onTap: () {
       isSelectedDeviceGroup.value = false;
       if (selectedAccessibleItemName.value != username) {
@@ -219,7 +216,8 @@ class _MyGroupState extends State<MyGroup> {
             border: Border(
                 bottom: BorderSide(
                     width: 0.7,
-                    color: Theme.of(context).dividerColor.withOpacity(0.1))),
+                    color:
+                        Theme.of(context).dividerColor.withValues(alpha: 0.1))),
           ),
           child: Container(
             child: Row(
@@ -287,7 +285,8 @@ class _MyGroupState extends State<MyGroup> {
             border: Border(
                 bottom: BorderSide(
                     width: 0.7,
-                    color: Theme.of(context).dividerColor.withOpacity(0.1))),
+                    color:
+                        Theme.of(context).dividerColor.withValues(alpha: 0.1))),
           ),
           child: Container(
             child: Row(

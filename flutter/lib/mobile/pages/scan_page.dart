@@ -97,7 +97,7 @@ class _ScanPageState extends State<ScanPage> {
 
         var reader = QRCodeReader();
         var result = reader.decode(bitmap);
-        if (result.text.startsWith(bind.mainUriPrefixSync())) {
+        if (result.text.startsWith(bind.crateFlutterFfiMainUriPrefixSync())) {
           handleUriLink(uriString: result.text);
         } else {
           showServerSettingFromQr(result.text);

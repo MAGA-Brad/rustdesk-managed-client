@@ -9,9 +9,9 @@ import 'package:flutter_hbb/common.dart' show isLinux;
 import 'package:flutter_hbb/models/model.dart';
 import 'package:image/image.dart' as img;
 
-deleteCustomCursor(String key) =>
+Future<void> deleteCustomCursor(String key) =>
     custom_cursor_manager.CursorManager.instance.deleteCursor(key);
-resetSystemCursor() {}
+void resetSystemCursor() {}
 
 MouseCursor buildCursorOfCache(
     CursorModel cursor, double scale, CursorData? cache) {

@@ -83,7 +83,11 @@ pub const OPTION_PRESET_ADDRESS_BOOK_PASSWORD: &str = "preset-address-book-passw
 pub const OPTION_PRESET_ADDRESS_BOOK_NOTE: &str = "preset-address-book-note";
 pub const OPTION_PRESET_DEVICE_USERNAME: &str = "preset-device-username";
 pub const OPTION_PRESET_DEVICE_NAME: &str = "preset-device-name";
+pub const OPTION_PRESET_DEVICE_EMAIL: &str = "preset-device-email";
 pub const OPTION_PRESET_NOTE: &str = "preset-note";
+// Local setting: how long (ms) managed-client local input takes priority
+// over a remote peer's input after the local user moves the mouse/keyboard.
+pub const OPTION_MANAGED_LOCAL_INPUT_PRIORITY_MS: &str = "managed-local-input-priority-ms";
 pub const OPTION_ENABLE_DIRECTX_CAPTURE: &str = "enable-directx-capture";
 pub const OPTION_ENABLE_ANDROID_SOFTWARE_ENCODING_HALF_SCALE: &str =
     "enable-android-software-encoding-half-scale";

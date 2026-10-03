@@ -71,8 +71,8 @@ static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Initial wait after startup before the first update check (30 seconds).
 pub const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 
-/// One full day — default interval between update checks.
-pub const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+/// Default interval between update checks (30 minutes).
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 30);
 
 /// Minimum interval between consecutive update checks (10 minutes).
 pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
@@ -94,6 +94,19 @@ pub fn manually_check_update() -> ResultType<()> {
     let sender = TX_MSG.lock().unwrap();
     sender.send(UpdateMsg::CheckUpdate)?;
     Ok(())
+}
+
+/// For the managed-client "Update Now" button. Runs check_update() directly
+/// on a fresh thread instead of going through the mpsc channel, so it isn't
+/// subject to the background loop's MIN_INTERVAL throttle - a user clicking
+/// this expects it to act immediately, not silently no-op if the scheduled
+/// check happened to run a few minutes ago.
+pub fn trigger_managed_update_now() {
+    std::thread::spawn(|| {
+        if let Err(e) = check_update(true) {
+            log::error!("Error applying managed update on demand: {}", e);
+        }
+    });
 }
 
 #[allow(dead_code)]
@@ -146,7 +159,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
     }
 
     let mut last_check_time = Instant::now();
-    let mut check_interval = DUR_ONE_DAY;
+    let mut check_interval = CHECK_INTERVAL;
     loop {
         let recv_res = rx_msg.recv_timeout(check_interval);
         match &recv_res {
@@ -165,7 +178,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
                     check_interval = RETRY_INTERVAL;
                 } else {
                     last_check_time = Instant::now();
-                    check_interval = DUR_ONE_DAY;
+                    check_interval = CHECK_INTERVAL;
                 }
             }
             Ok(UpdateMsg::Exit) => break,
@@ -174,6 +187,31 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 fn check_update(manually: bool) -> ResultType<()> {
+    #[cfg(target_os = "windows")]
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        if let Some(candidate) =
+            crate::hbbs_http::directory_enrollment::managed_update_check_and_download()?
+        {
+            log::info!(
+                "Verified managed update build {} version {}",
+                candidate.build_number,
+                candidate.version
+            );
+            // Force-applied, no user prompt: the background scheduled check
+            // (manually=false) and an explicit manual check both apply a
+            // verified update as soon as one is found, gated only on not
+            // interrupting a currently active remote session. Previously
+            // this only notified and waited for an explicit "Update Now"
+            // click - reverted per user feedback that a silent, forced
+            // update (the original managed-client behavior) is preferred
+            // over a prompt.
+            if has_no_active_conns() {
+                update_new_version(false, &candidate.version, &candidate.file_path);
+            }
+        }
+        return Ok(());
+    }
+
     // On macOS, auto-update is handled by check_update_as_root() in the service process.
     // The shared check_update() path is only used for manual update checks from the GUI.
     #[cfg(target_os = "macos")]
@@ -499,7 +537,7 @@ pub fn start_auto_update_macos() {
             log::info!("[root-update] Auto-update scheduler thread started.");
             std::thread::sleep(INITIAL_CHECK_DELAY);
             wait_for_failed_update_retry();
-            let mut interval = DUR_ONE_DAY;
+            let mut interval = CHECK_INTERVAL;
             loop {
                 log::info!("[root-update] Running scheduled update check...");
                 let no_active_conns = has_no_active_conns_ipc();
@@ -515,7 +553,7 @@ pub fn start_auto_update_macos() {
                                 // failure interval until the new daemon replaces us.
                                 interval = RETRY_INTERVAL;
                             } else {
-                                interval = DUR_ONE_DAY;
+                                interval = CHECK_INTERVAL;
                             }
                         }
                         Err(e) => {
