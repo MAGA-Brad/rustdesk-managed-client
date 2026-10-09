@@ -65,13 +65,13 @@ Widget _buildTerminalViewForPlatform({
 
 class TerminalPage extends StatefulWidget {
   const TerminalPage({
-    Key? key,
+    super.key,
     required this.id,
     required this.password,
     required this.isSharedPassword,
     this.forceRelay,
     this.connToken,
-  }) : super(key: key);
+  });
   final String id;
   final String? password;
   final bool? forceRelay;
@@ -87,12 +87,12 @@ class _TerminalPageState extends State<TerminalPage>
     with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   bool get _canConfigureTerminalClipboardPermission =>
       canConfigureTerminalClipboardPermission(
-        settingsDisabled: bind.isDisableSettings(),
+        settingsDisabled: bind.crateFlutterFfiIsDisableSettings(),
         optionFixed: isOptionFixed(kOptionAllowTerminalClipboardWrite),
       );
   bool get _canHandleTerminalClipboardWriteRequest =>
       canHandleTerminalClipboardWriteRequest(
-        localOption: bind.mainGetLocalOption(
+        localOption: bind.crateFlutterFfiMainGetLocalOption(
           key: kOptionAllowTerminalClipboardWrite,
         ),
         canConfigurePermission: _canConfigureTerminalClipboardPermission,
@@ -186,8 +186,9 @@ class _TerminalPageState extends State<TerminalPage>
     };
     // Load Row3 expand/collapse state from persistent storage. The raw option
     // read keeps Row3 collapsed when no value has been saved yet.
-    _row3Expanded =
-        bind.mainGetLocalOption(key: kOptionShowTerminalCtrlKeys) == 'Y';
+    _row3Expanded = bind.crateFlutterFfiMainGetLocalOption(
+            key: kOptionShowTerminalCtrlKeys) ==
+        'Y';
     // Initialize terminal connection
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _ffi.dialogManager
@@ -202,7 +203,7 @@ class _TerminalPageState extends State<TerminalPage>
 
   void _handleTerminalClipboardWriteBlocked(String clipboardText) {
     if (!mounted) return;
-    final option = bind.mainGetLocalOption(
+    final option = bind.crateFlutterFfiMainGetLocalOption(
       key: kOptionAllowTerminalClipboardWrite,
     );
     final request = _terminalClipboardNotice.recordBlocked(
@@ -279,7 +280,7 @@ class _TerminalPageState extends State<TerminalPage>
 
   Future<void> _declineTerminalClipboardWrite() async {
     try {
-      await bind.mainSetLocalOption(
+      await bind.crateFlutterFfiMainSetLocalOption(
         key: kOptionAllowTerminalClipboardWrite,
         value: kTerminalClipboardWriteDenied,
       );
@@ -303,7 +304,7 @@ class _TerminalPageState extends State<TerminalPage>
         canWrite: () => _canWriteTerminalClipboard,
         writeClipboard: writeTerminalClipboard,
         persistAllowed: request.persistAllowed
-            ? () => bind.mainSetLocalOption(
+            ? () => bind.crateFlutterFfiMainSetLocalOption(
                   key: kOptionAllowTerminalClipboardWrite,
                   value: kTerminalClipboardWriteAllowed,
                 )
@@ -358,7 +359,8 @@ class _TerminalPageState extends State<TerminalPage>
 
   void _updateKeyboardHeight() {
     if (_keyboardKey.currentContext != null) {
-      final renderBox = _keyboardKey.currentContext!.findRenderObject() as RenderBox;
+      final renderBox =
+          _keyboardKey.currentContext!.findRenderObject() as RenderBox;
       _keyboardHeight = renderBox.size.height;
     }
   }
@@ -371,7 +373,11 @@ class _TerminalPageState extends State<TerminalPage>
     final rows = (realHeight / _cellHeight!).floor();
     final extraSpace = realHeight - rows * _cellHeight!;
     final topBottom = max(0.0, extraSpace / 2.0);
-    return EdgeInsets.only(left: 5.0, right: 5.0, top: topBottom, bottom: topBottom + _sysKeyboardHeight + _keyboardHeight);
+    return EdgeInsets.only(
+        left: 5.0,
+        right: 5.0,
+        top: topBottom,
+        bottom: topBottom + _sysKeyboardHeight + _keyboardHeight);
   }
 
   /// Pastes clipboard text through TerminalModel so keyboard-only modifiers and
@@ -422,7 +428,8 @@ class _TerminalPageState extends State<TerminalPage>
 
   Widget buildBody() {
     final scaffold = Scaffold(
-      resizeToAvoidBottomInset: false, // Disable automatic layout adjustment; manually control UI updates to prevent flickering when the keyboard shows/hides
+      resizeToAvoidBottomInset:
+          false, // Disable automatic layout adjustment; manually control UI updates to prevent flickering when the keyboard shows/hides
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: Stack(
         children: [
@@ -453,9 +460,11 @@ class _TerminalPageState extends State<TerminalPage>
                     ),
                     padding: _calculatePadding(heightPx),
                     onSecondaryTapDown: (details, offset) async {
-                      final selection = _terminalModel.terminalController.selection;
+                      final selection =
+                          _terminalModel.terminalController.selection;
                       if (selection != null) {
-                        final text = _terminalModel.terminal.buffer.getText(selection);
+                        final text =
+                            _terminalModel.terminal.buffer.getText(selection);
                         _terminalModel.terminalController.clearSelection();
                         await Clipboard.setData(ClipboardData(text: text));
                       } else {
@@ -488,7 +497,9 @@ class _TerminalPageState extends State<TerminalPage>
           return RawGestureDetector(
             behavior: HitTestBehavior.translucent,
             gestures: <Type, GestureRecognizerFactory>{
-              HorizontalDragGestureRecognizer: GestureRecognizerFactoryWithHandlers<HorizontalDragGestureRecognizer>(
+              HorizontalDragGestureRecognizer:
+                  GestureRecognizerFactoryWithHandlers<
+                      HorizontalDragGestureRecognizer>(
                 () => HorizontalDragGestureRecognizer(
                   debugOwner: this,
                   // Only respond to touch input, exclude mouse/trackpad
@@ -506,7 +517,8 @@ class _TerminalPageState extends State<TerminalPage>
                     }
                     ..onEnd = (details) {
                       // Check if swipe started from left edge and moved right
-                      if (_swipeStartX < edgeThreshold && (_swipeCurrentX - _swipeStartX) > swipeThreshold) {
+                      if (_swipeStartX < edgeThreshold &&
+                          (_swipeCurrentX - _swipeStartX) > swipeThreshold) {
                         clientClose(sessionId, _ffi);
                       }
                       _swipeStartX = 0;
@@ -544,7 +556,7 @@ class _TerminalPageState extends State<TerminalPage>
             width: 44, // iOS standard tap target size
             height: 44,
             decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.5), // Half transparency
+              color: Colors.black.withValues(alpha: 0.5), // Half transparency
               shape: BoxShape.circle,
             ),
             child: Material(
@@ -742,8 +754,7 @@ class _TerminalPageState extends State<TerminalPage>
         minimumSize: const Size(terminalKeyboardKeyWidth, 32),
         padding: EdgeInsets.zero,
         textStyle: const TextStyle(fontSize: 12),
-        backgroundColor:
-            Theme.of(context).colorScheme.surfaceContainerHighest,
+        backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
         foregroundColor: Theme.of(context).colorScheme.onSurfaceVariant,
       ),
     );

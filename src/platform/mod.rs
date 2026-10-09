@@ -86,6 +86,97 @@ pub fn get_active_username() -> String {
     "android".into()
 }
 
+// Android equivalents of the managed-client machine-secret helpers backing
+// crate::hbbs_http::directory_enrollment's persisted-auth store and the passport identity key (see
+// platform/windows/protected_storage.rs and platform/windows/acl.rs for the Windows originals).
+// The app's private storage is already isolated from other apps; on top of that, secrets are
+// encrypted with a non-exportable Android Keystore key (SecretWrap.kt), as DPAPI does on Windows,
+// so a copy of the files (a backup, another process reading app storage) is useless without this
+// device's Keystore.
+#[cfg(target_os = "android")]
+const ANDROID_KEYSTORE_MAGIC: &[u8] = b"RDCK1";
+
+#[cfg(target_os = "android")]
+pub(crate) fn protect_machine_scope(data: &[u8]) -> hbb_common::ResultType<Vec<u8>> {
+    if data.is_empty() {
+        return Err(hbb_common::anyhow::anyhow!("Cannot protect an empty value"));
+    }
+    let wrapped = scrap::android::ffi::call_secret_wrap(data, true)
+        .map_err(|e| hbb_common::anyhow::anyhow!("Android Keystore encryption failed: {e}"))?;
+    Ok([ANDROID_KEYSTORE_MAGIC, &wrapped].concat())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn unprotect_machine_scope(data: &[u8]) -> hbb_common::ResultType<Vec<u8>> {
+    if data.is_empty() {
+        return Err(hbb_common::anyhow::anyhow!("Cannot unprotect an empty value"));
+    }
+    match data.strip_prefix(ANDROID_KEYSTORE_MAGIC) {
+        Some(wrapped) => scrap::android::ffi::call_secret_wrap(wrapped, false)
+            .map_err(|e| hbb_common::anyhow::anyhow!("Android Keystore decryption failed: {e}")),
+        // Written by an earlier build before secrets were Keystore-encrypted; rewritten on next save.
+        None => Ok(data.to_vec()),
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn get_program_data_dir() -> hbb_common::ResultType<std::path::PathBuf> {
+    Ok(hbb_common::config::Config::path(""))
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn create_machine_secret_directory(
+    path: &std::path::Path,
+) -> hbb_common::ResultType<()> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        hbb_common::anyhow::anyhow!(
+            "Failed to create machine-secret directory '{}': {}",
+            path.display(),
+            error
+        )
+    })?;
+    set_path_permission_for_machine_secret(path, true)
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn set_path_permission_for_machine_secret(
+    path: &std::path::Path,
+    expect_dir: bool,
+) -> hbb_common::ResultType<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        hbb_common::anyhow::anyhow!(
+            "Failed to inspect machine-secret target '{}': {}",
+            path.display(),
+            error
+        )
+    })?;
+
+    if metadata.file_type().is_symlink() {
+        return Err(hbb_common::anyhow::anyhow!(
+            "Machine-secret target is a symlink and is rejected: '{}'",
+            path.display()
+        ));
+    }
+
+    if expect_dir != metadata.is_dir() {
+        return Err(hbb_common::anyhow::anyhow!(
+            "Machine-secret target has unexpected type: '{}'",
+            path.display()
+        ));
+    }
+
+    let mode = if expect_dir { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
+        hbb_common::anyhow::anyhow!(
+            "Failed to set machine-secret permissions on '{}': {}",
+            path.display(),
+            error
+        )
+    })
+}
+
 #[cfg(target_os = "android")]
 pub const PA_SAMPLE_RATE: u32 = 48000;
 

@@ -9,9 +9,9 @@ import 'package:provider/provider.dart';
 class DesktopViewCameraScreen extends StatelessWidget {
   final Map<String, dynamic> params;
 
-  DesktopViewCameraScreen({Key? key, required this.params}) : super(key: key) {
-      bind.mainInitInputSource();
-      stateGlobal.getInputSource(force: true);
+  DesktopViewCameraScreen({super.key, required this.params}) {
+    bind.crateFlutterFfiMainInitInputSource();
+    stateGlobal.getInputSource(force: true);
   }
 
   @override

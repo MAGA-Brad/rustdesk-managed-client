@@ -22,9 +22,9 @@ class _PixelbufferTexture {
 
   int get display => _display;
 
-  create(int d, SessionID sessionId, FFI ffi) {
+  void create(int d, SessionID sessionId, FFI ffi) {
     _display = d;
-    _textureKey = bind.getNextTextureKey();
+    _textureKey = bind.crateFlutterFfiGetNextTextureKey();
     _sessionId = sessionId;
 
     textureRenderer.createTexture(_textureKey).then((id) async {
@@ -39,7 +39,7 @@ class _PixelbufferTexture {
     });
   }
 
-  destroy(bool unregisterTexture, FFI ffi) async {
+  Future<void> destroy(bool unregisterTexture, FFI ffi) async {
     if (!_destroying && _textureKey != -1 && _sessionId != null) {
       _destroying = true;
       if (unregisterTexture) {
@@ -59,7 +59,7 @@ class _PixelbufferTexture {
 class _GpuTexture {
   int _textureId = -1;
   SessionID? _sessionId;
-  final support = bind.mainHasGpuTextureRender();
+  final support = bind.crateFlutterFfiMainHasGpuTextureRender();
   bool _destroying = false;
   int _display = 0;
   int? _id;
@@ -71,7 +71,7 @@ class _GpuTexture {
 
   _GpuTexture();
 
-  create(int d, SessionID sessionId, FFI ffi) {
+  void create(int d, SessionID sessionId, FFI ffi) {
     if (support) {
       _sessionId = sessionId;
       _display = d;
@@ -95,7 +95,7 @@ class _GpuTexture {
     }
   }
 
-  destroy(bool unregisterTexture, FFI ffi) async {
+  Future<void> destroy(bool unregisterTexture, FFI ffi) async {
     // must stop texture render, render unregistered texture cause crash
     if (!_destroying && support && _sessionId != null && _textureId != -1) {
       _destroying = true;
@@ -123,17 +123,17 @@ class _Control {
   bool _isGpuTexture = false;
   bool get isGpuTexture => _isGpuTexture;
 
-  setTextureType({bool gpuTexture = false}) {
+  void setTextureType({bool gpuTexture = false}) {
     _isGpuTexture = gpuTexture;
     textureID.value = _isGpuTexture ? gpuTextureId : rgbaTextureId;
   }
 
-  setRgbaTextureId(int id) {
+  void setRgbaTextureId(int id) {
     _rgbaTextureId = id;
     textureID.value = _isGpuTexture ? gpuTextureId : rgbaTextureId;
   }
 
-  setGpuTextureId(int id) {
+  void setGpuTextureId(int id) {
     _gpuTextureId = id;
     textureID.value = _isGpuTexture ? gpuTextureId : rgbaTextureId;
   }
@@ -147,7 +147,7 @@ class TextureModel {
 
   TextureModel(this.parent);
 
-  setTextureType({required int display, required bool gpuTexture}) {
+  void setTextureType({required int display, required bool gpuTexture}) {
     debugPrint("setTextureType: display=$display, isGpuTexture=$gpuTexture");
     ensureControl(display);
     _control[display]?.setTextureType(gpuTexture: gpuTexture);
@@ -165,12 +165,12 @@ class TextureModel {
     }
   }
 
-  setRgbaTextureId({required int display, required int id}) {
+  void setRgbaTextureId({required int display, required int id}) {
     ensureControl(display);
     _control[display]?.setRgbaTextureId(id);
   }
 
-  setGpuTextureId({required int display, required int id}) {
+  void setGpuTextureId({required int display, required int id}) {
     ensureControl(display);
     _control[display]?.setGpuTextureId(id);
   }
@@ -180,7 +180,7 @@ class TextureModel {
     return _control[display]!.textureID;
   }
 
-  updateCurrentDisplay(int curDisplay) {
+  void updateCurrentDisplay(int curDisplay) {
     if (isWeb) return;
     final ffi = parent.target;
     if (ffi == null) return;
@@ -224,7 +224,7 @@ class TextureModel {
     }
   }
 
-  onRemotePageDispose(bool closeSession) async {
+  Future<void> onRemotePageDispose(bool closeSession) async {
     final ffi = parent.target;
     if (ffi == null) return;
     for (final texture in _pixelbufferRenderTextures.values) {
@@ -235,7 +235,7 @@ class TextureModel {
     }
   }
 
-  onViewCameraPageDispose(bool closeSession) async {
+  Future<void> onViewCameraPageDispose(bool closeSession) async {
     final ffi = parent.target;
     if (ffi == null) return;
     for (final texture in _pixelbufferRenderTextures.values) {
@@ -246,7 +246,7 @@ class TextureModel {
     }
   }
 
-  ensureControl(int display) {
+  void ensureControl(int display) {
     var ctl = _control[display];
     if (ctl == null) {
       ctl = _Control();

@@ -33,7 +33,7 @@ class _MenuTheme {
 class ViewCameraTabPage extends StatefulWidget {
   final Map<String, dynamic> params;
 
-  const ViewCameraTabPage({Key? key, required this.params}) : super(key: key);
+  const ViewCameraTabPage({super.key, required this.params});
 
   @override
   State<ViewCameraTabPage> createState() => _ViewCameraTabPageState(params);
@@ -69,7 +69,7 @@ class _ViewCameraTabPageState extends State<ViewCameraTabPage> {
         final viewCameraPage = tabController.widget(id);
         if (viewCameraPage is ViewCameraPage) {
           final ffi = viewCameraPage.ffi;
-          bind.setCurSessionId(sessionId: ffi.sessionId);
+          bind.crateFlutterFfiSetCurSessionId(sessionId: ffi.sessionId);
         }
         WindowController.fromWindowId(params['windowId'])
             .setTitle(getWindowNameWithId(id));
@@ -131,7 +131,7 @@ class _ViewCameraTabPageState extends State<ViewCameraTabPage> {
   @override
   Widget build(BuildContext context) {
     final child = Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.background,
+      backgroundColor: Theme.of(context).colorScheme.surface,
       body: DesktopTab(
         controller: tabController,
         onWindowCloseButton: handleWindowCloseButton,
@@ -368,8 +368,10 @@ class _ViewCameraTabPageState extends State<ViewCameraTabPage> {
       return true;
     } else {
       final bool res;
-      if (!option2bool(kOptionEnableConfirmClosingTabs,
-          bind.mainGetLocalOption(key: kOptionEnableConfirmClosingTabs))) {
+      if (!option2bool(
+          kOptionEnableConfirmClosingTabs,
+          bind.crateFlutterFfiMainGetLocalOption(
+              key: kOptionEnableConfirmClosingTabs))) {
         res = true;
       } else {
         res = await closeConfirmDialog();
@@ -381,7 +383,7 @@ class _ViewCameraTabPageState extends State<ViewCameraTabPage> {
     }
   }
 
-  _update_remote_count() =>
+  int _update_remote_count() =>
       RemoteCountState.find().value = tabController.length;
 
   Future<dynamic> _remoteMethodHandler(call, fromWindowId) async {

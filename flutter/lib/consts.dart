@@ -51,6 +51,13 @@ const String kAppTypeDesktopFileTransfer = "file transfer";
 const String kAppTypeDesktopViewCamera = "view camera";
 const String kAppTypeDesktopPortForward = "port forward";
 const String kAppTypeDesktopTerminal = "terminal";
+const String kAppTypeDesktopManagedChat = "managed chat";
+
+/// [kAppTypeRustDrop] a separate top-level app, like kAppTypeConnectionManager,
+/// launched via --rustdrop - not a multi_window sub-window of the main app,
+/// so a bug in this newer code can't take down a live remote-control session
+/// running in --server.
+const String kAppTypeRustDrop = "rustdrop";
 
 const String kWindowMainWindowOnTop = "main_window_on_top";
 const String kWindowRefreshCurrentUser = "refresh_current_user";
@@ -69,6 +76,9 @@ const String kWindowEventNewViewCamera = "new_view_camera";
 const String kWindowEventNewPortForward = "new_port_forward";
 const String kWindowEventNewTerminal = "new_terminal";
 const String kWindowEventRestoreTerminalSessions = "restore_terminal_sessions";
+// Main -> chat window: a new/updated message arrived for this conversation
+// id, refresh yourself.
+const String kWindowEventManagedChatMessage = "managed_chat_window_message";
 const String kWindowEventActiveSession = "active_session";
 const String kWindowEventActiveDisplaySession = "active_display_session";
 const String kWindowEventGetRemoteList = "get_remote_list";
@@ -155,8 +165,7 @@ const String kOptionRemoteMenubarDragLeft = "remote-menubar-drag-left";
 const String kOptionRemoteMenubarDragRight = "remote-menubar-drag-right";
 const String kOptionRemoteMenubarEdge = "remote-menubar-edge";
 const String kOptionRemoteMenubarFraction = "remote-menubar-frac";
-const String kOptionAllowMultiEdgeToolbarDock =
-    "allow-multi-edge-toolbar-dock";
+const String kOptionAllowMultiEdgeToolbarDock = "allow-multi-edge-toolbar-dock";
 const String kOptionHideAbTagsPanel = "hideAbTagsPanel";
 const String kOptionRemoteMenubarState = "remoteMenubarState";
 const String kOptionPeerSorting = "peer-sorting";
@@ -186,9 +195,12 @@ const String kOptionShowVirtualMouse = "show-virtual-mouse";
 const String kOptionVirtualMouseScale = "virtual-mouse-scale";
 const String kOptionShowVirtualJoystick = "show-virtual-joystick";
 const String kOptionAllowAskForNoteAtEndOfConnection = "allow-ask-for-note";
-const String kOptionAllowMonitorSwitchMainToolbar = "allow-monitor-switch-main-toolbar";
-const String kOptionAllowMonitorSwitchMinToolbar = "allow-monitor-switch-min-toolbar";
-const String kOptionEnableShowTerminalExtraKeys = "enable-show-terminal-extra-keys";
+const String kOptionAllowMonitorSwitchMainToolbar =
+    "allow-monitor-switch-main-toolbar";
+const String kOptionAllowMonitorSwitchMinToolbar =
+    "allow-monitor-switch-min-toolbar";
+const String kOptionEnableShowTerminalExtraKeys =
+    "enable-show-terminal-extra-keys";
 const String kOptionShowTerminalCtrlKeys = "show-terminal-extra-ctrl-keys";
 
 // network options
@@ -225,8 +237,10 @@ const String kOptionDisableFloatingWindow = "disable-floating-window";
 
 const String kOptionKeepScreenOn = "keep-screen-on";
 
-const String kOptionKeepAwakeDuringIncomingSessions = "keep-awake-during-incoming-sessions";
-const String kOptionKeepAwakeDuringOutgoingSessions = "keep-awake-during-outgoing-sessions";
+const String kOptionKeepAwakeDuringIncomingSessions =
+    "keep-awake-during-incoming-sessions";
+const String kOptionKeepAwakeDuringOutgoingSessions =
+    "keep-awake-during-outgoing-sessions";
 
 const String kOptionShowMobileAction = "showMobileActions";
 
@@ -263,6 +277,7 @@ const String kMsgboxTextWaitingForImage = 'Connected, waiting for image...';
 const String kEnvPortableExecutable = "RUSTDESK_APPNAME";
 
 const Color kColorWarn = Color.fromARGB(255, 245, 133, 59);
+const Color kColorActiveSession = Color.fromARGB(255, 26, 111, 219);
 const Color kColorCanvas = Colors.black;
 
 const int kMobileDefaultDisplayWidth = 720;
@@ -349,7 +364,7 @@ extension StringExtension on String {
   String get nonBreaking => replaceAll(' ', String.fromCharCode($nbsp));
 }
 
-const Size kConnectionManagerWindowSizeClosedChat = Size(300, 490);
+const Size kConnectionManagerWindowSizeClosedChat = Size(300, 350);
 const Size kConnectionManagerWindowSizeOpenChat = Size(700, 490);
 // Tabbar transition duration, now we remove the duration
 const Duration kTabTransitionDuration = Duration.zero;
@@ -383,7 +398,7 @@ const kMobilePageConstraints = BoxConstraints(maxWidth: 600);
 const kMouseControlDistance = 12;
 
 /// [kMouseControlTimeoutMSec] indicates the timeout (in milliseconds) that self-side can get control of mouse.
-const kMouseControlTimeoutMSec = 1000;
+const kMouseControlTimeoutMSec = 250;
 
 /// [kRemoteViewStyleOriginal] Show remote image without scaling.
 const kRemoteViewStyleOriginal = 'original';

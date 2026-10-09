@@ -177,7 +177,10 @@ async fn connect_and_login(
     let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
         Client::start(id, key, token, conn_type, interface.clone()).await?;
     interface.update_direct(Some(direct));
-    if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
+    if !stream.is_secured()
+        && (option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            || !crate::common::is_direct_ip_access(id))
+    {
         if !confirm_insecure_connection(&interface, ui_receiver).await {
             *close_port_forward = true;
             return Ok(None);
@@ -418,7 +421,10 @@ async fn connect_and_login_mux(
     let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
         Client::start(id, key, token, conn_type, interface.clone()).await?;
     interface.update_direct(Some(direct));
-    if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
+    if !stream.is_secured()
+        && (option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            || !crate::common::is_direct_ip_access(id))
+    {
         if !confirm_insecure_connection(&interface, ui_receiver).await {
             *close_port_forward = true;
             return Ok(None);

@@ -52,8 +52,8 @@ def generate_md5_table(folder: str, level, exclude: str = None) -> dict:
     return res
 
 
-def write_package_metadata(md5_table: dict, output_folder: str, exe: str):
-    write_blob(md5_table, os.path.join(output_folder, "data.bin"), exe)
+def write_package_metadata(md5_table: dict, output_folder: str, exe: str, name: str = "data.bin"):
+    write_blob(md5_table, os.path.join(output_folder, name), exe)
 
 
 def write_blob(md5_table: dict, output_path: str, exe: str):
@@ -111,6 +111,12 @@ if __name__ == '__main__':
                       help="the target used by cargo")
     parser.add_option("-l", "--level", dest="level", type="int",
                       help="compression level, default is 11, highest", default=11)
+    parser.add_option("-n", "--name", dest="name",
+                      help="output data file name, default is data.bin (use data_x64.bin / data_arm64.bin for an AIO build)",
+                      default="data.bin")
+    parser.add_option("-s", "--skip-build", dest="skip_build", action="store_true",
+                      help="write the data file only, skip building the launcher (use when writing multiple arch payloads before one final launcher build)",
+                      default=False)
     parser.add_option("--package", dest="package",
                       help="write the per-customer blob to this path instead of "
                            "data.bin, and skip the cargo build. Injected into the "
@@ -150,6 +156,7 @@ if __name__ == '__main__':
     if options.package:
         write_blob(md5_table, os.path.abspath(options.package), exe)
     else:
-        write_package_metadata(md5_table, output_folder, exe)
+        write_package_metadata(md5_table, output_folder, exe, options.name)
         write_app_metadata(output_folder)
-        build_portable(output_folder, options.target)
+        if not options.skip_build:
+            build_portable(output_folder, options.target)

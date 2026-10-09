@@ -305,11 +305,72 @@ pub enum DataPortableService {
     Mouse((Vec<u8>, i32, String, u32, bool, bool)),
     Pointer((Vec<u8>, i32)),
     Key(Vec<u8>),
+    LocalInputPriorityUntil(u64),
     RequestStart,
     WillClose,
     CmShowElevation(bool),
 }
 
+/// A managed client session whose TOTP was verified, passed from the --server that ends it for a
+/// Windows session switch to the --server that takes the reconnect, through the service.
+#[cfg(windows)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SessionSwitchKey {
+    pub peer_id: String,
+    pub name: String,
+    pub session_id: u64,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for SessionSwitchKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSwitchKey")
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RedactedSecret(Vec<u8>);
+
+#[cfg(windows)]
+impl RedactedSecret {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value.into_bytes())
+    }
+
+    pub(crate) fn from_bytes(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn as_str(
+        &self,
+    ) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.0)
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RedactedSecret {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +419,131 @@ pub enum Data {
     #[cfg(windows)]
     SAS,
     UserSid(Option<u32>),
+    #[cfg(windows)]
+    DirectoryEnrollment {
+        enrollment_password: RedactedSecret,
+    },
+    #[cfg(windows)]
+    DirectoryEnrollmentResult(bool, Option<String>),
+    #[cfg(windows)]
+    DirectoryStatusQuery,
+    #[cfg(windows)]
+    DirectoryStatusResult((String, String, String)),
+    #[cfg(windows)]
+    DirectoryReenrollmentRequest,
+    #[cfg(windows)]
+    DirectoryReenrollmentResult(bool),
+    #[cfg(windows)]
+    DirectoryFriendlyNameChanged(String),
+    #[cfg(windows)]
+    DirectoryContactEmailUpdateRequest(String),
+    #[cfg(windows)]
+    DirectoryContactEmailUpdateResult(bool),
+    #[cfg(windows)]
+    PendingManagedUpdateQuery,
+    #[cfg(windows)]
+    PendingManagedUpdateResult(Option<(u64, String)>),
+    #[cfg(windows)]
+    PendingManagedUpdateNotify(Option<(u64, String)>),
+    #[cfg(windows)]
+    TriggerManagedUpdateNow,
+    #[cfg(windows)]
+    SessionSwitchHandoff(SessionSwitchKey),
+    #[cfg(windows)]
+    SessionSwitchHandoffClaim(SessionSwitchKey),
+    #[cfg(windows)]
+    SessionSwitchHandoffClaimResult(bool),
+    // Managed peer authentication (src/managed_peer_auth.rs). GUI -> --server (main IPC): sign a
+    // login proof with the device key. --server/GUI -> service: auth state for a controller id.
+    #[cfg(windows)]
+    ManagedPeerProofRequest {
+        challenge: String,
+        controlled_id: String,
+        controller_id: String,
+        session_id: u64,
+    },
+    #[cfg(windows)]
+    ManagedPeerProofResult(Option<Vec<u8>>),
+    // GUI -> --server: sign a sealed WebRTC offer as this device (src/managed_sealed_signal.rs).
+    #[cfg(windows)]
+    ManagedSignalSignRequest {
+        target_id: String,
+        sealed_key: Vec<u8>,
+        body: Vec<u8>,
+    },
+    #[cfg(windows)]
+    ManagedSignalSignResult(Option<(String, Vec<u8>)>),
+    // GUI -> --server: sec8 DeviceAuth for a key-exchanged hbbs connection (src/managed_passport.rs).
+    #[cfg(windows)]
+    ManagedDeviceAuthRequest(Vec<u8>),
+    #[cfg(windows)]
+    ManagedDeviceAuthResult(Option<(String, Vec<u8>)>),
+    #[cfg(windows)]
+    ManagedPeerAuthQuery(String),
+    #[cfg(windows)]
+    ManagedPeerAuthInfo(crate::managed_peer_auth::PeerAuthInfo),
+    // GUI -> service: an initiated connection's route/timing for RDS (connection-event JSON).
+    #[cfg(windows)]
+    ManagedConnectionEvent(String),
+    // Managed chat's REST calls need the machine-secret directory-state
+    // file, which is ACL'd to SYSTEM + Administrators - the interactive
+    // GUI process (a filtered, non-elevated token even for a local admin
+    // user) can't read it, exactly the same permission gap documented
+    // above for TriggerManagedUpdateNow. Routed to the --server process
+    // for the same reason: it already reads this file successfully and
+    // runs bound to the right session. (operation, json_args) in,
+    // json_result (or a JSON {"error": ...} object) out - see
+    // hbbs_http::managed_chat::handle_ipc_request for the operation list.
+    #[cfg(windows)]
+    ManagedChatIpcRequest(String, String),
+    #[cfg(windows)]
+    ManagedChatIpcResponse(String),
+    // RustDrop (a separate app installed alongside RustDesk, see
+    // rustdrop_architecture doc section 04) has no enrollment of its own and
+    // never touches directory_state.dpapi directly - same ACL wall as
+    // ManagedChatIpcRequest above. It asks the already-running --server
+    // process for this device's identity instead, over this same main IPC
+    // channel (RustDrop.exe is allow-listed for this channel in
+    // ipc/auth.rs's ensure_peer_executable_matches_current_by_pid, the same
+    // way the portable-service logon helper is). Wire shape, since Data uses
+    // #[serde(tag = "t", content = "c")]: request is the bare JSON
+    // `{"t":"GetDeviceCredentialRequest"}`; response is
+    // `{"t":"GetDeviceCredentialResponse","c":"<json string - see
+    // directory_enrollment::device_credential_ipc_json for its shape>"}`.
+    #[cfg(windows)]
+    GetDeviceCredentialRequest,
+    #[cfg(windows)]
+    GetDeviceCredentialResponse(String),
+    // RustDrop's native rewrite (--rustdrop mode of this same binary,
+    // alongside the separate Electron RustDrop.exe that
+    // GetDeviceCredentialRequest above still serves for now) needs one more
+    // secret behind this same ACL wall: its own X25519 keypair
+    // (rustdrop_keystore's rustdrop_keypair.json). Deliberately NOT following
+    // ManagedChatIpcRequest's shape (relay each operation, run it in
+    // --server) - the whole point of keeping RustDrop's UI a separate OS
+    // process from --server was fault isolation from live remote-control
+    // sessions, which relaying every send/accept into --server would throw
+    // away. Instead this hands the keypair itself to --rustdrop once at
+    // startup (same trust decision the existing GetDeviceCredentialRequest
+    // already made for the directory credential), and --rustdrop does all
+    // its own list_devices/list_drops/send_file/accept_drop calls directly
+    // via rustdrop_rds_client/rustdrop_transfer, entirely in its own process.
+    #[cfg(windows)]
+    RustDropKeypairRequest,
+    #[cfg(windows)]
+    RustDropKeypairResponse(String),
+    // The actual chat websocket connection also has to live in --server
+    // for the same ACL reason (see ManagedChatIpcRequest above) - but
+    // push_global_event only reaches Dart from inside the GUI process,
+    // which hosts the Flutter engine. --server sends this, fire-and-
+    // forget, to a small dedicated listener the GUI hosts just for this
+    // (see managed_chat_start_push_listener in flutter_ffi.rs) - modeled
+    // on the same "receiver hosts the listener, sender connects out as a
+    // one-shot client" shape server.rs's start_ipc_url_server already
+    // uses for UrlLink, just inverted for --server as the sender instead
+    // of an external OS-level URL activation.
+    #[cfg(windows)]
+    ManagedChatIncomingMessage(String),
     OnlineStatus(Option<(i64, bool)>),
     Config((String, Option<String>)),
     Options(Option<HashMap<String, String>>),
@@ -870,6 +1056,40 @@ async fn handle(data: Data, stream: &mut Connection) {
                 std::process::exit(-1); // to make sure --server luauchagent process can restart because SuccessfulExit used
             }
         }
+        #[cfg(windows)]
+        Data::TriggerManagedUpdateNow => {
+            // Handled here (the "" main-IPC listener, run by the --server
+            // process) rather than the SYSTEM service - see
+            // trigger_managed_update_now_via_server for why.
+            crate::updater::trigger_managed_update_now();
+        }
+        #[cfg(windows)]
+        Data::ManagedChatIpcRequest(operation, args_json) => {
+            log::info!(
+                "managed chat IPC: server process received {} request",
+                operation
+            );
+            let result =
+                crate::hbbs_http::managed_chat::handle_ipc_request(&operation, &args_json).await;
+            // Never the result itself: it can carry message bodies.
+            log::info!(
+                "managed chat IPC: server process result ({} bytes)",
+                result.len()
+            );
+            allow_err!(stream.send(&Data::ManagedChatIpcResponse(result)).await);
+        }
+        #[cfg(windows)]
+        Data::GetDeviceCredentialRequest => {
+            log::info!("rustdrop credential IPC: server process received request");
+            let result = crate::hbbs_http::directory_enrollment::device_credential_ipc_json();
+            allow_err!(stream.send(&Data::GetDeviceCredentialResponse(result)).await);
+        }
+        #[cfg(windows)]
+        Data::RustDropKeypairRequest => {
+            log::info!("rustdrop keypair IPC: server process received request");
+            let result = crate::rustdrop_keystore::keypair_ipc_json();
+            allow_err!(stream.send(&Data::RustDropKeypairResponse(result)).await);
+        }
         Data::OnlineStatus(_) => {
             let x = config::get_online_state();
             let confirmed = Config::get_key_confirmed();
@@ -970,6 +1190,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = crate::audio_service::get_voice_call_input_device();
                 } else if name == "unlock-pin" {
                     value = Some(Config::get_unlock_pin());
+                } else if name == "2fa" {
+                    value = Some(Config::get_option("2fa"));
                 } else if name == "trusted-devices" {
                     value = Some(Config::get_trusted_devices_json());
                 } else {
@@ -1002,6 +1224,16 @@ async fn handle(data: Data, stream: &mut Connection) {
                     // reading back any secret.
                     let ack = if updated { "Y" } else { "N" }.to_owned();
                     allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);
+                } else if name == "2fa" {
+                    Config::set_option("2fa".to_owned(), value.clone());
+                    updated = Config::get_option("2fa") == value;
+                    let ack = if updated { "Y" } else { "N" }.to_owned();
+                    allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);
+                    if updated {
+                        log::info!("2FA state updated through dedicated IPC");
+                    } else {
+                        log::warn!("2FA state failed dedicated IPC persistence verification");
+                    }
                 } else if name == "salt" {
                     Config::set_salt(&value);
                 } else if name == "voice-call-input" {
@@ -1099,6 +1331,35 @@ async fn handle(data: Data, stream: &mut Connection) {
                     .send(&Data::SwitchSidesUuid(uuid, id, action, Some(allowed)))
                     .await
             );
+        }
+        #[cfg(windows)]
+        Data::ManagedPeerProofRequest {
+            challenge,
+            controlled_id,
+            controller_id,
+            session_id,
+        } => {
+            let proof = crate::managed_peer_auth::build_proof(
+                &challenge,
+                &controlled_id,
+                &controller_id,
+                session_id,
+            );
+            allow_err!(stream.send(&Data::ManagedPeerProofResult(proof)).await);
+        }
+        #[cfg(windows)]
+        Data::ManagedSignalSignRequest {
+            target_id,
+            sealed_key,
+            body,
+        } => {
+            let signed = crate::managed_sealed_signal::sign_offer(&target_id, &sealed_key, &body);
+            allow_err!(stream.send(&Data::ManagedSignalSignResult(signed)).await);
+        }
+        #[cfg(windows)]
+        Data::ManagedDeviceAuthRequest(binding) => {
+            let signed = crate::managed_passport::sign_device_auth(&binding);
+            allow_err!(stream.send(&Data::ManagedDeviceAuthResult(signed)).await);
         }
         #[cfg(windows)]
         Data::ControlledSessionCount(_) => {
@@ -1884,6 +2145,42 @@ pub async fn get_option_async(key: &str) -> String {
     }
 }
 
+pub fn get_2fa_from_daemon() -> ResultType<String> {
+    let value = get_config("2fa")?.unwrap_or_default();
+    Config::set_option("2fa".to_owned(), value.clone());
+    Ok(value)
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn set_2fa_with_ack(value: String) -> ResultType<bool> {
+    let ms_timeout = 1_000;
+    let mut c = connect(ms_timeout, "").await?;
+    c.send_config("2fa", value.clone()).await?;
+    let acked = matches!(
+        c.next_timeout(ms_timeout).await?,
+        Some(Data::Config((name, Some(ack)))) if name == "2fa" && ack.trim() == "Y"
+    );
+    drop(c);
+    if !acked {
+        return Ok(false);
+    }
+
+    let daemon_value = get_config_async("2fa", ms_timeout)
+        .await?
+        .unwrap_or_default();
+    if daemon_value != value {
+        log::warn!("2FA dedicated IPC ACK did not survive daemon readback");
+        return Ok(false);
+    }
+
+    Config::set_option("2fa".to_owned(), value.clone());
+    if Config::get_option("2fa") != value {
+        log::warn!("2FA daemon state was confirmed but local mirror readback failed");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub fn set_option(key: &str, value: &str) {
     let mut options = get_options();
     if value.is_empty() {
@@ -2026,10 +2323,424 @@ pub fn close_all_instances() -> ResultType<bool> {
 
 #[cfg(windows)]
 #[tokio::main(flavor = "current_thread")]
+pub async fn send_directory_enrollment_secret(
+    enrollment_password: RedactedSecret,
+) -> ResultType<(bool, Option<String>)> {
+    let mut stream = None;
+
+    // Installation has completed, but the SCM service process may
+    // still need a few seconds before its protected IPC listener
+    // is accepting connections.
+    for _ in 0..20 {
+        match crate::ipc::connect_service(1000).await {
+            Ok(connection) => {
+                stream = Some(connection);
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(
+                    std::time::Duration::from_millis(500),
+                )
+                .await;
+            }
+        }
+    }
+
+    let Some(mut stream) = stream else {
+        return Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service IPC is unavailable"
+        ));
+    };
+
+    let message = crate::ipc::Data::DirectoryEnrollment {
+        enrollment_password,
+    };
+
+    stream.send(&message).await?;
+
+    // Zero the sender-side secret as soon as serialization/send
+    // has completed rather than retaining it while awaiting the
+    // service response.
+    drop(message);
+
+    // Must exceed the enrollment HTTP request's own timeout
+    // (post_enrollment_request in directory_enrollment.rs, currently 60s) -
+    // this is a wrapper around that whole round-trip (service receives this
+    // IPC call, makes the HTTP request, persists the result, replies), so a
+    // shorter outer deadline here would cut the wait off before the inner
+    // HTTP timeout ever gets a chance to matter.
+    match stream.next_timeout(65_000).await? {
+        Some(
+            crate::ipc::Data::DirectoryEnrollmentResult(
+                accepted,
+                reason,
+            ),
+        ) => Ok((accepted, reason)),
+
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no enrollment result"
+        )),
+    }
+}
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_directory_status_from_service(
+) -> ResultType<(String, String, String)> {
+    let mut stream =
+        crate::ipc::connect_service(1000).await?;
+
+    stream
+        .send(
+            &crate::ipc::Data::DirectoryStatusQuery,
+        )
+        .await?;
+
+    match stream.next_timeout(2_000).await? {
+        Some(
+            crate::ipc::Data::DirectoryStatusResult(
+                status,
+            ),
+        ) => Ok(status),
+
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no status"
+        )),
+    }
+}
+
+// PENDING_MANAGED_UPDATE lives in directory_enrollment.rs as process-local
+// state, set by the background update checker which runs in the SYSTEM
+// service process - a separate process from this GUI, with its own memory.
+// The UI must ask the service for it over IPC rather than reading it
+// directly, the same way directory enrollment status already works.
+// The auto-update checker runs in the per-session --server process
+// (started from rendezvous_mediator's persistent loop), not the --service
+// process that owns the IPC pipe the GUI queries - so it must push its
+// result over here, the same way DirectoryFriendlyNameChanged relays a
+// GUI-side change into the service's own Config cache.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn notify_pending_managed_update_to_service(
+    pending: Option<(u64, String)>,
+) -> ResultType<()> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::PendingManagedUpdateNotify(pending))
+        .await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_pending_managed_update_from_service(
+) -> ResultType<Option<(u64, String)>> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::PendingManagedUpdateQuery)
+        .await?;
+    match stream.next_timeout(2_000).await? {
+        Some(crate::ipc::Data::PendingManagedUpdateResult(pending)) => {
+            Ok(pending)
+        }
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no pending-update status"
+        )),
+    }
+}
+
+// "Update Now" is invoked from the interactive (non-elevated) GUI process,
+// which cannot read the machine-secret directory-state file - it's ACL'd to
+// SYSTEM + BUILTIN\Administrators, and a filtered admin token (the normal
+// case when RustDesk is launched by double-clicking, even as a local admin)
+// is denied by that ACL. Reading the file there would silently see it as
+// absent and fail with a misleading "not enrolled" error.
+//
+// This asks the per-session --server process to run the check-and-apply
+// instead (the "" postfix, same channel client.rs/tray.rs/ui_interface.rs
+// already use to reach it) rather than the SYSTEM service. The --server
+// process already reads this file successfully for the background daily
+// check, and - unlike the service, which runs in session 0 - it runs bound
+// to the actual interactive session, which update_new_version() needs to
+// launch the elevated installer into the right desktop. Routing an
+// update/install step through the already-elevated service instead of
+// letting it run where the normal elevation path expects it caused a real
+// bricking incident previously (the service stopping/deleting itself
+// mid-update) - this must stay in --server, never --service.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn trigger_managed_update_now_via_server() -> ResultType<()> {
+    let mut stream = crate::ipc::connect(1000, "").await?;
+    stream
+        .send(&crate::ipc::Data::TriggerManagedUpdateNow)
+        .await?;
+    Ok(())
+}
+
+// See ManagedChatIpcRequest's doc comment for why this can't just call
+// hbbs_http::managed_chat directly from the GUI process. Returns the
+// operation's JSON result (or a JSON {"error": ...} object) as a plain
+// String either way - the caller (flutter_ffi.rs) doesn't need to
+// distinguish an IPC-layer failure from an application-layer one, both
+// render the same "something went wrong" toast to the user.
+#[cfg(windows)]
+pub async fn managed_chat_ipc_call(operation: &str, args_json: String) -> String {
+    let make_error = |message: String| serde_json::json!({ "error": message }).to_string();
+
+    log::info!("managed chat IPC: calling {} (from GUI process)", operation);
+
+    let mut stream = match crate::ipc::connect(1000, "").await {
+        Ok(stream) => stream,
+        Err(error) => {
+            log::info!(
+                "managed chat IPC: failed to connect to server process: {}",
+                error
+            );
+            return make_error(format!("failed to reach server process: {}", error));
+        }
+    };
+    if let Err(error) = stream
+        .send(&crate::ipc::Data::ManagedChatIpcRequest(
+            operation.to_string(),
+            args_json,
+        ))
+        .await
+    {
+        log::info!("managed chat IPC: failed to send request: {}", error);
+        return make_error(error.to_string());
+    }
+    log::info!("managed chat IPC: request sent, awaiting response");
+    match stream.next_timeout(10_000).await {
+        Ok(Some(crate::ipc::Data::ManagedChatIpcResponse(json))) => {
+            log::info!("managed chat IPC: got response ({} bytes)", json.len());
+            json
+        }
+        Ok(_) => {
+            log::info!("managed chat IPC: unexpected response variant");
+            make_error("server process gave no response".to_string())
+        }
+        Err(error) => {
+            log::info!("managed chat IPC: error awaiting response: {}", error);
+            make_error(error.to_string())
+        }
+    }
+}
+
+// See ipc::Data::RustDropKeypairRequest's doc comment: --rustdrop calls this
+// once at startup (same "cache once, keep running" pattern the retired
+// Electron client's own ensureIdentity() used) and does everything else -
+// list_devices, list_drops, send_file, accept_drop, decline_drop - directly
+// in its own process from then on, deliberately never routing those through
+// --server.
+// Rust-side caller for the request half of the SAME GetDeviceCredentialRequest/
+// Response pair the separate Electron RustDrop.exe already used from its own
+// JS IPC client - this is just the first Rust caller of it, for the new
+// --rustdrop mode. See that Data variant's doc comment for the wire shape.
+#[cfg(windows)]
+pub async fn rustdrop_identity_ipc_call() -> String {
+    let make_error = |message: String| serde_json::json!({ "error": message }).to_string();
+
+    let mut stream = match crate::ipc::connect(1000, "").await {
+        Ok(stream) => stream,
+        Err(error) => {
+            log::info!("rustdrop identity IPC: failed to reach server process: {}", error);
+            return make_error(format!("failed to reach server process: {}", error));
+        }
+    };
+    if let Err(error) = stream.send(&crate::ipc::Data::GetDeviceCredentialRequest).await {
+        log::info!("rustdrop identity IPC: failed to send request: {}", error);
+        return make_error(error.to_string());
+    }
+    match stream.next_timeout(10_000).await {
+        Ok(Some(crate::ipc::Data::GetDeviceCredentialResponse(json))) => json,
+        Ok(_) => make_error("server process gave no response".to_string()),
+        Err(error) => make_error(error.to_string()),
+    }
+}
+
+#[cfg(windows)]
+pub async fn rustdrop_keypair_ipc_call() -> String {
+    let make_error = |message: String| serde_json::json!({ "error": message }).to_string();
+
+    let mut stream = match crate::ipc::connect(1000, "").await {
+        Ok(stream) => stream,
+        Err(error) => {
+            log::info!("rustdrop keypair IPC: failed to reach server process: {}", error);
+            return make_error(format!("failed to reach server process: {}", error));
+        }
+    };
+    if let Err(error) = stream.send(&crate::ipc::Data::RustDropKeypairRequest).await {
+        log::info!("rustdrop keypair IPC: failed to send request: {}", error);
+        return make_error(error.to_string());
+    }
+    match stream.next_timeout(10_000).await {
+        Ok(Some(crate::ipc::Data::RustDropKeypairResponse(json))) => json,
+        Ok(_) => make_error("server process gave no response".to_string()),
+        Err(error) => make_error(error.to_string()),
+    }
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn request_directory_reenrollment() -> ResultType<bool> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::DirectoryReenrollmentRequest)
+        .await?;
+    match stream.next_timeout(10_000).await? {
+        Some(crate::ipc::Data::DirectoryReenrollmentResult(accepted)) => {
+            Ok(accepted)
+        }
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no re-enrollment result"
+        )),
+    }
+}
+
+// Unlike friendly-name, contact-email is not synced via the heartbeat, so the
+// service must make an actual authenticated API call and report back whether
+// the server accepted it - not just a best-effort local cache refresh.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn update_directory_contact_email(
+    email: String,
+) -> ResultType<bool> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(
+            &crate::ipc::Data::DirectoryContactEmailUpdateRequest(
+                email,
+            ),
+        )
+        .await?;
+    match stream.next_timeout(10_000).await? {
+        Some(
+            crate::ipc::Data::DirectoryContactEmailUpdateResult(
+                accepted,
+            ),
+        ) => Ok(accepted),
+        _ => Err(hbb_common::anyhow::anyhow!(
+            "Managed directory service returned no email update result"
+        )),
+    }
+}
+
+// Best-effort: refreshes the service's own cached Config so its next managed
+// heartbeat picks up a friendly-name change made from this (GUI) process
+// without waiting for a service restart. No response is expected.
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn notify_directory_friendly_name_changed(
+    name: String,
+) -> ResultType<()> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream
+        .send(&crate::ipc::Data::DirectoryFriendlyNameChanged(name))
+        .await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
 pub async fn connect_to_user_session(usid: Option<u32>) -> ResultType<()> {
     let mut stream = crate::ipc::connect_service(1000).await?;
     timeout(1000, stream.send(&crate::ipc::Data::UserSid(usid))).await??;
     Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn leave_session_switch_handoff(key: SessionSwitchKey) -> ResultType<()> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    timeout(1000, stream.send(&Data::SessionSwitchHandoff(key))).await??;
+    Ok(())
+}
+
+/// Asks this device's `--server` (it holds the device key) for a managed peer login proof.
+#[cfg(windows)]
+pub async fn request_managed_peer_proof(
+    challenge: String,
+    controlled_id: String,
+    controller_id: String,
+    session_id: u64,
+) -> ResultType<Option<Vec<u8>>> {
+    let mut c = connect(1000, "").await?;
+    c.send(&Data::ManagedPeerProofRequest {
+        challenge,
+        controlled_id,
+        controller_id,
+        session_id,
+    })
+    .await?;
+    match c.next_timeout(2000).await? {
+        Some(Data::ManagedPeerProofResult(proof)) => Ok(proof),
+        _ => Ok(None),
+    }
+}
+
+/// Asks this device's `--server` (it holds the device key) to sign a sealed WebRTC offer.
+/// Returns the device id it signed as, with the signature.
+#[cfg(windows)]
+pub async fn request_managed_signal_signature(
+    target_id: String,
+    sealed_key: Vec<u8>,
+    body: Vec<u8>,
+) -> ResultType<Option<(String, Vec<u8>)>> {
+    let mut c = connect(1000, "").await?;
+    c.send(&Data::ManagedSignalSignRequest {
+        target_id,
+        sealed_key,
+        body,
+    })
+    .await?;
+    match c.next_timeout(2000).await? {
+        Some(Data::ManagedSignalSignResult(signed)) => Ok(signed),
+        _ => Ok(None),
+    }
+}
+
+/// Asks this device's `--server` (it can read the identity key) for the DeviceAuth of one
+/// key-exchanged hbbs connection: the passport and the signature over `binding`.
+#[cfg(windows)]
+pub async fn request_device_auth(binding: Vec<u8>) -> ResultType<Option<(String, Vec<u8>)>> {
+    let mut c = connect(1000, "").await?;
+    c.send(&Data::ManagedDeviceAuthRequest(binding)).await?;
+    // hbbs waits 30 s for the next message, so a slow --server costs nothing here; giving up
+    // early sends the connection's request without the proof (refused under Enforce).
+    match c.next_timeout(5000).await? {
+        Some(Data::ManagedDeviceAuthResult(signed)) => Ok(signed),
+        _ => Ok(None),
+    }
+}
+
+/// Asks the service what RDS's directory says about `controller_id` (mode, listed key).
+#[cfg(windows)]
+pub async fn query_managed_peer_auth(
+    controller_id: String,
+) -> ResultType<crate::managed_peer_auth::PeerAuthInfo> {
+    let mut stream = connect_service(1000).await?;
+    stream.send(&Data::ManagedPeerAuthQuery(controller_id)).await?;
+    match stream.next_timeout(1500).await? {
+        Some(Data::ManagedPeerAuthInfo(info)) => Ok(info),
+        _ => bail!("no managed peer auth answer from the service"),
+    }
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn send_managed_connection_event(event_json: String) -> ResultType<()> {
+    let mut stream = connect_service(1000).await?;
+    timeout(1000, stream.send(&Data::ManagedConnectionEvent(event_json))).await??;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub async fn claim_session_switch_handoff(key: SessionSwitchKey) -> ResultType<bool> {
+    let mut stream = crate::ipc::connect_service(1000).await?;
+    stream.send(&Data::SessionSwitchHandoffClaim(key)).await?;
+    Ok(matches!(
+        stream.next_timeout(1000).await?,
+        Some(Data::SessionSwitchHandoffClaimResult(true))
+    ))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -2162,7 +2873,7 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
         let connect_result = timeout(timeout_ms, Endpoint::connect(&socket_path))
             .await
             .map_err(|err| {
-                anyhow::anyhow!(
+                hbb_common::anyhow::anyhow!(
                     "Timeout connecting to terminal ipc at {}: {}",
                     socket_path,
                     err
@@ -2171,7 +2882,7 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
         let connection = match connect_result {
             Ok(Ok(connection)) => connection,
             Ok(Err(err)) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Failed to connect to terminal ipc at {}: {}",
                     socket_path,
                     err
@@ -2185,7 +2896,7 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
         };
         let mut ipc_conn = ConnectionTmpl::new(connection);
         if let Err(err) = ipc_conn.send(&Data::TerminalSessionCount(0)).await {
-            last_err = Some(anyhow::anyhow!(
+            last_err = Some(hbb_common::anyhow::anyhow!(
                 "Failed to request terminal session count via ipc at {}: {}",
                 socket_path,
                 err
@@ -2197,20 +2908,20 @@ pub async fn get_terminal_session_count() -> ResultType<usize> {
                 return Ok(session_count);
             }
             Ok(None) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Invalid response when requesting terminal session count via ipc at {}",
                     socket_path
                 ));
             }
             Ok(other) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Unexpected response when requesting terminal session count via ipc at {}: {:?}",
                     socket_path,
                     other.map(|v| std::mem::discriminant(&v))
                 ));
             }
             Err(err) => {
-                last_err = Some(anyhow::anyhow!(
+                last_err = Some(hbb_common::anyhow::anyhow!(
                     "Failed to read terminal session count via ipc at {}: {}",
                     socket_path,
                     err

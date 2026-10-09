@@ -168,7 +168,7 @@ class LoginRequest {
 
     Map<String, dynamic> deviceInfo = {};
     try {
-      deviceInfo = jsonDecode(bind.mainGetLoginDeviceInfo());
+      deviceInfo = jsonDecode(bind.crateFlutterFfiMainGetLoginDeviceInfo());
     } catch (e) {
       debugPrint('Failed to decode get device info: $e');
     }

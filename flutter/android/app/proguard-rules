@@ -5,3 +5,8 @@
 
 # Keep rustls-platform-verifier classes for JNI
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
+
+# Managed builds: SecretWrap (Android Keystore encryption of device secrets) is called from Rust
+# through JNI only, so nothing in Kotlin keeps it alive.
+-keep class com.carriez.flutter_hbb.SecretWrap { *; }
+-keep class com.carriez.flutter_hbb.RdcPlatform { *; }

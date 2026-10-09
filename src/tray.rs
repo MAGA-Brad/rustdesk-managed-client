@@ -61,12 +61,24 @@ fn make_tray() -> hbb_common::ResultType<()> {
     let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
         .context("Failed to open icon")?;
 
-    let mut event_loop = EventLoopBuilder::new().build();
+    let event_loop = EventLoopBuilder::new().build();
 
     let tray_menu = Menu::new();
-    let hide_stop_service = crate::ui_interface::get_builtin_option(
-        keys::OPTION_HIDE_STOP_SERVICE,
-    ) == "Y";
+    // A managed client's SYSTEM-level watchdog unconditionally keeps the
+    // service running (see service_watchdog_check_and_fix in
+    // src/platform/windows.rs) - a managed device should never be able to
+    // opt itself out of remote management. The Settings page's own
+    // Stop/Start control is already hidden for managed clients
+    // (desktop_setting_page.dart); this tray menu item is a second,
+    // separate surface with the exact same effect (confirmed in
+    // production 2026-09-07: Brad stopped the service from here after the
+    // Settings control was already hidden) and needs the same treatment.
+    let is_managed_client = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let hide_stop_service = is_managed_client
+        || crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_STOP_SERVICE) == "Y";
     // The tray icon is only shown when the service is running, so we don't need to check
     // the `stop-service` option here.
     let quit_i = if !hide_stop_service {
@@ -274,7 +286,9 @@ async fn start_query_session_count(sender: std::sync::mpsc::Sender<Data>) {
                     res = c.next() => {
                         match res {
                             Err(err) => {
-                                log::error!("ipc connection closed: {}", err);
+                                // The service restarting (install, update) ends this; the loop
+                                // reconnects, as the other IPC listeners log it, at info.
+                                log::info!("ipc connection closed: {}", err);
                                 break;
                             }
 

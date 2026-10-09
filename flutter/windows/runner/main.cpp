@@ -3,6 +3,7 @@
 #include <tchar.h>
 #include <uni_links_desktop/uni_links_desktop_plugin.h>
 #include <windows.h>
+#include <shobjidl.h>
 
 #include <algorithm>
 #include <iostream>
@@ -16,7 +17,7 @@ typedef void (*FUNC_RUSTDESK_FREE_ARGS)( char**, int);
 typedef int (*FUNC_RUSTDESK_GET_APP_NAME)(wchar_t*, int);
 typedef int (*FUNC_RUSTDESK_IS_DISABLE_INSTALLATION)();
 /// Note: `--server`, `--service` are already handled in [core_main.rs].
-const std::vector<std::string> parameters_white_list = {"--install", "--cm"};
+const std::vector<std::string> parameters_white_list = {"--install", "--cm", "--rustdrop"};
 
 const wchar_t* getWindowClassName();
 
@@ -104,6 +105,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     }
     if (!allow_multiple_instances) {
       if (!command_line_arguments.empty()) {
+        // The process launched by the browser owns the foreground permission.
+        // Transfer it to the existing RustDesk process before dispatching the
+        // URI so that it can bring an existing session to the foreground.
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != 0) {
+          ::AllowSetForegroundWindow(pid);
+        }
         // Dispatch command line arguments
         DispatchToUniLinksDesktop(hwnd);
       } else {
@@ -137,6 +146,17 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   bool is_install_page = false;
   if (!command_line_arguments.empty() && command_line_arguments.front().compare(0, installParam.size(), installParam.c_str()) == 0) {
     is_install_page = true;
+  }
+  // Without this, RustDrop's separate process falls back to Windows'
+  // default taskbar grouping heuristic, which groups windows by the
+  // launching executable's path - since RustDrop is the same rustdesk.exe
+  // just started with --rustdrop, it gets folded into the main window's
+  // taskbar icon instead of getting its own. Giving it a distinct app ID
+  // (and leaving the main app's ID untouched, so existing pinned-taskbar
+  // associations for RustDesk itself aren't disturbed) fixes that.
+  auto rustdropParam = std::string("--rustdrop");
+  if (!command_line_arguments.empty() && command_line_arguments.front().compare(0, rustdropParam.size(), rustdropParam.c_str()) == 0) {
+    ::SetCurrentProcessExplicitAppUserModelID(L"RustDesk.RustDrop");
   }
 
   command_line_arguments.insert(command_line_arguments.end(), rust_args.begin(), rust_args.end());

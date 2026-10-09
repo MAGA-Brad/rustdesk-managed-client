@@ -23,6 +23,121 @@ macro_rules! my_println{
     };
 }
 
+// A managed client that's already installed and already enrolled doesn't
+// need the full install flow (authorization password, enrollment password,
+// friendly name, contact email) - it just needs its files brought up to
+// date. Re-running the installer this way is the normal path for pushing
+// out an updated build to a machine that's already part of the fleet.
+#[cfg(windows)]
+fn try_silent_managed_upgrade(managed_client: bool) -> bool {
+    // log::* is a no-op this early - global_init() does not set up logging on
+    // Windows, and the install-mode logger isn't wired up until much later
+    // (inside the normal Flutter/InstallPage startup path, which this
+    // function exists specifically to bypass). Use the same file-based
+    // diag_write already relied on elsewhere for SYSTEM-context tracing, so
+    // this path is never silently unobservable again.
+    use crate::server::input_service::diag_write;
+
+    diag_write(&format!(
+        "try_silent_managed_upgrade: managed_client={}",
+        managed_client
+    ));
+    if !managed_client {
+        return false;
+    }
+    let installed = crate::platform::is_installed();
+    diag_write(&format!("try_silent_managed_upgrade: is_installed={}", installed));
+    if !installed {
+        return false;
+    }
+    // A raw file-existence check on the DPAPI credential
+    // (C:\ProgramData\RustDeskManaged\...) is not reliable here: that
+    // directory is ACL-restricted to SYSTEM/Administrators, and this
+    // function runs from the installer's initial, non-elevated launch -
+    // exactly the same restricted context a real double-click starts in.
+    // Ask the already-running SYSTEM-context service over the existing
+    // managed-directory IPC channel instead, which already has the access
+    // this process doesn't.
+    let ready = match crate::ipc::get_directory_status_from_service() {
+        Ok((state, _text, _snapshot)) => {
+            diag_write(&format!(
+                "try_silent_managed_upgrade: service directory state={:?}",
+                state
+            ));
+            state == "ready"
+        }
+        Err(err) => {
+            diag_write(&format!(
+                "try_silent_managed_upgrade: directory status IPC query failed: {:?}",
+                err
+            ));
+            false
+        }
+    };
+    if !ready {
+        return false;
+    }
+    let options_json = crate::ui_interface::install_options();
+    let options = crate::platform::windows::install_options_json_to_flags(&options_json);
+    let path = crate::ui_interface::install_path();
+
+    // The full manual-install flow (install_page.dart, the path this
+    // function exists to bypass) always calls this before install_me() -
+    // without it here too, install_me()'s XCOPY /C step can find
+    // librustdesk.dll still locked by the currently-running --server/GUI
+    // it was never told to stop, silently skip that one file, and report
+    // success anyway (confirmed in production, 2026-09-06: a device stayed
+    // on the old DLL through multiple "successful" installer runs with no
+    // visible error, only diagnosable from the fact that a brand-new
+    // staged copy in %LOCALAPPDATA% had the right file but Program Files
+    // never did). This call is itself a no-op with no UAC prompt if
+    // nothing is running yet (see its own is_self_service_running gate).
+    diag_write("try_silent_managed_upgrade: stopping running instance before install");
+    crate::platform::windows::stop_running_instance_before_install();
+
+    diag_write(&format!(
+        "try_silent_managed_upgrade: calling install_me options_json={:?} options={:?} path={:?}",
+        options_json, options, path
+    ));
+    // Runs in this (client) process, same as a normal manual install -
+    // install_me() self-elevates via a standard Windows UAC prompt when the
+    // caller isn't already elevated. That's expected and fine: this is
+    // meant to look like any other installer, not to bypass UAC.
+    match crate::platform::windows::install_me(&options, path, true, false) {
+        Ok(()) => {
+            diag_write("try_silent_managed_upgrade: install_me returned Ok");
+            // install_me() runs with silent=true here, so run_after_run_cmds()
+            // only restarts the tray process, never the visible main window -
+            // by design, for the ordinary "just refresh the files" case. But a
+            // managed client re-run *by a person* double-clicking the
+            // installer is exactly the opposite case: they're doing this to
+            // see it work. Without this, a successful update is completely
+            // silent - no window, nothing - indistinguishable from the
+            // installer having done nothing at all. Brad's explicit call:
+            // relaunch the actual app rather than show a popup - seeing it
+            // come back up is confirmation enough on its own.
+            let (_, _, _, exe) = crate::platform::windows::get_install_info();
+            diag_write(&format!(
+                "try_silent_managed_upgrade: relaunching main window at {:?}",
+                exe
+            ));
+            hbb_common::allow_err!(crate::platform::windows::run_exe_direct(&exe, vec![], true));
+            true
+        }
+        Err(err) => {
+            // Do not swallow this: falling through to the normal --install
+            // flow (full UI, prompts, and a UAC request the user can actually
+            // see and act on) is far better than exiting silently and leaving
+            // the user stuck on the old version with no explanation.
+            diag_write(&format!(
+                "try_silent_managed_upgrade: install_me FAILED, falling back to full install flow: {:?}",
+                err
+            ));
+            false
+        }
+    }
+}
+
 /// shared by flutter and sciter main function
 ///
 /// [Note]
@@ -41,6 +156,7 @@ pub fn core_main() -> Option<Vec<String>> {
     }
     let mut args = Vec::new();
     let mut flutter_args = Vec::new();
+    let managed_client = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some();
     let mut i = 0;
     let mut _is_elevate = false;
     let mut _is_run_as_system = false;
@@ -52,6 +168,13 @@ pub fn core_main() -> Option<Vec<String>> {
         if i == 0 {
             arg_exe = arg;
         } else if i > 0 {
+            if managed_client
+                && ["--view-camera", "--port-forward", "--terminal", "--rdp"]
+                    .contains(&arg.as_str())
+            {
+                log::warn!("Managed policy rejected unsupported launch mode: {}", arg);
+                return None;
+            }
             #[cfg(feature = "flutter")]
             if [
                 "--connect",
@@ -134,6 +257,32 @@ pub fn core_main() -> Option<Vec<String>> {
     if config::is_disable_installation() {
         args.retain(|arg| arg != "--install");
         flutter_args.retain(|arg| arg != "--install");
+    }
+    // Covers both paths that can land "--install" in args: click_setup above
+    // (direct double-click, no wrapper) and the portable wrapper passing it
+    // straight through as a real argument - either way, an already-installed
+    // and already-enrolled managed client just needs its files refreshed,
+    // not the full install UI.
+    #[cfg(windows)]
+    if args.contains(&"--install".to_string()) && try_silent_managed_upgrade(managed_client) {
+        return None;
+    }
+    // Fired every 5 minutes by the "{app} ServiceWatchdog" scheduled task
+    // (itself set up by install_me on Windows) - already running as SYSTEM,
+    // so this just checks/repairs the service and exits without ever
+    // reaching the Flutter UI.
+    #[cfg(windows)]
+    if args.contains(&"--service-watchdog".to_string()) {
+        crate::platform::windows::service_watchdog_check_and_fix();
+        return None;
+    }
+    // Manual override for the daily debug-log upload - see
+    // hbbs_http::directory_enrollment::debug_log_upload_once. Useful when
+    // someone has hands-on access to a machine and wants a fresh log
+    // without waiting on the background worker's own schedule.
+    if args.contains(&"--upload-debug-log".to_string()) {
+        crate::hbbs_http::directory_enrollment::debug_log_upload_once();
+        return None;
     }
     if args.len() > 0 {
         if args[0] == "--version" {
@@ -258,6 +407,30 @@ pub fn core_main() -> Option<Vec<String>> {
                     log::error!("Failed to after-install: {}", err);
                 }
                 return None;
+            } else if args[0] == "--managed-enrollment-handoff" {
+                #[cfg(feature = "flutter")]
+                {
+                    let exit_code =
+                        match crate::ui_interface::
+                            run_managed_directory_enrollment_handoff_from_stdin()
+                        {
+                            Ok(true) => 0,
+                            Ok(false) => 2,
+                            Err(err) => {
+                                log::error!(
+                                    "Managed enrollment handoff process failed: {}",
+                                    err
+                                );
+                                3
+                            }
+                        };
+                    std::process::exit(exit_code);
+                }
+
+                #[cfg(not(feature = "flutter"))]
+                {
+                    return None;
+                }
             } else if args[0] == "--before-uninstall" {
                 if let Err(err) = platform::run_before_uninstall() {
                     log::error!("Failed to before-uninstall: {}", err);
@@ -312,7 +485,7 @@ pub fn core_main() -> Option<Vec<String>> {
                 return None;
             } else if args[0] == "--install-remote-printer" {
                 #[cfg(windows)]
-                if crate::platform::is_win_10_or_greater() {
+                if crate::platform::is_win_10_or_greater() && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
                     match remote_printer::install_update_printer(&crate::get_app_name()) {
                         Ok(_) => {
                             log::info!("Remote printer installed/updated successfully");
@@ -700,6 +873,10 @@ pub fn core_main() -> Option<Vec<String>> {
             crate::ipc::hwcodec_process();
             return None;
         } else if args[0] == "--terminal-helper" {
+            if managed_client {
+                log::warn!("Managed policy rejected terminal helper launch");
+                return None;
+            }
             // Terminal helper process - runs as user to create ConPTY
             // This is needed because ConPTY has compatibility issues with CreateProcessAsUserW
             #[cfg(target_os = "windows")]
@@ -714,6 +891,41 @@ pub fn core_main() -> Option<Vec<String>> {
             // call connection manager to establish connections
             // meanwhile, return true to call flutter window to show control panel
             crate::ui_interface::start_option_status_sync();
+        } else if args[0] == "--rustdrop" {
+            // RustDrop's native UI: a separate top-level Flutter app in its
+            // own OS process, like --cm above, not a multi_window sub-window
+            // of the main app - so a bug in this newer, less-tested code
+            // can't take down a live remote-control session running in
+            // --server. Falls through like --cm: main.dart's own
+            // args.first == '--rustdrop' branch shows the RustDrop screen
+            // instead of the main window.
+            //
+            // Single-instance guard: main_launch_rustdrop()'s own check
+            // (check_process, a process-table scan) is a TOCTOU race - two
+            // near-simultaneous callers (e.g. two incoming-transfer
+            // notifications a few ms apart) can both see nothing running and
+            // both spawn. This is the real, atomic guard: claimed here, at
+            // the actual new process's own startup, so it holds regardless
+            // of how many callers raced to spawn it - see
+            // try_lock_rustdrop_single_instance's doc comment.
+            #[cfg(windows)]
+            if !crate::platform::windows::try_lock_rustdrop_single_instance() {
+                log::info!("Another RustDrop window is already running in this session, exit");
+                return None;
+            } else {
+                log::debug!(
+                    "try_lock_rustdrop_single_instance: acquired, pid={}",
+                    std::process::id()
+                );
+            }
+        } else if args[0] == "--cm-no-ui" {
+            #[cfg(feature = "flutter")]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                crate::ui_interface::start_option_status_sync();
+                crate::flutter::connection_manager::start_cm_no_ui();
+            }
+            return None;
         } else if args[0] == "--whiteboard" {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
@@ -743,11 +955,16 @@ fn import_config(path: &str) {
     let path = std::path::Path::new(path);
     log::info!("import config from {:?} and {:?}", path, path2);
     let config: Config = load_path(path.into());
+    // A fresh device's primary Config (id/keypair) is legitimately empty here -
+    // the keypair is generated lazily by the service on its first registration,
+    // not by the GUI/installer process writing this source file. That must not
+    // skip the *separate* Config2 import below (device options - including the
+    // managed-client's preset-device-name/email collected by the install form),
+    // which has no dependency on the keypair being present yet. These two
+    // imports need to be independent, not gated by a single early return.
     if config.is_empty() {
-        log::info!("Empty source config, skipped");
-        return;
-    }
-    if get_modified_time(&path) > get_modified_time(&Config::file())
+        log::info!("Empty source config, primary config import skipped");
+    } else if get_modified_time(&path) > get_modified_time(&Config::file())
         && get_modified_time(&path) < get_exe_time()
     {
         if store_path(Config::file(), config).is_err() {

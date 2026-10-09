@@ -227,8 +227,55 @@ fn is_windows_7() -> bool {
     false
 }
 
+// Nothing else records whether this wrapper got as far as starting the
+// extracted app. Same file and 5MB cap as the main crate's diag_write
+// (src/common.rs append_capped_diag_line), which this separate crate can't
+// call. The managed debug-log upload ships it, so only file names and the
+// leading mode flag go in: later arguments can be values such as a password,
+// and full paths include the user's profile directory.
+#[cfg(windows)]
+fn diag_write(msg: &str) {
+    use std::io::Write;
+    const DIAG_PATH: &str = "C:\\ProgramData\\rustdesk-ctrlaltdel-diag.txt";
+    const MAX_DIAG_BYTES: u64 = 5 * 1024 * 1024;
+
+    if std::fs::metadata(DIAG_PATH).map_or(false, |m| m.len() > MAX_DIAG_BYTES) {
+        let _ = std::fs::remove_file(DIAG_PATH);
+    }
+    let line = format!("[{:?}] {}\n", std::time::SystemTime::now(), msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DIAG_PATH)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(not(windows))]
+fn diag_write(_msg: &str) {}
+
+fn diag_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn diag_mode(args: &[String]) -> Option<&str> {
+    args.first()
+        .filter(|arg| arg.starts_with("--"))
+        .and_then(|arg| arg.split('=').next())
+}
+
 fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
     println!("executing {}", path.display());
+    diag_write(&format!(
+        "portable::execute: exe={:?} mode={:?} argc={} ui={}",
+        diag_file_name(&path),
+        diag_mode(&args),
+        args.len(),
+        _ui
+    ));
     // setup env
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_name = exe.file_name().unwrap_or_default();
@@ -255,6 +302,10 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
             .stderr(Stdio::inherit());
     }
     let _child = cmd.spawn();
+    match &_child {
+        Ok(child) => diag_write(&format!("portable::execute: spawn Ok pid={}", child.id())),
+        Err(e) => diag_write(&format!("portable::execute: spawn FAILED err={:?}", e)),
+    }
 
     #[cfg(windows)]
     if _ui {
@@ -287,15 +338,29 @@ fn main() -> Result<(), String> {
     #[cfg(not(windows))]
     let quick_support = false;
 
+    diag_write(&format!(
+        "portable::main: arg_exe={:?} mode={:?} argc={} click_setup={} quick_support={}",
+        diag_file_name(Path::new(&arg_exe)),
+        diag_mode(&args),
+        args.len(),
+        click_setup,
+        quick_support
+    ));
+
     let mut ui = false;
     let reader = BinaryReader::new()?;
-    if let Some(exe) = setup(
+    let setup_result = setup(
         reader,
         None,
         click_setup || args.contains(&"--silent-install".to_owned()),
         &args,
         &mut ui,
-    ) {
+    );
+    diag_write(&format!(
+        "portable::main: setup() returned {:?}",
+        setup_result.as_deref().map(diag_file_name)
+    ));
+    if let Some(exe) = setup_result {
         if click_setup {
             args = vec!["--install".to_owned()];
         } else if quick_support {

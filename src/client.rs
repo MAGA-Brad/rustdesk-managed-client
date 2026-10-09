@@ -424,6 +424,8 @@ impl Client {
         if config::is_incoming_only() && !is_switch_sides_back(conn_type, &interface).await {
             bail!("Incoming only mode");
         }
+        #[cfg(any(windows, target_os = "android"))]
+        refresh_managed_relay_fallback_delay().await;
         // to-do: remember the port for each peer, so that we can retry easier
         if hbb_common::is_ip_str(peer) {
             return Ok((
@@ -629,6 +631,13 @@ impl Client {
     /// restores the default instead of collapsing the delay and handing every race to the
     /// relay.
     fn relay_fallback_delay_ms() -> u64 {
+        #[cfg(any(windows, target_os = "android"))]
+        {
+            let managed = MANAGED_RELAY_FALLBACK_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if managed > 0 {
+                return managed;
+            }
+        }
         match LocalConfig::get_option(keys::OPTION_RELAY_FALLBACK_DELAY)
             .trim()
             .parse::<f64>()
@@ -677,6 +686,7 @@ impl Client {
         webrtc: WebRTCStream,
         peer: String,
         session_key: String,
+        signal_key: Option<crate::managed_sealed_signal::SignalKey>,
     ) -> oneshot::Sender<()> {
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -695,7 +705,11 @@ impl Client {
                                 msg.set_ice_candidate(IceCandidate {
                                     id: peer.clone(),
                                     session_key: session_key.clone(),
-                                    candidate,
+                                    candidate: crate::managed_sealed_signal::seal_outgoing(
+                                        &signal_key,
+                                        crate::managed_sealed_signal::TO_TARGET,
+                                        candidate,
+                                    ),
                                     ..Default::default()
                                 });
                                 // Bound the send so a stalled rendezvous socket cannot block the
@@ -756,9 +770,19 @@ impl Client {
                         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
                             if let Some(rendezvous_message::Union::IceCandidate(ice)) = msg_in.union
                             {
-                                if Self::is_expected_webrtc_ice_candidate(&ice, &session_key) {
+                                let candidate =
+                                    if Self::is_expected_webrtc_ice_candidate(&ice, &session_key) {
+                                        crate::managed_sealed_signal::open_incoming(
+                                            &signal_key,
+                                            crate::managed_sealed_signal::TO_CONTROLLER,
+                                            ice.candidate,
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
+                                if !candidate.is_empty() {
                                     if let Err(err) =
-                                        webrtc.add_remote_ice_candidate(&ice.candidate).await
+                                        webrtc.add_remote_ice_candidate(&candidate).await
                                     {
                                         if let Some(n) = REJECTED_ICE_LOG.due() {
                                             log::warn!(
@@ -811,7 +835,12 @@ impl Client {
         // into_inner() once the stream is adopted into a connection attempt.
         let mut webrtc_offerer = webrtc_offerer.map(OffererGuard::new);
         let mut start = Instant::now();
-        let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
+        let mut socket = crate::managed_ws_fallback::connect_rendezvous(
+            &rendezvous_server,
+            &key,
+            CONNECT_TIMEOUT,
+        )
+        .await;
         debug_assert!(!servers.contains(&rendezvous_server));
         let rtt = start.elapsed();
         log::debug!("TCP connection establishment time used: {:?}", rtt);
@@ -819,7 +848,9 @@ impl Client {
             log::info!("try the other servers: {:?}", servers);
             for server in servers {
                 let server = check_port(server, RENDEZVOUS_PORT);
-                socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
+                socket =
+                    crate::managed_ws_fallback::connect_rendezvous(&server, &key, CONNECT_TIMEOUT)
+                        .await;
                 if socket.is_ok() {
                     rendezvous_server = server;
                     break;
@@ -874,7 +905,7 @@ impl Client {
                 }
             }
         }
-        if !exchanged && legacy_secure {
+        if !exchanged && (legacy_secure || crate::rendezvous_encryption_required()) {
             secure_tcp(&mut socket, &key)
                 .await
                 .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
@@ -917,6 +948,11 @@ impl Client {
             .and_then(|g| g.stream())
             .map(|stream| stream.local_endpoint().to_owned())
             .unwrap_or_default();
+        let (webrtc_sdp_offer, signal_key) =
+            crate::managed_sealed_signal::seal_outgoing_offer(&peer, webrtc_sdp_offer).await;
+        if webrtc_sdp_offer.is_empty() {
+            webrtc_offerer = None;
+        }
         let allow_tcp_punch = tcp_punch_allowed() && request_allows_tcp_punch(&webrtc_sdp_offer);
         // Every direct transport this round carries, not one of them: a round can carry several
         // at once (a NAT port and an offer and a v6 address), and since the TCP punch became a
@@ -1016,7 +1052,11 @@ impl Client {
                             relay_server = ph.relay_server;
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
-                            webrtc_sdp_answer = ph.webrtc_sdp_answer;
+                            webrtc_sdp_answer = crate::managed_sealed_signal::open_incoming(
+                                &signal_key,
+                                crate::managed_sealed_signal::TO_CONTROLLER,
+                                ph.webrtc_sdp_answer,
+                            );
                             let s = udp.0.take();
                             if udp_nat_port > 0 && ph.is_udp && s.is_some() {
                                 if let Some(s) = s {
@@ -1038,7 +1078,12 @@ impl Client {
                             break 'punch_attempts;
                         }
                     }
-                    Some(rendezvous_message::Union::RelayResponse(rr)) => {
+                    Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
+                        rr.webrtc_sdp_answer = crate::managed_sealed_signal::open_incoming(
+                            &signal_key,
+                            crate::managed_sealed_signal::TO_CONTROLLER,
+                            std::mem::take(&mut rr.webrtc_sdp_answer),
+                        );
                         log::info!(
                             "relay requested from peer, time used: {:?}, relay_server: {}",
                             start.elapsed(),
@@ -1101,6 +1146,7 @@ impl Client {
                                         webrtc.clone(),
                                         peer.clone(),
                                         session_key,
+                                        signal_key.clone(),
                                     ));
                                     webrtc_for_connect = Some(webrtc);
                                 }
@@ -1270,7 +1316,14 @@ impl Client {
                                 }
                                 pending_webrtc_ice.remove(0);
                             }
-                            pending_webrtc_ice.push(ice.candidate);
+                            let candidate = crate::managed_sealed_signal::open_incoming(
+                                &signal_key,
+                                crate::managed_sealed_signal::TO_CONTROLLER,
+                                ice.candidate,
+                            );
+                            if !candidate.is_empty() {
+                                pending_webrtc_ice.push(candidate);
+                            }
                         } else if let Some(n) = UNEXPECTED_ICE_LOG.due() {
                             log::debug!(
                                 "dropped {} ICE candidate(s) for unexpected WebRTC session key, last: {}",
@@ -1316,6 +1369,7 @@ impl Client {
                         webrtc.clone(),
                         peer.clone(),
                         session_key,
+                        signal_key.clone(),
                     ));
                     webrtc_for_connect = Some(webrtc);
                 } else {
@@ -1791,11 +1845,16 @@ impl Client {
 
         for i in 1..=3 {
             // use different socket due to current hbbs implementation requiring different nat address for each attempt
-            let mut socket = connect_tcp(rendezvous_server, CONNECT_TIMEOUT)
-                .await
-                .with_context(|| "Failed to connect to rendezvous server")?;
+            let mut socket =
+                crate::managed_ws_fallback::connect_rendezvous(rendezvous_server, key, CONNECT_TIMEOUT)
+                    .await
+                    .with_context(|| "Failed to connect to rendezvous server")?;
 
-            if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
+            if !key.is_empty()
+                && (!token.is_empty()
+                    || !switch_code.is_empty()
+                    || crate::rendezvous_encryption_required())
+            {
                 secure_tcp(&mut socket, key).await?;
             }
 
@@ -1848,8 +1907,8 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
-        let mut conn = connect_tcp(
-            ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
+        let mut conn = crate::managed_ws_fallback::connect_relay(
+            &ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,
         )
         .await
@@ -3024,7 +3083,8 @@ impl LoginConfigHandler {
         self.selected_windows_session_id = None;
         self.shared_password = shared_password;
         self.record_state = false;
-        self.record_permission = true;
+        // Managed builds never record sessions.
+        self.record_permission = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none();
 
         // `std::env::remove_var("IS_TERMINAL_ADMIN");` is called in `session_add_sync()` - `flutter_ffi.rs`.
         let is_terminal_admin = conn_type == ConnType::TERMINAL
@@ -4798,11 +4858,100 @@ async fn send_login(
     password: Vec<u8>,
     peer: &mut Stream,
 ) {
-    let msg_out = lc
+    #[allow(unused_mut)]
+    let mut msg_out = lc
         .read()
         .unwrap()
         .create_login_msg(os_username, os_password, password);
+    #[cfg(any(windows, target_os = "android"))]
+    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {
+        let my_id = lr.my_id.clone();
+        if let Some(proof) = managed_peer_proof(&lc, &my_id).await {
+            lr.managed_peer_proof = proof.into();
+        }
+    }
     allow_err!(peer.send(&msg_out).await);
+}
+
+/// Managed builds: RDS's relay fallback delay (Config page -> Remote Connections), refreshed
+/// from the service at the start of each connection; 0 = not known, use the local setting.
+#[cfg(any(windows, target_os = "android"))]
+static MANAGED_RELAY_FALLBACK_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(windows, target_os = "android"))]
+async fn refresh_managed_relay_fallback_delay() {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        return;
+    }
+    #[cfg(windows)]
+    let info = crate::ipc::query_managed_peer_auth(String::new()).await.ok();
+    // Android: the directory worker runs in this process.
+    #[cfg(target_os = "android")]
+    let info = Some(crate::managed_peer_auth::directory_info(""));
+    if let Some(info) = info {
+        if info.relay_fallback_delay_ms > 0 {
+            MANAGED_RELAY_FALLBACK_DELAY_MS
+                .store(info.relay_fallback_delay_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        MANAGED_WEBRTC.store(info.webrtc, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Managed builds: whether RDS has WebRTC on for this device (Config page -> Remote Connections),
+/// refreshed with the relay fallback delay at the start of each connection. Off until RDS says.
+#[cfg(any(windows, target_os = "android"))]
+static MANAGED_WEBRTC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Managed builds decide WebRTC from RDS, never from the local setting.
+pub(crate) fn managed_webrtc_enabled() -> Option<bool> {
+    #[cfg(any(windows, target_os = "android"))]
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return Some(MANAGED_WEBRTC.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    None
+}
+
+/// Managed builds: this device's RDS certificate proof for logging in to the peer that sent
+/// `lc.hash` (see managed_peer_auth.rs). The local --server signs it - it holds the device key; on
+/// Android there is only the app process, which holds the key itself.
+#[cfg(any(windows, target_os = "android"))]
+async fn managed_peer_proof(lc: &Arc<RwLock<LoginConfigHandler>>, my_id: &str) -> Option<Vec<u8>> {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        return None;
+    }
+    let (challenge, controlled_id, session_id) = {
+        let lc = lc.read().unwrap();
+        let id = lc
+            .id
+            .split(|c| c == '@' || c == '/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        (lc.hash.challenge.clone(), id, lc.session_id)
+    };
+    #[cfg(target_os = "android")]
+    {
+        let proof = crate::managed_peer_auth::build_proof(&challenge, &controlled_id, my_id, session_id);
+        if proof.is_none() {
+            log::warn!("managed peer auth: no device certificate available; logging in without proof");
+        }
+        return proof;
+    }
+    #[cfg(windows)]
+    match crate::ipc::request_managed_peer_proof(challenge, controlled_id, my_id.to_owned(), session_id)
+        .await
+    {
+        Ok(Some(proof)) => Some(proof),
+        Ok(None) => {
+            log::warn!("managed peer auth: no device certificate available; logging in without proof");
+            None
+        }
+        Err(err) => {
+            log::warn!("managed peer auth: login proof unavailable: {}", err);
+            None
+        }
+    }
 }
 
 /// Handle login request made from ui.
@@ -4855,16 +5004,24 @@ async fn send_switch_login_request(
     peer: &mut Stream,
     uuid: Uuid,
 ) {
+    #[allow(unused_mut)]
+    let mut lr = lc
+        .read()
+        .unwrap()
+        .create_login_msg("".to_owned(), "".to_owned(), vec![])
+        .login_request()
+        .to_owned();
+    #[cfg(any(windows, target_os = "android"))]
+    {
+        let my_id = lr.my_id.clone();
+        if let Some(proof) = managed_peer_proof(&lc, &my_id).await {
+            lr.managed_peer_proof = proof.into();
+        }
+    }
     let mut msg_out = Message::new();
     msg_out.set_switch_sides_response(SwitchSidesResponse {
         uuid: Bytes::from(uuid.as_bytes().to_vec()),
-        lr: hbb_common::protobuf::MessageField::some(
-            lc.read()
-                .unwrap()
-                .create_login_msg("".to_owned(), "".to_owned(), vec![])
-                .login_request()
-                .to_owned(),
-        ),
+        lr: hbb_common::protobuf::MessageField::some(lr),
         ..Default::default()
     });
     allow_err!(peer.send(&msg_out).await);
@@ -5009,6 +5166,16 @@ pub async fn confirm_insecure_connection(
     interface: &impl Interface,
     receiver: &mut UnboundedReceiver<Data>,
 ) -> bool {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        log::error!("refusing connection: end-to-end encryption could not be established");
+        interface.msgbox(
+            "error",
+            "Insecure Connection",
+            "End-to-end encryption could not be established, so the connection was refused.",
+            "",
+        );
+        return false;
+    }
     interface.msgbox(
         "insecure-connection-nocancel-hasclose",
         "Insecure Connection",
@@ -5220,7 +5387,6 @@ mod port_forward_mux_tests {
         assert!(asks(&lc));
     }
 }
-
 pub async fn hc_connection(
     feedback: i32,
     rendezvous_server: String,
@@ -5313,12 +5479,27 @@ pub mod peer_online {
             f(onlines, offlines)
         } else {
             let query_timeout = std::time::Duration::from_millis(3_000);
-            match query_online_states_(&ids, query_timeout).await {
+            let result = if crate::rendezvous_encryption_required() {
+                query_online_states_kept(&ids, query_timeout).await
+            } else {
+                query_online_states_(&ids, query_timeout).await
+            };
+            match result {
                 Ok((onlines, offlines)) => {
                     f(onlines, offlines);
                 }
                 Err(e) => {
                     log::debug!("query onlines, {}", &e);
+                    // A timeout/protocol error (as opposed to the immediate
+                    // connect/send failures already handled inside
+                    // query_online_states_, which report all-offline) used
+                    // to fall through here without ever calling `f`, leaving
+                    // the UI's last-known online states cached forever - so a
+                    // peer that was online before this client lost its own
+                    // connection to the server kept showing as online
+                    // indefinitely. Treat any failure to get a definitive
+                    // answer the same way: report every queried peer offline.
+                    f(vec![], ids);
                 }
             }
         }
@@ -5327,6 +5508,17 @@ pub mod peer_online {
     async fn create_online_stream() -> ResultType<Stream> {
         let (rendezvous_server, _servers, _contained) =
             crate::get_rendezvous_server(READ_TIMEOUT).await;
+        // Managed builds ask on hbbs's main, key-exchanged connection (with its 443 fallback):
+        // the separate NAT-test port below is blocked on some networks, and every failed query
+        // shows the whole peer list offline.
+        if crate::rendezvous_encryption_required() {
+            return crate::managed_ws_fallback::connect_rendezvous(
+                &rendezvous_server,
+                &crate::get_key(true).await,
+                CONNECT_TIMEOUT,
+            )
+            .await;
+        }
         let tmp: Vec<&str> = rendezvous_server.split(":").collect();
         if tmp.len() != 2 {
             bail!("Invalid server address: {}", rendezvous_server);
@@ -5406,6 +5598,93 @@ pub mod peer_online {
             }
         }
 
+        bail!("Failed to query online states, no online response");
+    }
+
+    /// Managed builds keep the key-exchanged online-status connection between queries, so a peer
+    /// list refreshing every few seconds doesn't open, key-exchange and prove a new connection
+    /// each time. The managed hbbs keeps it open after answering and drops it after 30 s idle.
+    static KEPT_ONLINE_STREAM: std::sync::Mutex<Option<(Stream, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    const KEEP_ONLINE_STREAM_FOR: std::time::Duration = std::time::Duration::from_secs(20);
+
+    async fn query_online_states_kept(
+        ids: &Vec<String>,
+        timeout: std::time::Duration,
+    ) -> ResultType<(Vec<String>, Vec<String>)> {
+        for attempt in 0..2 {
+            let kept = if attempt == 0 {
+                KEPT_ONLINE_STREAM
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .filter(|(_, used)| used.elapsed() < KEEP_ONLINE_STREAM_FOR)
+            } else {
+                None
+            };
+            let reused = kept.is_some();
+            let mut socket = match kept {
+                Some((socket, _)) => socket,
+                None => match create_online_stream().await {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        log::debug!("Failed to create peers online stream, {e}");
+                        return Ok((vec![], ids.clone()));
+                    }
+                },
+            };
+            match ask_online_states(&mut socket, ids, timeout).await {
+                Ok(states) => {
+                    *KEPT_ONLINE_STREAM.lock().unwrap() = Some((socket, std::time::Instant::now()));
+                    return Ok(states);
+                }
+                // The kept connection was closed meanwhile (an older hbbs closes after each
+                // answer): ask once more on a new one.
+                Err(e) if reused => log::debug!("kept online stream gone, reconnecting: {e}"),
+                Err(e) => return Err(e),
+            }
+        }
+        bail!("Failed to query online states, no online response");
+    }
+
+    async fn ask_online_states(
+        socket: &mut Stream,
+        ids: &Vec<String>,
+        timeout: std::time::Duration,
+    ) -> ResultType<(Vec<String>, Vec<String>)> {
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_online_request(OnlineRequest {
+            id: Config::get_id(),
+            peers: ids.clone(),
+            ..Default::default()
+        });
+        socket.send(&msg_out).await?;
+        for _ in 0..2 {
+            let Some(msg_in) =
+                crate::get_next_nonkeyexchange_msg(socket, Some(timeout.as_millis() as _)).await
+            else {
+                bail!("Online stream receives None");
+            };
+            if let Some(rendezvous_message::Union::OnlineResponse(online_response)) = msg_in.union {
+                let states = online_response.states;
+                let required_len = ids.len().div_ceil(u8::BITS as usize);
+                if states.len() < required_len {
+                    bail!(
+                        "Invalid online response: expected at least {required_len} state bytes, got {}",
+                        states.len()
+                    );
+                }
+                let (mut onlines, mut offlines) = (Vec::new(), Vec::new());
+                for (i, id) in ids.iter().enumerate() {
+                    if states[i / 8] & (0x01 << (7 - i % 8)) != 0 {
+                        onlines.push(id.clone());
+                    } else {
+                        offlines.push(id.clone());
+                    }
+                }
+                return Ok((onlines, offlines));
+            }
+        }
         bail!("Failed to query online states, no online response");
     }
 

@@ -102,6 +102,8 @@ pub struct Remote<T: InvokeUiSession> {
     last_record_state: bool,
     sent_close_reason: bool,
     cursor_dedupe: CursorDedupe,
+    #[cfg(any(windows, target_os = "android"))]
+    managed_report: Option<crate::managed_connection_report::ConnectionReport>,
 }
 
 #[derive(Default)]
@@ -154,6 +156,8 @@ impl<T: InvokeUiSession> Remote<T> {
             last_record_state: false,
             sent_close_reason: false,
             cursor_dedupe: Default::default(),
+            #[cfg(any(windows, target_os = "android"))]
+            managed_report: None,
         }
     }
 
@@ -191,6 +195,8 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
+        #[cfg(any(windows, target_os = "android"))]
+        let connect_started = Instant::now();
         match Client::start(
             &self.handler.get_id(),
             key,
@@ -217,8 +223,24 @@ impl<T: InvokeUiSession> Remote<T> {
                 };
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
+                #[cfg(any(windows, target_os = "android"))]
+                {
+                    let session_id = self.handler.lc.read().unwrap().session_id;
+                    self.managed_report = crate::managed_connection_report::ConnectionReport::new(
+                        session_id,
+                        round,
+                        &self.handler.get_id(),
+                        self.handler.is_file_transfer(),
+                        self.handler.is_default(),
+                        direct,
+                        stream_type,
+                        connect_started.elapsed().as_millis() as u64,
+                        Client::relay_fallback_delay_ms(),
+                    );
+                }
                 if !is_secured
-                    && !crate::common::is_direct_ip_access(&self.handler.get_id())
+                    && (option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+                        || !crate::common::is_direct_ip_access(&self.handler.get_id()))
                     && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
                 {
                     self.send_close_reason(&mut peer, "").await;
@@ -426,6 +448,10 @@ impl<T: InvokeUiSession> Remote<T> {
             Err(err) => {
                 self.handler.on_establish_connection_error(err.to_string());
             }
+        }
+        #[cfg(any(windows, target_os = "android"))]
+        if let Some(mut report) = self.managed_report.take() {
+            report.ended();
         }
         self.handle_disconnected(round);
     }
@@ -1595,6 +1621,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         self.handler.handle_peer_info(pi);
+                        #[cfg(any(windows, target_os = "android"))]
+                        if let Some(report) = self.managed_report.as_mut() {
+                            report.established();
+                        }
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
                         self.check_clipboard_file_context();
                         if self.handler.is_default() {
@@ -2034,10 +2064,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
                 Some(message::Union::Misc(misc)) => match misc.union {
                     Some(misc::Union::AudioFormat(f)) => {
-                        self.audio_sender.send(MediaData::AudioFormat(f)).ok();
+                        // Managed builds never play the remote device's audio.
+                        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+                            self.audio_sender.send(MediaData::AudioFormat(f)).ok();
+                        }
                     }
                     Some(misc::Union::ChatMessage(c)) => {
-                        self.handler.new_message(c.text);
+                        // Managed builds have no in-session text chat.
+                        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+                            self.handler.new_message(c.text);
+                        }
                     }
                     Some(misc::Union::PermissionInfo(p)) => {
                         log::info!("Change permission {:?} -> {}", p.permission, p.enabled);
@@ -2083,7 +2119,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.set_permission("restart", p.enabled);
                             }
                             Ok(Permission::Recording) => {
-                                self.handler.lc.write().unwrap().record_permission = p.enabled;
+                                self.handler.lc.write().unwrap().record_permission =
+                                    p.enabled && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none();
                                 self.update_record_state();
                                 self.handler.set_permission("recording", p.enabled);
                             }
@@ -2244,10 +2281,14 @@ impl<T: InvokeUiSession> Remote<T> {
                     _ => {}
                 },
                 Some(message::Union::TestDelay(t)) => {
+                    #[cfg(any(windows, target_os = "android"))]
+                    if let Some(report) = self.managed_report.as_mut() {
+                        report.note_delay(t.last_delay);
+                    }
                     self.handler.handle_test_delay(t, peer).await;
                 }
                 Some(message::Union::AudioFrame(frame)) => {
-                    if !self.handler.lc.read().unwrap().disable_audio.v {
+                    if !self.handler.lc.read().unwrap().disable_audio.v && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
                         self.audio_sender
                             .send(MediaData::AudioFrame(Box::new(frame)))
                             .ok();

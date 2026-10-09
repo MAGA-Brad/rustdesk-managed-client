@@ -24,27 +24,22 @@ class PeerTabModel with ChangeNotifier {
   int _currentTab = 0; // index in tabNames
   static const int maxTabCount = 5;
   static const List<String> tabNames = [
-    'Recent sessions',
+    'History',
     'Favorites',
-    'Discovered',
+    'Directory',
     'Address book',
     'Accessible devices',
   ];
   static const List<IconData> icons = [
     Icons.access_time_filled,
     Icons.star,
-    Icons.explore,
+    Icons.menu_book_rounded,
     IconFont.addressBook,
     IconFont.deviceGroupFill,
   ];
-  List<bool> isEnabled = List.from([
-    true,
-    true,
-    !isWeb && bind.mainGetLocalOption(key: "disable-discovery-panel") != "Y",
-    !(bind.isDisableAb() || bind.isDisableAccount()),
-    !(bind.isDisableGroupPanel() || bind.isDisableAccount()),
-  ]);
-  final List<bool> _isVisible = List.filled(maxTabCount, true, growable: false);
+  List<bool> isEnabled = List.from([true, true, true, false, false]);
+  final List<bool> _isVisible =
+      List<bool>.from([true, true, true, false, false], growable: false);
   List<bool> get isVisibleEnabled => () {
         final list = _isVisible.toList();
         for (int i = 0; i < maxTabCount; i++) {
@@ -68,9 +63,19 @@ class PeerTabModel with ChangeNotifier {
   String get lastId => _lastId;
 
   PeerTabModel(this.parent) {
+    final managedDirectory =
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
+    if (managedDirectory) {
+      // Managed clients are driven entirely by the directory - there's no
+      // manual "type in an ID" workflow for History to track, so hide it.
+      isEnabled[PeerTabIndex.recent.index] = false;
+      _isVisible[PeerTabIndex.recent.index] = false;
+    }
     // visible
     try {
-      final option = bind.getLocalFlutterOption(k: kOptionPeerTabVisible);
+      final option = managedDirectory
+          ? ''
+          : bind.crateFlutterFfiGetLocalFlutterOption(k: kOptionPeerTabVisible);
       if (option.isNotEmpty) {
         List<dynamic> decodeList = jsonDecode(option);
         if (decodeList.length == _isVisible.length) {
@@ -86,7 +91,9 @@ class PeerTabModel with ChangeNotifier {
     }
     // order
     try {
-      final option = bind.getLocalFlutterOption(k: kOptionPeerTabOrder);
+      final option = managedDirectory
+          ? ''
+          : bind.crateFlutterFfiGetLocalFlutterOption(k: kOptionPeerTabOrder);
       if (option.isNotEmpty) {
         List<dynamic> decodeList = jsonDecode(option);
         if (decodeList.length == maxTabCount) {
@@ -109,15 +116,16 @@ class PeerTabModel with ChangeNotifier {
       debugPrint("failed to get peer tab order list: $e");
     }
     // init currentTab
-    _currentTab =
-        int.tryParse(bind.getLocalFlutterOption(k: kOptionPeerTabIndex)) ?? 0;
+    _currentTab = int.tryParse(bind.crateFlutterFfiGetLocalFlutterOption(
+            k: kOptionPeerTabIndex)) ??
+        0;
     if (_currentTab < 0 || _currentTab >= maxTabCount) {
       _currentTab = 0;
     }
     _trySetCurrentTabToFirstVisibleEnabled();
   }
 
-  setCurrentTab(int index) {
+  void setCurrentTab(int index) {
     if (_currentTab != index) {
       _currentTab = index;
       notifyListeners();
@@ -138,7 +146,7 @@ class PeerTabModel with ChangeNotifier {
     return Icons.help;
   }
 
-  setMultiSelectionMode(bool mode) {
+  void setMultiSelectionMode(bool mode) {
     _multiSelectionMode = mode;
     if (!mode) {
       _selectedPeers.clear();
@@ -147,7 +155,7 @@ class PeerTabModel with ChangeNotifier {
     notifyListeners();
   }
 
-  select(Peer peer) {
+  void select(Peer peer) {
     if (!_multiSelectionMode) {
       // https://github.com/flutter/flutter/issues/101275#issuecomment-1604541700
       // After onTap, the shift key should be pressed for a while when not in multiselection mode,
@@ -187,7 +195,7 @@ class PeerTabModel with ChangeNotifier {
   // `notifyListeners()` will cause many rebuilds.
   // So, we need to reduce the calls to "notifyListeners()" only when necessary.
   // A better way is to use a new model.
-  setCurrentTabCachedPeers(List<Peer> peers) {
+  void setCurrentTabCachedPeers(List<Peer> peers) {
     Future.delayed(Duration.zero, () {
       final isPreEmpty = _currentTabCachedPeers.isEmpty;
       _currentTabCachedPeers = peers;
@@ -198,7 +206,7 @@ class PeerTabModel with ChangeNotifier {
     });
   }
 
-  selectAll() {
+  void selectAll() {
     _selectedPeers = _currentTabCachedPeers.toList();
     notifyListeners();
   }
@@ -207,7 +215,7 @@ class PeerTabModel with ChangeNotifier {
     return selectedPeers.firstWhereOrNull((p) => p.id == id) != null;
   }
 
-  setShiftDown(bool v) {
+  void setShiftDown(bool v) {
     if (_isShiftDown != v) {
       _isShiftDown = v;
       if (_multiSelectionMode) {
@@ -216,7 +224,7 @@ class PeerTabModel with ChangeNotifier {
     }
   }
 
-  setTabVisible(int index, bool visible) {
+  void setTabVisible(int index, bool visible) {
     if (index >= 0 && index < maxTabCount) {
       if (_isVisible[index] != visible) {
         _isVisible[index] = visible;
@@ -226,7 +234,7 @@ class PeerTabModel with ChangeNotifier {
           _currentTab = index;
         }
         try {
-          bind.setLocalFlutterOption(
+          bind.crateFlutterFfiSetLocalFlutterOption(
               k: kOptionPeerTabVisible, v: jsonEncode(_isVisible));
         } catch (_) {}
         notifyListeners();
@@ -234,7 +242,7 @@ class PeerTabModel with ChangeNotifier {
     }
   }
 
-  _trySetCurrentTabToFirstVisibleEnabled() {
+  void _trySetCurrentTabToFirstVisibleEnabled() {
     if (!visibleEnabledOrderedIndexs.contains(_currentTab)) {
       if (visibleEnabledOrderedIndexs.isNotEmpty) {
         _currentTab = visibleEnabledOrderedIndexs.first;
@@ -242,7 +250,7 @@ class PeerTabModel with ChangeNotifier {
     }
   }
 
-  reorder(int oldIndex, int newIndex) {
+  void reorder(int oldIndex, int newIndex) {
     if (oldIndex < newIndex) {
       newIndex -= 1;
     }
@@ -263,7 +271,8 @@ class PeerTabModel with ChangeNotifier {
       for (int i = 0; i < list.length; i++) {
         orders[i] = list[i];
       }
-      bind.setLocalFlutterOption(k: kOptionPeerTabOrder, v: jsonEncode(orders));
+      bind.crateFlutterFfiSetLocalFlutterOption(
+          k: kOptionPeerTabOrder, v: jsonEncode(orders));
       notifyListeners();
     }
   }

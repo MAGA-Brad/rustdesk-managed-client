@@ -31,7 +31,7 @@ final Map<String, bool> closeSessionOnDispose = {};
 
 class ViewCameraPage extends StatefulWidget {
   ViewCameraPage({
-    Key? key,
+    super.key,
     required this.id,
     required this.toolbarState,
     this.sessionId,
@@ -43,7 +43,7 @@ class ViewCameraPage extends StatefulWidget {
     this.connToken,
     this.forceRelay,
     this.isSharedPassword,
-  }) : super(key: key) {
+  }) {
     initSharedStates(id);
   }
 
@@ -105,8 +105,8 @@ class _ViewCameraPageState extends State<ViewCameraPage>
     _ffi.imageModel.addCallbackOnFirstImage((String peerId) {
       showKBLayoutTypeChooserIfNeeded(
           _ffi.ffiModel.pi.platform, _ffi.dialogManager);
-      _ffi.recordingModel
-          .updateStatus(bind.sessionGetIsRecording(sessionId: _ffi.sessionId));
+      _ffi.recordingModel.updateStatus(
+          bind.crateFlutterFfiSessionGetIsRecording(sessionId: _ffi.sessionId));
     });
     _ffi.start(
       widget.id,
@@ -314,7 +314,7 @@ class _ViewCameraPageState extends State<ViewCameraPage>
     }
 
     return Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.background,
+      backgroundColor: Theme.of(context).colorScheme.surface,
       body: Obx(() {
         final imageReady = _ffi.ffiModel.pi.isSet.isTrue &&
             _ffi.ffiModel.waitForFirstImage.isFalse;
@@ -443,9 +443,13 @@ class _ViewCameraPageState extends State<ViewCameraPage>
   Widget getBodyForDesktop(BuildContext context) {
     var paints = <Widget>[
       MouseRegion(onEnter: (evt) {
-        if (!isWeb) bind.hostStopSystemKeyPropagate(stopped: false);
+        if (!isWeb) {
+          bind.crateFlutterFfiHostStopSystemKeyPropagate(stopped: false);
+        }
       }, onExit: (evt) {
-        if (!isWeb) bind.hostStopSystemKeyPropagate(stopped: true);
+        if (!isWeb) {
+          bind.crateFlutterFfiHostStopSystemKeyPropagate(stopped: true);
+        }
       }, child: LayoutBuilder(builder: (context, constraints) {
         final c = Provider.of<CanvasModel>(context, listen: false);
         Future.delayed(Duration.zero, () => c.updateViewStyle());
@@ -491,12 +495,11 @@ class ImagePaint extends StatefulWidget {
   final Widget Function(Widget)? listenerBuilder;
 
   ImagePaint(
-      {Key? key,
+      {super.key,
       required this.ffi,
       required this.id,
       required this.cursorOverImage,
-      this.listenerBuilder})
-      : super(key: key);
+      this.listenerBuilder});
 
   @override
   State<StatefulWidget> createState() => _ImagePaintState();

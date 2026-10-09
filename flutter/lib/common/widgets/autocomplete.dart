@@ -123,7 +123,8 @@ class AllPeersLoader {
   AllPeersLoader({
     @visibleForTesting Future<void> Function(List<String> ids)? queryOnlines,
     @visibleForTesting Duration? queryOnlineDebounce,
-  })  : _queryOnlines = queryOnlines ?? ((ids) => bind.queryOnlines(ids: ids)),
+  })  : _queryOnlines = queryOnlines ??
+            ((ids) => bind.crateFlutterFfiQueryOnlines(ids: ids)),
         _queryOnlineDebounce =
             queryOnlineDebounce ?? _defaultQueryOnlineDebounce;
 
@@ -159,10 +160,10 @@ class AllPeersLoader {
     _isPeersLoading = true;
 
     if (gFFI.recentPeersModel.peers.isEmpty) {
-      bind.mainLoadRecentPeers();
+      bind.crateFlutterFfiMainLoadRecentPeers();
     }
     if (gFFI.lanPeersModel.peers.isEmpty) {
-      bind.mainLoadLanPeers();
+      bind.crateFlutterFfiMainLoadLanPeers();
     }
     // No need to care about peers from abModel, and group model.
     // Because they will pull data in `refreshCurrentUser()` on startup.
@@ -283,10 +284,10 @@ class AutocompletePeerTile extends StatefulWidget {
   final Peer peer;
 
   const AutocompletePeerTile({
-    Key? key,
+    super.key,
     required this.onSelect,
     required this.peer,
-  }) : super(key: key);
+  });
 
   @override
   AutocompletePeerTileState createState() => AutocompletePeerTileState();
@@ -308,7 +309,11 @@ class AutocompletePeerTileState extends State<AutocompletePeerTile> {
         '${widget.peer.username}${widget.peer.username.isNotEmpty && widget.peer.hostname.isNotEmpty ? '@' : ''}${widget.peer.hostname}';
     final greyStyle = TextStyle(
         fontSize: 11,
-        color: Theme.of(context).textTheme.titleLarge?.color?.withOpacity(0.6));
+        color: Theme.of(context)
+            .textTheme
+            .titleLarge
+            ?.color
+            ?.withValues(alpha: 0.6));
     final child = GestureDetector(
         onTap: () => widget.onSelect(),
         child: Padding(
@@ -339,7 +344,7 @@ class AutocompletePeerTileState extends State<AutocompletePeerTile> {
                       child: Container(
                           padding: EdgeInsets.only(left: 10),
                           decoration: BoxDecoration(
-                            color: Theme.of(context).colorScheme.background,
+                            color: Theme.of(context).colorScheme.surface,
                             borderRadius: BorderRadius.only(
                               topRight: Radius.circular(tileRadius),
                               bottomRight: Radius.circular(tileRadius),

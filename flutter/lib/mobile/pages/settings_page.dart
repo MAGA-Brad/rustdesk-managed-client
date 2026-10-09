@@ -30,7 +30,8 @@ class SettingsPage extends StatefulWidget implements PageShape {
   final icon = Icon(Icons.settings);
 
   @override
-  final appBarActions = bind.isDisableSettings() ? [] : [ScanButton()];
+  final appBarActions =
+      bind.crateFlutterFfiIsDisableSettings() ? [] : [ScanButton()];
 
   @override
   State<SettingsPage> createState() => _SettingsState();
@@ -108,40 +109,63 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _preventSleepWhileConnected = true;
 
   _SettingsState() {
-    _enableAbr = option2bool(
-        kOptionEnableAbr, bind.mainGetOptionSync(key: kOptionEnableAbr));
+    _enableAbr = option2bool(kOptionEnableAbr,
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionEnableAbr));
     _denyLANDiscovery = !option2bool(kOptionEnableLanDiscovery,
-        bind.mainGetOptionSync(key: kOptionEnableLanDiscovery));
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionEnableLanDiscovery));
     _onlyWhiteList = whitelistNotEmpty();
     _onlyIdWhiteList = idWhitelistNotEmpty();
-    _enableDirectIPAccess = option2bool(
-        kOptionDirectServer, bind.mainGetOptionSync(key: kOptionDirectServer));
+    _enableDirectIPAccess = option2bool(kOptionDirectServer,
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionDirectServer));
     _enableRecordSession = option2bool(kOptionEnableRecordSession,
-        bind.mainGetOptionSync(key: kOptionEnableRecordSession));
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionEnableRecordSession));
     _enableHardwareCodec = option2bool(kOptionEnableHwcodec,
-        bind.mainGetOptionSync(key: kOptionEnableHwcodec));
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionEnableHwcodec));
     _allowWebSocket = mainGetBoolOptionSync(kOptionAllowWebSocket);
     _allowInsecureTlsFallback =
         mainGetBoolOptionSync(kOptionAllowInsecureTLSFallback);
-    _disableUdp = bind.mainGetOptionSync(key: kOptionDisableUdp) == 'Y';
-    _autoRecordIncomingSession = option2bool(kOptionAllowAutoRecordIncoming,
-        bind.mainGetOptionSync(key: kOptionAllowAutoRecordIncoming));
-    _autoRecordOutgoingSession = option2bool(kOptionAllowAutoRecordOutgoing,
-        bind.mainGetLocalOption(key: kOptionAllowAutoRecordOutgoing));
-    _localIP = bind.mainGetOptionSync(key: 'local-ip-addr');
-    _directAccessPort = bind.mainGetOptionSync(key: kOptionDirectAccessPort);
+    _disableUdp =
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionDisableUdp) == 'Y';
+    _autoRecordIncomingSession = option2bool(
+        kOptionAllowAutoRecordIncoming,
+        bind.crateFlutterFfiMainGetOptionSync(
+            key: kOptionAllowAutoRecordIncoming));
+    _autoRecordOutgoingSession = option2bool(
+        kOptionAllowAutoRecordOutgoing,
+        bind.crateFlutterFfiMainGetLocalOption(
+            key: kOptionAllowAutoRecordOutgoing));
+    _localIP = bind.crateFlutterFfiMainGetOptionSync(key: 'local-ip-addr');
+    _directAccessPort =
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionDirectAccessPort);
     _allowAutoDisconnect = option2bool(kOptionAllowAutoDisconnect,
-        bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
-    _autoDisconnectTimeout =
-        bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
-    _hideServer =
-        bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
-    _hideProxy = bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
-    _hideNetwork =
-        bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) == 'Y';
-    _hideWebSocket =
-        bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y' ||
-            isWeb;
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionAllowAutoDisconnect));
+    _autoDisconnectTimeout = bind.crateFlutterFfiMainGetOptionSync(
+        key: kOptionAutoDisconnectTimeout);
+    // Managed clients hide the Server/Proxy fields the same way the desktop
+    // settings page does (see desktop_setting_page.dart's network()) -
+    // letting a fleet user point their own client at an arbitrary server or
+    // proxy would break their managed connection with no easy way back.
+    final isManagedClient =
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
+    _hideServer = isManagedClient ||
+        bind.crateFlutterFfiMainGetBuildinOption(
+                key: kOptionHideServerSetting) ==
+            'Y';
+    _hideProxy = isManagedClient ||
+        bind.crateFlutterFfiMainGetBuildinOption(
+                key: kOptionHideProxySetting) ==
+            'Y';
+    _hideNetwork = bind.crateFlutterFfiMainGetBuildinOption(
+            key: kOptionHideNetworkSetting) ==
+        'Y';
+    // Managed clients must stay on the UDP registration path - the managed
+    // server's hbbs rejects RegisterPk over TCP/websocket at the protocol level, so
+    // a user flipping this on would silently break their own connection.
+    _hideWebSocket = isManagedClient ||
+        bind.crateFlutterFfiMainGetBuildinOption(
+                key: kOptionHideWebSocketSetting) ==
+            'Y' ||
+        isWeb;
     _enableTrustedDevices = mainGetBoolOptionSync(kOptionEnableTrustedDevices);
     _enableTcpPunch = mainGetLocalBoolOptionSync(kOptionEnableTcpPunch);
     _enableUdpPunch = mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
@@ -195,9 +219,10 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         _checkUpdateOnStartup = checkUpdateOnStartup;
       }
 
-      var floatingWindowDisabled =
-          bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
-              !await AndroidPermissionManager.check(kSystemAlertWindow);
+      var floatingWindowDisabled = bind.crateFlutterFfiMainGetLocalOption(
+                  key: kOptionDisableFloatingWindow) ==
+              "Y" ||
+          !await AndroidPermissionManager.check(kSystemAlertWindow);
       if (floatingWindowDisabled != _floatingWindowDisabled) {
         update = true;
         _floatingWindowDisabled = floatingWindowDisabled;
@@ -206,31 +231,32 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       final keepScreenOn = _floatingWindowDisabled
           ? KeepScreenOn.never
           : optionToKeepScreenOn(
-              bind.mainGetLocalOption(key: kOptionKeepScreenOn));
+              bind.crateFlutterFfiMainGetLocalOption(key: kOptionKeepScreenOn));
       if (keepScreenOn != _keepScreenOn) {
         update = true;
         _keepScreenOn = keepScreenOn;
       }
 
-      final fingerprint = await bind.mainGetFingerprint();
+      final fingerprint = await bind.crateFlutterFfiMainGetFingerprint();
       if (_fingerprint != fingerprint) {
         update = true;
         _fingerprint = fingerprint;
       }
 
-      final buildDate = await bind.mainGetBuildDate();
+      final buildDate = await bind.crateFlutterFfiMainGetBuildDate();
       if (_buildDate != buildDate) {
         update = true;
         _buildDate = buildDate;
       }
 
-      final myId = await bind.mainGetMyId();
+      final myId = await bind.crateFlutterFfiMainGetMyId();
       if (_myId != myId) {
         update = true;
         _myId = myId;
       }
 
-      final isUsingPublicServer = await bind.mainIsUsingPublicServer();
+      final isUsingPublicServer =
+          await bind.crateFlutterFfiMainIsUsingPublicServer();
       if (_isUsingPublicServer != isUsingPublicServer) {
         update = true;
         _isUsingPublicServer = isUsingPublicServer;
@@ -287,12 +313,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     Provider.of<FfiModel>(context);
-    final outgoingOnly = bind.isOutgoingOnly();
-    final incomingOnly = bind.isIncomingOnly();
+    final outgoingOnly = bind.crateFlutterFfiIsOutgoingOnly();
+    final incomingOnly = bind.crateFlutterFfiIsIncomingOnly();
     final customClientSection = CustomSettingsSection(
         child: Column(
       children: [
-        if (bind.isCustomClient())
+        if (bind.crateFlutterFfiIsCustomClient())
           Align(
             alignment: Alignment.center,
             child: loadPowered(context),
@@ -304,7 +330,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       ],
     ));
     final List<AbstractSettingsTile> enhancementsTiles = [];
-    final enable2fa = bind.mainHasValid2FaSync();
+    final enable2fa = bind.crateFlutterFfiMainHasValid2FaSync();
     final List<AbstractSettingsTile> tfaTiles = [
       SettingsTile.switchTile(
         title: Text(translate('enable-2fa-title')),
@@ -327,7 +353,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       if (enable2fa)
         SettingsTile.switchTile(
           title: Text(translate('Telegram bot')),
-          initialValue: bind.mainHasValidBotSync(),
+          initialValue: bind.crateFlutterFfiMainHasValidBotSync(),
           onToggle: (v) async {
             update() async {
               setState(() {});
@@ -380,11 +406,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         onToggle: isOptionFixed(kOptionEnableLanDiscovery)
             ? null
             : (v) async {
-                await bind.mainSetOption(
+                await bind.crateFlutterFfiMainSetOption(
                     key: kOptionEnableLanDiscovery,
                     value: bool2option(kOptionEnableLanDiscovery, !v));
-                final newValue = !option2bool(kOptionEnableLanDiscovery,
-                    await bind.mainGetOption(key: kOptionEnableLanDiscovery));
+                final newValue = !option2bool(
+                    kOptionEnableLanDiscovery,
+                    await bind.crateFlutterFfiMainGetOption(
+                        key: kOptionEnableLanDiscovery));
                 setState(() {
                   _denyLANDiscovery = newValue;
                 });
@@ -505,7 +533,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 _enableDirectIPAccess = !_enableDirectIPAccess;
                 String value =
                     bool2option(kOptionDirectServer, _enableDirectIPAccess);
-                await bind.mainSetOption(
+                await bind.crateFlutterFfiMainSetOption(
                     key: kOptionDirectServer, value: value);
                 setState(() {});
               },
@@ -552,7 +580,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 _allowAutoDisconnect = !_allowAutoDisconnect;
                 String value = bool2option(
                     kOptionAllowAutoDisconnect, _allowAutoDisconnect);
-                await bind.mainSetOption(
+                await bind.crateFlutterFfiMainSetOption(
                     key: kOptionAllowAutoDisconnect, value: value);
                 setState(() {});
               },
@@ -629,7 +657,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           gFFI.invokeMethod(AndroidChannel.kSetStartOnBootOpt, toValue);
         }));
 
-    if (!bind.isCustomClient()) {
+    if (!bind.crateFlutterFfiIsCustomClient()) {
       enhancementsTiles.add(
         SettingsTile.switchTile(
           initialValue: _checkUpdateOnStartup,
@@ -671,7 +699,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         }
       }
       final disable = !toValue;
-      bind.mainSetLocalOption(
+      bind.crateFlutterFfiMainSetLocalOption(
           key: kOptionDisableFloatingWindow,
           value: disable ? 'Y' : defaultOptionNo);
       setState(() => _floatingWindowDisabled = disable);
@@ -685,7 +713,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           Text('* ${translate('floating_window_tip')}',
               style: Theme.of(context).textTheme.bodySmall),
         ]),
-        onToggle: bind.mainIsOptionFixed(key: kOptionDisableFloatingWindow)
+        onToggle: bind.crateFlutterFfiMainIsOptionFixed(
+                key: kOptionDisableFloatingWindow)
             ? null
             : onFloatingWindowChanged));
 
@@ -700,25 +729,26 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       ],
       getter: () => _keepScreenOnToOption(_floatingWindowDisabled
           ? KeepScreenOn.never
-          : optionToKeepScreenOn(
-              bind.mainGetLocalOption(key: kOptionKeepScreenOn))),
+          : optionToKeepScreenOn(bind.crateFlutterFfiMainGetLocalOption(
+              key: kOptionKeepScreenOn))),
       asyncSetter: isOptionFixed(kOptionKeepScreenOn) || _floatingWindowDisabled
           ? null
           : (value) async {
-              await bind.mainSetLocalOption(
+              await bind.crateFlutterFfiMainSetLocalOption(
                   key: kOptionKeepScreenOn, value: value);
               setState(() => _keepScreenOn = optionToKeepScreenOn(value));
               gFFI.serverModel.androidUpdatekeepScreenOn();
             },
     ));
 
-    final disabledSettings = bind.isDisableSettings();
-    final hideSecuritySettings =
-        bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) == 'Y';
+    final disabledSettings = bind.crateFlutterFfiIsDisableSettings();
+    final hideSecuritySettings = bind.crateFlutterFfiMainGetBuildinOption(
+            key: kOptionHideSecuritySetting) ==
+        'Y';
     final settings = SettingsList(
       sections: [
         customClientSection,
-        if (!bind.isDisableAccount())
+        if (!bind.crateFlutterFfiIsDisableAccount())
           SettingsSection(
             title: Text(translate('Account')),
             tiles: [
@@ -727,7 +757,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                     ? translate('Login')
                     : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})')),
                 leading: Obx(() {
-                  final avatar = bind.mainResolveAvatarUrl(
+                  final avatar = bind.crateFlutterFfiMainResolveAvatarUrl(
                       avatar: gFFI.userModel.avatar.value);
                   return buildAvatarWidget(
                         avatar: avatar,
@@ -754,7 +784,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 leading: Icon(Icons.cloud),
                 onPressed: (context) {
                   showServerSettings(gFFI.dialogManager, (callback) async {
-                    _isUsingPublicServer = await bind.mainIsUsingPublicServer();
+                    _isUsingPublicServer =
+                        await bind.crateFlutterFfiMainIsUsingPublicServer();
                     setState(callback);
                   });
                 }),
@@ -765,7 +796,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 onPressed: (context) {
                   changeSocks5Proxy();
                 }),
-          if (isAndroid && !bind.isOutgoingOnly())
+          if (isAndroid && !bind.crateFlutterFfiIsOutgoingOnly())
             SettingsTile(
                 title: Text(translate('Deploy')),
                 leading: Icon(Icons.cloud_upload),
@@ -810,10 +841,11 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               onToggle: isOptionFixed(kOptionDisableUdp)
                   ? null
                   : (v) async {
-                      await bind.mainSetOption(
+                      await bind.crateFlutterFfiMainSetOption(
                           key: kOptionDisableUdp, value: v ? 'Y' : 'N');
-                      final newValue =
-                          bind.mainGetOptionSync(key: kOptionDisableUdp) == 'Y';
+                      final newValue = bind.crateFlutterFfiMainGetOptionSync(
+                              key: kOptionDisableUdp) ==
+                          'Y';
                       setState(() {
                         _disableUdp = newValue;
                       });
@@ -897,7 +929,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               showThemeSettings(gFFI.dialogManager);
             },
           ),
-          if (!bind.isDisableAccount())
+          if (!bind.crateFlutterFfiIsDisableAccount())
             SettingsTile.switchTile(
               title: Text(translate('note-at-conn-end-tip')),
               initialValue: _allowAskForNoteAtEndOfConnection,
@@ -958,13 +990,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   onToggle: isOptionFixed(kOptionAllowAutoRecordIncoming)
                       ? null
                       : (v) async {
-                          await bind.mainSetOption(
+                          await bind.crateFlutterFfiMainSetOption(
                               key: kOptionAllowAutoRecordIncoming,
                               value: bool2option(
                                   kOptionAllowAutoRecordIncoming, v));
                           final newValue = option2bool(
                               kOptionAllowAutoRecordIncoming,
-                              await bind.mainGetOption(
+                              await bind.crateFlutterFfiMainGetOption(
                                   key: kOptionAllowAutoRecordIncoming));
                           setState(() {
                             _autoRecordIncomingSession = newValue;
@@ -979,13 +1011,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   onToggle: isOptionFixed(kOptionAllowAutoRecordOutgoing)
                       ? null
                       : (v) async {
-                          await bind.mainSetLocalOption(
+                          await bind.crateFlutterFfiMainSetLocalOption(
                               key: kOptionAllowAutoRecordOutgoing,
                               value: bool2option(
                                   kOptionAllowAutoRecordOutgoing, v));
                           final newValue = option2bool(
                               kOptionAllowAutoRecordOutgoing,
-                              bind.mainGetLocalOption(
+                              bind.crateFlutterFfiMainGetLocalOption(
                                   key: kOptionAllowAutoRecordOutgoing));
                           setState(() {
                             _autoRecordOutgoingSession = newValue;
@@ -994,7 +1026,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 ),
               SettingsTile(
                 title: Text(translate("Directory")),
-                description: Text(bind.mainVideoSaveDirectory(root: false)),
+                description: Text(
+                    bind.crateFlutterFfiMainVideoSaveDirectory(root: false)),
               ),
             ],
           ),
@@ -1011,7 +1044,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             title: Text(translate("Share screen")),
             tiles: shareScreenTiles,
           ),
-        if (!bind.isIncomingOnly()) defaultDisplaySection(),
+        if (!bind.crateFlutterFfiIsIncomingOnly()) defaultDisplaySection(),
         if (isAndroid &&
             !disabledSettings &&
             !outgoingOnly &&
@@ -1084,7 +1117,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     return true;
   }
 
-  defaultDisplaySection() {
+  SettingsSection defaultDisplaySection() {
     return SettingsSection(
       title: Text(translate("Display Settings")),
       tiles: [
@@ -1104,15 +1137,17 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
 
 void showLanguageSettings(OverlayDialogManager dialogManager) async {
   try {
-    final langs = json.decode(await bind.mainGetLangs()) as List<dynamic>;
-    var lang = bind.mainGetLocalOption(key: kCommConfKeyLang);
+    final langs =
+        json.decode(await bind.crateFlutterFfiMainGetLangs()) as List<dynamic>;
+    var lang = bind.crateFlutterFfiMainGetLocalOption(key: kCommConfKeyLang);
     dialogManager.show((setState, close, context) {
       setLang(v) async {
         if (lang != v) {
           setState(() {
             lang = v;
           });
-          await bind.mainSetLocalOption(key: kCommConfKeyLang, value: v);
+          await bind.crateFlutterFfiMainSetLocalOption(
+              key: kCommConfKeyLang, value: v);
           HomePage.homeKey.currentState?.refreshPages();
           Future.delayed(Duration(milliseconds: 200), close);
         }
@@ -1219,7 +1254,8 @@ class _DisplayPage extends StatefulWidget {
 class __DisplayPageState extends State<_DisplayPage> {
   @override
   Widget build(BuildContext context) {
-    final Map codecsJson = jsonDecode(bind.mainSupportedHwdecodings());
+    final Map codecsJson =
+        jsonDecode(bind.crateFlutterFfiMainSupportedHwdecodings());
     final h264 = codecsJson['h264'] ?? false;
     final h265 = codecsJson['h265'] ?? false;
     var codecList = [
@@ -1248,12 +1284,12 @@ class __DisplayPageState extends State<_DisplayPage> {
                 _RadioEntry('Scale original', kRemoteViewStyleOriginal),
                 _RadioEntry('Scale adaptive', kRemoteViewStyleAdaptive)
               ],
-              getter: () =>
-                  bind.mainGetUserDefaultOption(key: kOptionViewStyle),
+              getter: () => bind.crateFlutterFfiMainGetUserDefaultOption(
+                  key: kOptionViewStyle),
               asyncSetter: isOptionFixed(kOptionViewStyle)
                   ? null
                   : (value) async {
-                      await bind.mainSetUserDefaultOption(
+                      await bind.crateFlutterFfiMainSetUserDefaultOption(
                           key: kOptionViewStyle, value: value);
                     },
             ),
@@ -1266,15 +1302,15 @@ class __DisplayPageState extends State<_DisplayPage> {
                 _RadioEntry('Custom', kRemoteImageQualityCustom),
               ],
               getter: () {
-                final v =
-                    bind.mainGetUserDefaultOption(key: kOptionImageQuality);
+                final v = bind.crateFlutterFfiMainGetUserDefaultOption(
+                    key: kOptionImageQuality);
                 showCustomImageQuality.value = v == kRemoteImageQualityCustom;
                 return v;
               },
               asyncSetter: isOptionFixed(kOptionImageQuality)
                   ? null
                   : (value) async {
-                      await bind.mainSetUserDefaultOption(
+                      await bind.crateFlutterFfiMainSetUserDefaultOption(
                           key: kOptionImageQuality, value: value);
                       showCustomImageQuality.value =
                           value == kRemoteImageQualityCustom;
@@ -1286,12 +1322,12 @@ class __DisplayPageState extends State<_DisplayPage> {
             _getPopupDialogRadioEntry(
               title: 'Default Codec',
               list: codecList,
-              getter: () =>
-                  bind.mainGetUserDefaultOption(key: kOptionCodecPreference),
+              getter: () => bind.crateFlutterFfiMainGetUserDefaultOption(
+                  key: kOptionCodecPreference),
               asyncSetter: isOptionFixed(kOptionCodecPreference)
                   ? null
                   : (value) async {
-                      await bind.mainSetUserDefaultOption(
+                      await bind.crateFlutterFfiMainSetUserDefaultOption(
                           key: kOptionCodecPreference, value: value);
                     },
             ),
@@ -1417,10 +1453,8 @@ SettingsTile _getPopupDialogRadioEntry({
       return CustomAlertDialog(
           content: Obx(
         () => Column(children: [
-          ...list
-              .map((e) => getRadio(Text(translate(e.label)), e.value,
-                  groupValue.value, onChanged))
-              .toList(),
+          ...list.map((e) => getRadio(
+              Text(translate(e.label)), e.value, groupValue.value, onChanged)),
           Offstage(
             offstage:
                 !(tail != null && showTail != null && showTail.value == true),

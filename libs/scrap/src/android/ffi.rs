@@ -441,6 +441,93 @@ pub fn call_main_service_set_by_name(
     }
 }
 
+/// Managed builds: encrypts (`wrap`) or decrypts a device secret with the app's Android Keystore key
+/// (SecretWrap.kt). The class is loaded through the app's class loader, since a native thread's
+/// FindClass only sees system classes.
+pub fn call_secret_wrap(data: &[u8], wrap: bool) -> JniResult<Vec<u8>> {
+    let jvm = JVM.read().unwrap();
+    let ctx = APPLICATION_CONTEXT.read().unwrap();
+    let (Some(jvm), Some(ctx)) = (jvm.as_ref(), ctx.as_ref()) else {
+        return Err(JniError::ThrowFailed(-1));
+    };
+    let mut env = jvm.attach_current_thread_as_daemon()?;
+    let result = env.with_local_frame(16, |env| -> JniResult<Vec<u8>> {
+        let loader = env
+            .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let name = env.new_string("com.carriez.flutter_hbb.SecretWrap")?;
+        let class = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(name))],
+            )?
+            .l()?;
+        let input = env.byte_array_from_slice(data)?;
+        let output = env
+            .call_static_method(
+                JClass::from(class),
+                if wrap { "wrap" } else { "unwrap" },
+                "([B)[B",
+                &[JValue::Object(&JObject::from(input))],
+            )?
+            .l()?;
+        env.convert_byte_array(jni::objects::JByteArray::from(output))
+    });
+    if result.is_err() && env.exception_check().unwrap_or(false) {
+        // Prints the Java exception and its stack to logcat, then clears it for the next JNI call.
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    result
+}
+
+/// Managed builds: `RdcPlatform.call(context, op, arg)` (RdcPlatform.kt) - the device report and the
+/// self-update install. Loaded through the app's class loader, as call_secret_wrap.
+pub fn call_rdc_platform(op: &str, arg: &str) -> JniResult<String> {
+    let jvm = JVM.read().unwrap();
+    let ctx = APPLICATION_CONTEXT.read().unwrap();
+    let (Some(jvm), Some(ctx)) = (jvm.as_ref(), ctx.as_ref()) else {
+        return Err(JniError::ThrowFailed(-1));
+    };
+    let mut env = jvm.attach_current_thread_as_daemon()?;
+    let result = env.with_local_frame(16, |env| -> JniResult<String> {
+        let loader = env
+            .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let name = env.new_string("com.carriez.flutter_hbb.RdcPlatform")?;
+        let class = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(name))],
+            )?
+            .l()?;
+        let op = env.new_string(op)?;
+        let arg = env.new_string(arg)?;
+        let output = env
+            .call_static_method(
+                JClass::from(class),
+                "call",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    JValue::Object(ctx.as_obj()),
+                    JValue::Object(&JObject::from(op)),
+                    JValue::Object(&JObject::from(arg)),
+                ],
+            )?
+            .l()?;
+        Ok(env.get_string(&JString::from(output))?.into())
+    });
+    if result.is_err() && env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    result
+}
+
 // Difference between MainService, MainActivity, JNI_OnLoad:
 //  jvm is the same, ctx is differen and ctx of JNI_OnLoad is null.
 //  cpal: all three works
@@ -506,6 +593,12 @@ pub extern "system" fn Java_ffi_FFI_onAppStart(mut env: JNIEnv, _class: JClass, 
             let java_vm = jvm.get_java_vm_pointer() as *mut c_void;
             let context_jobject = context.as_obj().as_raw() as *mut c_void;
             *APPLICATION_CONTEXT.write().unwrap() = Some(context);
+            // call_secret_wrap needs the VM before anything else (service, clipboard) stores it.
+            if JVM.read().unwrap().is_none() {
+                if let Ok(vm) = env.get_java_vm() {
+                    *JVM.write().unwrap() = Some(vm);
+                }
+            }
             try_init_rustls_platform_verifier(&mut env, context_jobject);
         }
     }

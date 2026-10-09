@@ -38,12 +38,11 @@ typedef OnTouchModeChange = void Function(bool);
 
 class GestureHelp extends StatefulWidget {
   GestureHelp(
-      {Key? key,
+      {super.key,
       required this.touchMode,
       required this.onTouchModeChange,
       required this.virtualMouseMode,
-      this.inputModel})
-      : super(key: key);
+      this.inputModel});
   final bool touchMode;
   final OnTouchModeChange onTouchModeChange;
   final VirtualMouseMode virtualMouseMode;
@@ -352,8 +351,7 @@ class _GestureHelpState extends State<GestureHelp> {
 
 class GestureInfo extends StatelessWidget {
   const GestureInfo(this.width, this.icon, this.fromText, this.toText,
-      {Key? key})
-      : super(key: key);
+      {super.key});
 
   final String fromText;
   final String toText;

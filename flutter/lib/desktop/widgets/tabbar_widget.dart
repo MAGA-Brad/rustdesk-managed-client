@@ -169,7 +169,9 @@ class DesktopTabController {
         }));
       }
     });
-    if ((isDesktop && (bind.isIncomingOnly() || bind.isOutgoingOnly())) ||
+    if ((isDesktop &&
+            (bind.crateFlutterFfiIsIncomingOnly() ||
+                bind.crateFlutterFfiIsOutgoingOnly())) ||
         callOnSelected) {
       if (state.value.tabs.length > index) {
         final key = state.value.tabs[index].key;
@@ -260,7 +262,7 @@ class DesktopTab extends StatefulWidget {
   final RxList<String> invisibleTabKeys = RxList.empty();
 
   DesktopTab({
-    Key? key,
+    super.key,
     required this.controller,
     this.showLogo = true,
     this.showTitle = false,
@@ -277,10 +279,11 @@ class DesktopTab extends StatefulWidget {
     this.selectedTabBackgroundColor,
     this.unSelectedTabBackgroundColor,
     this.selectedBorderColor,
-  }) : super(key: key);
+  });
 
   static RxString tablabelGetter(String peerId) {
-    final alias = bind.mainGetPeerOptionSync(id: peerId, key: 'alias');
+    final alias =
+        bind.crateFlutterFfiMainGetPeerOptionSync(id: peerId, key: 'alias');
     return RxString(getDesktopTabLabel(peerId, alias));
   }
 
@@ -329,7 +332,8 @@ class _DesktopTabState extends State<DesktopTab>
   _DesktopTabState() : super();
 
   static RxString tablabelGetter(String peerId) {
-    final alias = bind.mainGetPeerOptionSync(id: peerId, key: 'alias');
+    final alias =
+        bind.crateFlutterFfiMainGetPeerOptionSync(id: peerId, key: 'alias');
     return RxString(getDesktopTabLabel(peerId, alias));
   }
 
@@ -405,7 +409,7 @@ class _DesktopTabState extends State<DesktopTab>
     super.onWindowUnmaximize();
   }
 
-  _saveFrame({bool? flush}) async {
+  Future<void> _saveFrame({bool? flush}) async {
     try {
       if (tabType == DesktopTabType.main) {
         await saveWindowPosition(WindowType.Main, flush: flush);
@@ -593,7 +597,8 @@ class _DesktopTabState extends State<DesktopTab>
   }
 
   Widget _buildBar() {
-    final isIncomingHomePage = bind.isIncomingOnly() && isInHomePage();
+    final isIncomingHomePage =
+        bind.crateFlutterFfiIsIncomingOnly() && isInHomePage();
     return Row(
       children: [
         Expanded(
@@ -604,13 +609,16 @@ class _DesktopTabState extends State<DesktopTab>
                         final current = DateTime.now().millisecondsSinceEpoch;
                         final elapsed = current - _lastClickTime;
                         _lastClickTime = current;
-                        if (elapsed < bind.getDoubleClickTime()) {
+                        if (elapsed <
+                            bind.crateFlutterFfiGetDoubleClickTime()) {
                           // onDoubleTap
                           toggleMaximize(isMainWindow)
                               .then((value) => stateGlobal.setMaximized(value));
                         }
                       }
-                    : (isIncomingHomePage ? () {} : null), // Keep tap recognizer for Windows touch.
+                    : (isIncomingHomePage
+                        ? () {}
+                        : null), // Keep tap recognizer for Windows touch.
                 onPanStart: (_) => startDragging(isMainWindow),
                 onPanCancel: () {
                   // We want to disable dragging of the tab area in the tab bar.
@@ -714,7 +722,7 @@ class WindowActionPanel extends StatefulWidget {
   final LabelGetter? labelGetter;
 
   const WindowActionPanel(
-      {Key? key,
+      {super.key,
       required this.isMainWindow,
       required this.state,
       required this.tabController,
@@ -724,8 +732,7 @@ class WindowActionPanel extends StatefulWidget {
       this.showMaximize = true,
       this.showClose = true,
       this.onClose,
-      this.labelGetter})
-      : super(key: key);
+      this.labelGetter});
 
   @override
   State<StatefulWidget> createState() {
@@ -790,9 +797,10 @@ class WindowActionPanelState extends State<WindowActionPanel> {
                       icon: stateGlobal.isMaximized.isTrue
                           ? IconFont.restore
                           : IconFont.max,
-                      onTap: bind.isIncomingOnly() && isInHomePage()
-                          ? null
-                          : _toggleMaximize,
+                      onTap:
+                          bind.crateFlutterFfiIsIncomingOnly() && isInHomePage()
+                              ? null
+                              : _toggleMaximize,
                       isClose: false,
                     )),
               if (widget.showClose && !isMacOS)
@@ -874,7 +882,7 @@ Future<bool> closeConfirmDialog() async {
   final res = await gFFI.dialogManager.show<bool>((setState, close, context) {
     submit() {
       String value = bool2option(kOptionEnableConfirmClosingTabs, confirm);
-      bind.mainSetLocalOption(
+      bind.crateFlutterFfiMainSetLocalOption(
           key: kOptionEnableConfirmClosingTabs, value: value);
       close(true);
     }
@@ -953,7 +961,7 @@ class _ListView extends StatelessWidget {
         controller.tabType == DesktopTabType.install;
   }
 
-  onVisibilityChanged(VisibilityInfo info) {
+  void onVisibilityChanged(VisibilityInfo info) {
     final key = (info.key as ValueKey).value;
     if (info.visibleFraction < 0.75) {
       if (!invisibleTabKeys.contains(key)) {
@@ -1041,7 +1049,7 @@ class _Tab extends StatefulWidget {
   final Color? selectedBorderColor;
 
   const _Tab({
-    Key? key,
+    super.key,
     required this.index,
     required this.tabInfoKey,
     required this.label,
@@ -1058,7 +1066,7 @@ class _Tab extends StatefulWidget {
     this.selectedTabBackgroundColor,
     this.unSelectedTabBackgroundColor,
     this.selectedBorderColor,
-  }) : super(key: key);
+  });
 
   @override
   State<_Tab> createState() => _TabState();
@@ -1216,11 +1224,10 @@ class _CloseButton extends StatelessWidget {
   final Function onClose;
 
   const _CloseButton({
-    Key? key,
     required this.visible,
     required this.tabSelected,
     required this.onClose,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1258,15 +1265,14 @@ class ActionIcon extends StatefulWidget {
   final double boxSize;
 
   const ActionIcon(
-      {Key? key,
+      {super.key,
       this.message,
       required this.icon,
       this.onTap,
       this.onTapDown,
       this.isClose = false,
       this.iconSize = _kActionIconSize,
-      this.boxSize = _kTabBarHeight - 1})
-      : super(key: key);
+      this.boxSize = _kTabBarHeight - 1});
 
   @override
   State<ActionIcon> createState() => _ActionIconState();
@@ -1313,8 +1319,8 @@ class _ActionIconState extends State<ActionIcon> {
 
 class AddButton extends StatelessWidget {
   const AddButton({
-    Key? key,
-  }) : super(key: key);
+    super.key,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1535,7 +1541,7 @@ class TabbarTheme extends ThemeExtension<TabbarTheme> {
     );
   }
 
-  static color(BuildContext context) {
+  static ColorThemeExtension color(BuildContext context) {
     return Theme.of(context).extension<ColorThemeExtension>()!;
   }
 }

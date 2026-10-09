@@ -49,7 +49,7 @@ void showDeployDialog() {
       });
       String res;
       try {
-        res = await bind.mainDeployDevice(
+        res = await bind.crateFlutterFfiMainDeployDevice(
             token: token, id: idController.text.trim());
       } catch (e) {
         setState(() {

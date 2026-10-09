@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Managed builds (RDC), merged over the main manifest for release builds: the app only connects
+     out, so nothing that lets it be controlled or start on its own is declared, and its data (which
+     holds the device's secrets) is excluded from backup and device-to-device transfer. It installs
+     its own signed updates (RdcPlatform.kt). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" tools:node="remove" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" tools:node="remove" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+
+    <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/rdc_data_extraction_rules">
+
+        <receiver android:name=".BootReceiver" tools:node="remove" />
+        <service android:name=".InputService" tools:node="remove" />
+        <service android:name=".FloatingWindowService" tools:node="remove" />
+        <receiver
+            android:name=".UpdateResultReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

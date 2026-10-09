@@ -41,7 +41,29 @@ pub fn get_key_cursor(conn_id: i32) -> String {
 
 pub fn register_whiteboard(k: String) {
     std::thread::spawn(|| {
-        allow_err!(start_whiteboard_());
+        let mut delay_secs = 2;
+        loop {
+            // A pump is already owned by another (earlier) register_whiteboard
+            // call; this invocation's start_whiteboard_() is just the existing
+            // harmless "already started" no-op, so only the real owner retries.
+            let already_owned = TX_WHITEBOARD.read().unwrap().is_some();
+            let started = Instant::now();
+            allow_err!(start_whiteboard_());
+            if already_owned || CONNS.read().unwrap().is_empty() {
+                break;
+            }
+            // The pump (or its child window) exited while a connection is
+            // still registered - most commonly the hosting session
+            // disconnected out from under it. Retry so the overlay comes back
+            // once it reconnects; back off while it keeps exiting straight
+            // away (session still disconnected), since each attempt spawns a
+            // process.
+            if started.elapsed() >= std::time::Duration::from_secs(60) {
+                delay_secs = 2;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+            delay_secs = (delay_secs * 2).min(60);
+        }
     });
     let mut conns = CONNS.write().unwrap();
     if !conns.contains_key(&k) {
@@ -65,9 +87,13 @@ pub fn unregister_whiteboard(k: String) {
     let is_conns_empty = conns.is_empty();
     drop(conns);
 
-    TX_WHITEBOARD.read().unwrap().as_ref().map(|tx| {
-        allow_err!(tx.send((k, CustomEvent::Clear)));
-    });
+    // try_read for the same reason as tx_send_event: a start in progress has
+    // nothing of this connection's to clear yet.
+    if let Ok(tx) = TX_WHITEBOARD.try_read() {
+        tx.as_ref().map(|tx| {
+            allow_err!(tx.send((k, CustomEvent::Clear)));
+        });
+    }
     if is_conns_empty {
         std::thread::spawn(|| {
             let mut whiteboard = TX_WHITEBOARD.write().unwrap();
@@ -128,9 +154,15 @@ fn tx_send_event(conn: &mut Conn, k: String, event: CustomEvent) {
         }
     }
 
-    TX_WHITEBOARD.read().unwrap().as_ref().map(|tx| {
-        allow_err!(tx.send((k, event)));
-    });
+    // try_read: start_whiteboard_ holds the write lock while it launches the
+    // overlay (seconds, or until someone logs in at a login screen), and this
+    // runs on the remote-input path - a cursor-overlay update isn't worth
+    // stalling remote mouse and keyboard for.
+    if let Ok(tx) = TX_WHITEBOARD.try_read() {
+        tx.as_ref().map(|tx| {
+            allow_err!(tx.send((k, event)));
+        });
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -227,7 +259,11 @@ async fn start_whiteboard_() -> ResultType<()> {
                         if matches!(data.1, CustomEvent::Exit) {
                             break;
                         } else {
-                            allow_err!(stream.send(&Data::Whiteboard(data)).await);
+                            // Propagate a real send failure instead of
+                            // swallowing it: it means the child (window) is
+                            // gone, and only returning an Err here lets
+                            // register_whiteboard's retry loop respawn it.
+                            stream.send(&Data::Whiteboard(data)).await?;
                             timer.reset();
                         }
                     }
@@ -241,7 +277,7 @@ async fn start_whiteboard_() -> ResultType<()> {
                 for (k, conn) in conns.iter_mut() {
                     if conn.last_cursor_evt.tm.elapsed().as_millis() > 300 {
                         if let Some(evt) = conn.last_cursor_evt.evt.take() {
-                            allow_err!(stream.send(&Data::Whiteboard((k.clone(), evt))).await);
+                            stream.send(&Data::Whiteboard((k.clone(), evt))).await?;
                             conn.last_cursor_evt.c = 0;
                         }
                     }

@@ -32,6 +32,11 @@ if (flutterVersionName == null) {
     flutterVersionName = '1.0'
 }
 
+// Managed builds (RDC): the app identity comes from the build environment, like the managed
+// values compiled into the Rust library; unset, this is the stock RustDesk app.
+def managedApplicationId = System.getenv('RDC_ANDROID_APPLICATION_ID')
+def isManagedAndroid = managedApplicationId != null && !managedApplicationId.trim().isEmpty()
+
 // Add rustls-platform-verifier Android support
 String findRustlsPlatformVerifierMavenDir() {
     def dependencyText = providers.exec {
@@ -84,6 +89,8 @@ protobuf {
 android {
     namespace "com.carriez.flutter_hbb"
     compileSdkVersion 36
+    // The NDK the Rust library is built with, so Gradle doesn't fetch another.
+    ndkVersion "28.2.13676358"
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
 
@@ -99,8 +106,12 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId "com.carriez.flutter_hbb"
-        minSdkVersion 22
+        applicationId isManagedAndroid ? managedApplicationId.trim() : "com.carriez.flutter_hbb"
+        manifestPlaceholders = [
+            appLabel: isManagedAndroid ? (System.getenv('RDC_ANDROID_APP_LABEL') ?: 'RDC') : 'RustDesk',
+            deepLinkScheme: isManagedAndroid ? (System.getenv('RDC_ANDROID_DEEP_LINK_SCHEME') ?: 'rdc') : 'rustdesk',
+        ]
+        minSdkVersion 24
         targetSdkVersion 36
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
@@ -113,6 +124,13 @@ android {
         storeFile keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null
         storePassword keystoreProperties['storePassword']
       }
+    }
+
+    // Managed builds only connect out: the overlay drops boot start, the accessibility (input)
+    // service, the floating window and Android backup of the app's data (which holds its secrets).
+    if (isManagedAndroid) {
+        sourceSets.release.manifest.srcFile 'src/managed/AndroidManifest.xml'
+        sourceSets.release.res.srcDirs += 'src/managed/res'
     }
 
     buildTypes {
@@ -134,7 +152,6 @@ dependencies {
     implementation 'com.google.protobuf:protobuf-javalite:3.20.1'
     implementation "androidx.media:media:1.6.0"
     implementation 'com.github.getActivity:XXPermissions:18.5'
-    implementation("org.jetbrains.kotlin:kotlin-stdlib") { version { strictly("1.9.10") } }
     implementation 'com.caverock:androidsvg-aar:1.4'
     implementation "rustls:rustls-platform-verifier:0.1.1"
 }

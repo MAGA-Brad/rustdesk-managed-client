@@ -31,7 +31,7 @@ typedef _TerminalClipboardSource = ({
 class TerminalTabPage extends StatefulWidget {
   final Map<String, dynamic> params;
 
-  const TerminalTabPage({Key? key, required this.params}) : super(key: key);
+  const TerminalTabPage({super.key, required this.params});
 
   @override
   State<TerminalTabPage> createState() => _TerminalTabPageState(params);
@@ -41,12 +41,12 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
   DesktopTabController get tabController => Get.find<DesktopTabController>();
   bool get _canConfigureTerminalClipboardPermission =>
       canConfigureTerminalClipboardPermission(
-        settingsDisabled: bind.isDisableSettings(),
+        settingsDisabled: bind.crateFlutterFfiIsDisableSettings(),
         optionFixed: isOptionFixed(kOptionAllowTerminalClipboardWrite),
       );
   bool get _canHandleTerminalClipboardWriteRequest =>
       canHandleTerminalClipboardWriteRequest(
-        localOption: bind.mainGetLocalOption(
+        localOption: bind.crateFlutterFfiMainGetLocalOption(
           key: kOptionAllowTerminalClipboardWrite,
         ),
         canConfigurePermission: _canConfigureTerminalClipboardPermission,
@@ -94,7 +94,8 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
     String? connToken,
   }) {
     final tabKey = '${peerId}_$terminalId';
-    final alias = bind.mainGetPeerOptionSync(id: peerId, key: 'alias');
+    final alias =
+        bind.crateFlutterFfiMainGetPeerOptionSync(id: peerId, key: 'alias');
     final tabLabel =
         alias.isNotEmpty ? '$alias #$terminalId' : '$peerId #$terminalId';
     final clipboardSource = (
@@ -136,7 +137,7 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
     String clipboardText,
   ) {
     if (!mounted) return;
-    final option = bind.mainGetLocalOption(
+    final option = bind.crateFlutterFfiMainGetLocalOption(
       key: kOptionAllowTerminalClipboardWrite,
     );
     final request = _terminalClipboardNotice.recordBlocked(
@@ -223,7 +224,7 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
 
   Future<void> _declineTerminalClipboardWrite() async {
     try {
-      await bind.mainSetLocalOption(
+      await bind.crateFlutterFfiMainSetLocalOption(
         key: kOptionAllowTerminalClipboardWrite,
         value: kTerminalClipboardWriteDenied,
       );
@@ -248,7 +249,7 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
         canWrite: () => _canWriteTerminalClipboard(source),
         writeClipboard: writeTerminalClipboard,
         persistAllowed: request.persistAllowed
-            ? () => bind.mainSetLocalOption(
+            ? () => bind.crateFlutterFfiMainSetLocalOption(
                   key: kOptionAllowTerminalClipboardWrite,
                   value: kTerminalClipboardWriteAllowed,
                 )
@@ -388,7 +389,7 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
     final ffi = TerminalConnectionManager.getExistingConnection(peerId);
     if (ffi == null) return;
 
-    final isPersistent = bind.sessionGetToggleOptionSync(
+    final isPersistent = bind.crateFlutterFfiSessionGetToggleOptionSync(
       sessionId: ffi.sessionId,
       arg: kOptionTerminalPersistent,
     );
@@ -464,14 +465,14 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
       text: translate('Keep terminal sessions on disconnect'),
       getter: () async {
         final ffi = Get.find<FFI>(tag: 'terminal_$peerId');
-        return bind.sessionGetToggleOptionSync(
+        return bind.crateFlutterFfiSessionGetToggleOptionSync(
           sessionId: ffi.sessionId,
           arg: kOptionTerminalPersistent,
         );
       },
       setter: (bool v) async {
         final ffi = Get.find<FFI>(tag: 'terminal_$peerId');
-        await bind.sessionToggleOption(
+        await bind.crateFlutterFfiSessionToggleOption(
           sessionId: ffi.sessionId,
           value: kOptionTerminalPersistent,
         );
@@ -805,8 +806,10 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
       return true;
     } else {
       final bool res;
-      if (!option2bool(kOptionEnableConfirmClosingTabs,
-          bind.mainGetLocalOption(key: kOptionEnableConfirmClosingTabs))) {
+      if (!option2bool(
+          kOptionEnableConfirmClosingTabs,
+          bind.crateFlutterFfiMainGetLocalOption(
+              key: kOptionEnableConfirmClosingTabs))) {
         res = true;
       } else {
         res = await closeConfirmDialog();

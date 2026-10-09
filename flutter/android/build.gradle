@@ -45,6 +45,16 @@ subprojects {
     if (kotlinJvmTarget != null) {
         configureKotlinJvmTarget(project, kotlinJvmTarget)
     }
+    // Plugins compile against the app's SDK: sqflite_android 2.4.4 calls Android 16 (API 36) APIs
+    // but declares compileSdk 34. Registered before the plugin's own script runs, so this lands
+    // before the Android plugin finalizes its settings.
+    if (!project.state.executed) {
+        project.afterEvaluate {
+            if (project.plugins.hasPlugin('com.android.library')) {
+                project.android.compileSdkVersion 36
+            }
+        }
+    }
 }
 subprojects {
     project.evaluationDependsOn(':app')

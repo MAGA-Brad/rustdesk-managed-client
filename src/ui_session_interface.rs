@@ -471,7 +471,9 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn is_screenshot_supported(&self) -> bool {
-        crate::common::is_support_screenshot_num(self.lc.read().unwrap().version)
+        // Managed builds never offer screenshots of the remote screen.
+        option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none()
+            && crate::common::is_support_screenshot_num(self.lc.read().unwrap().version)
     }
 
     pub fn take_screenshot(&self, display: i32, sid: String) {

@@ -20,7 +20,7 @@ import 'home_page.dart';
 
 /// Connection page for connecting to a remote peer.
 class ConnectionPage extends StatefulWidget implements PageShape {
-  ConnectionPage({Key? key, required this.appBarActions}) : super(key: key);
+  ConnectionPage({super.key, required this.appBarActions});
 
   @override
   final icon = const Icon(Icons.connected_tv);
@@ -66,7 +66,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
     _idFocusNode.addListener(onFocusChanged);
     if (_idController.text.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
-        final lastRemoteId = await bind.mainGetLastRemoteId();
+        final lastRemoteId = await bind.crateFlutterFfiMainGetLastRemoteId();
         if (lastRemoteId != _idController.id) {
           setState(() {
             _idController.id = lastRemoteId;
@@ -84,9 +84,11 @@ class _ConnectionPageState extends State<ConnectionPage> {
       slivers: [
         SliverList(
             delegate: SliverChildListDelegate([
-          if (!bind.isCustomClient() && !isIOS)
+          if (!bind.crateFlutterFfiIsCustomClient() && !isIOS)
             Obx(() => _buildUpdateUI(stateGlobal.updateUrl.value)),
-          _buildRemoteIDTextField(),
+          // Managed clients connect from the directory below, as on desktop.
+          if (bind.crateFlutterFfiMainGetManagedDirectoryStatus().isEmpty)
+            _buildRemoteIDTextField(),
         ])),
         SliverFillRemaining(
           hasScrollBody: true,
@@ -283,7 +285,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
                               decoration: BoxDecoration(
                                 boxShadow: [
                                   BoxShadow(
-                                    color: Colors.black.withOpacity(0.3),
+                                    color: Colors.black.withValues(alpha: 0.3),
                                     blurRadius: 5,
                                     spreadRadius: 1,
                                   ),

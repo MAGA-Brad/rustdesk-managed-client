@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:bot_toast/bot_toast.dart';
@@ -26,7 +27,7 @@ import '../../common.dart';
 import '../../models/platform_model.dart';
 
 class PeerTabPage extends StatefulWidget {
-  const PeerTabPage({Key? key}) : super(key: key);
+  const PeerTabPage({super.key});
   @override
   State<PeerTabPage> createState() => _PeerTabPageState();
 }
@@ -50,7 +51,7 @@ class _PeerTabPageState extends State<PeerTabPage>
     _TabEntry(FavoritePeersView(
       menuPadding: _menuPadding(),
     )),
-    _TabEntry(DiscoveredPeersView(
+    _TabEntry(DirectoryPeersView(
       menuPadding: _menuPadding(),
     )),
     _TabEntry(
@@ -76,7 +77,17 @@ class _PeerTabPageState extends State<PeerTabPage>
   }
 
   void _loadLocalOptions() {
-    final uiType = bind.getLocalFlutterOption(k: kOptionPeerCardUiType);
+    // Managed clients only ever use tile view - the "Change view" picker is
+    // hidden entirely for them (see _createPeerViewTypeSwitch), so a saved
+    // grid/list preference from before this was locked down (or from a
+    // config carried over some other way) must not stick - always resolve
+    // to tile regardless of what's saved.
+    if (bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty) {
+      peerCardUiType.value = PeerUiType.tile;
+      return;
+    }
+    final uiType =
+        bind.crateFlutterFfiGetLocalFlutterOption(k: kOptionPeerCardUiType);
     if (uiType != '') {
       peerCardUiType.value = int.parse(uiType) == 0
           ? PeerUiType.grid
@@ -85,7 +96,8 @@ class _PeerTabPageState extends State<PeerTabPage>
               : PeerUiType.list;
     }
     hideAbTagsPanel.value =
-        bind.mainGetLocalOption(key: kOptionHideAbTagsPanel) == 'Y';
+        bind.crateFlutterFfiMainGetLocalOption(key: kOptionHideAbTagsPanel) ==
+            'Y';
   }
 
   Future<void> handleTabSelection(int tabIndex) async {
@@ -96,6 +108,27 @@ class _PeerTabPageState extends State<PeerTabPage>
       gFFI.peerTabModel.setCurrentTab(tabIndex);
       entries[tabIndex].load?.call(hint: false);
     }
+  }
+
+  Timer? _managedSessionTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    // Owned here (rather than by DirectoryPeersView, which only exists in
+    // the widget tree while the Directory tab is actually selected) so
+    // Recent/Favorite peers keep getting their active-session data backfilled
+    // no matter which tab the user is currently looking at.
+    if (bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty) {
+      _managedSessionTimer = Timer.periodic(const Duration(seconds: 3),
+          (_) => enrichPeersWithManagedSessionData());
+    }
+  }
+
+  @override
+  void dispose() {
+    _managedSessionTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -109,6 +142,15 @@ class _PeerTabPageState extends State<PeerTabPage>
       textBaseline: TextBaseline.ideographic,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            loadIcon(20),
+            const SizedBox(width: 8),
+            const Text('RustDesk',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ],
+        ).paddingOnly(bottom: 12),
         Obx(() => SizedBox(
               height: 32,
               child: Container(
@@ -144,44 +186,54 @@ class _PeerTabPageState extends State<PeerTabPage>
         physics: NeverScrollableScrollPhysics(),
         children: model.visibleEnabledOrderedIndexs.map((t) {
           final selected = model.currentTab == t;
+          final label = model.tabTooltip(t).toUpperCase();
           final color = selected
-              ? MyTheme.tabbar(context).selectedTextColor
-              : MyTheme.tabbar(context).unSelectedTextColor
-            ?..withOpacity(0.5);
-          final hover = false.obs;
-          final deco = BoxDecoration(
-              color: Theme.of(context).colorScheme.background,
-              borderRadius: BorderRadius.circular(6));
-          final decoBorder = BoxDecoration(
-              border: Border(
-            bottom: BorderSide(width: 2, color: color!),
-          ));
+              ? Theme.of(context).colorScheme.primary
+              : Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.color
+                  ?.withValues(alpha: 0.6);
           counter += 1;
           return ReorderableDragStartListener(
               key: ValueKey(t),
               index: counter,
-              child: Obx(() => Tooltip(
-                    preferBelow: false,
-                    message: model.tabTooltip(t),
-                    onTriggered: isMobile ? mobileShowTabVisibilityMenu : null,
-                    child: InkWell(
-                      child: Container(
-                        decoration: (hover.value
-                            ? (selected ? decoBorder : deco)
-                            : (selected ? decoBorder : null)),
-                        child: Icon(model.tabIcon(t), color: color)
-                            .paddingSymmetric(horizontal: 4),
-                      ).paddingSymmetric(horizontal: 4),
-                      onTap: isOptionFixed(kOptionPeerTabIndex)
-                          ? null
-                          : () async {
-                              await handleTabSelection(t);
-                              await bind.setLocalFlutterOption(
-                                  k: kOptionPeerTabIndex, v: t.toString());
-                            },
-                      onHover: (value) => hover.value = value,
+              child: Tooltip(
+                preferBelow: false,
+                message: model.tabTooltip(t),
+                onTriggered: isMobile ? mobileShowTabVisibilityMenu : null,
+                child: InkWell(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border(
+                        bottom: BorderSide(
+                          width: 2,
+                          color: selected
+                              ? Theme.of(context).colorScheme.primary
+                              : Colors.transparent,
+                        ),
+                      ),
                     ),
-                  )));
+                    child: Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 11,
+                        letterSpacing: 0.5,
+                        fontWeight: FontWeight.bold,
+                        color: color,
+                        height: 1.0,
+                      ),
+                    ).paddingSymmetric(horizontal: 4, vertical: 2),
+                  ).paddingSymmetric(horizontal: 8),
+                  onTap: isOptionFixed(kOptionPeerTabIndex)
+                      ? null
+                      : () async {
+                          await handleTabSelection(t);
+                          await bind.crateFlutterFfiSetLocalFlutterOption(
+                              k: kOptionPeerTabIndex, v: t.toString());
+                        },
+                ),
+              ));
         }).toList());
   }
 
@@ -235,6 +287,10 @@ class _PeerTabPageState extends State<PeerTabPage>
   }
 
   Widget _createPeerViewTypeSwitch(BuildContext context) {
+    // Nothing to switch between when tile view is the only option allowed.
+    if (bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty) {
+      return const Offstage();
+    }
     return PeerViewDropdown();
   }
 
@@ -396,23 +452,23 @@ class _PeerTabPageState extends State<PeerTabPage>
             switch (model.currentTab) {
               case 0:
                 for (var p in peers) {
-                  await bind.mainRemovePeer(id: p.id);
+                  await bind.crateFlutterFfiMainRemovePeer(id: p.id);
                 }
-                bind.mainLoadRecentPeers();
+                bind.crateFlutterFfiMainLoadRecentPeers();
                 break;
               case 1:
-                final favs = (await bind.mainGetFav()).toList();
+                final favs = (await bind.crateFlutterFfiMainGetFav()).toList();
                 peers.map((p) {
                   favs.remove(p.id);
                 }).toList();
-                await bind.mainStoreFav(favs: favs);
-                bind.mainLoadFavPeers();
+                await bind.crateFlutterFfiMainStoreFav(favs: favs);
+                bind.crateFlutterFfiMainLoadFavPeers();
                 break;
               case 2:
                 for (var p in peers) {
-                  await bind.mainRemoveDiscovered(id: p.id);
+                  await bind.crateFlutterFfiMainRemoveDiscovered(id: p.id);
                 }
-                bind.mainLoadLanPeers();
+                bind.crateFlutterFfiMainLoadLanPeers();
                 break;
               case 3:
                 await gFFI.abModel.deletePeers(peers.map((p) => p.id).toList());
@@ -439,13 +495,13 @@ class _PeerTabPageState extends State<PeerTabPage>
         toolTip: translate('Add to Favorites'),
         onTap: () async {
           final peers = model.selectedPeers;
-          final favs = (await bind.mainGetFav()).toList();
+          final favs = (await bind.crateFlutterFfiMainGetFav()).toList();
           for (var p in peers) {
             if (!favs.contains(p.id)) {
               favs.add(p.id);
             }
           }
-          await bind.mainStoreFav(favs: favs);
+          await bind.crateFlutterFfiMainStoreFav(favs: favs);
           model.setMultiSelectionMode(false);
           showToast(translate('Successful'));
         },
@@ -542,7 +598,7 @@ class _PeerTabPageState extends State<PeerTabPage>
           size: 18,
         ),
         onTap: () async {
-          await bind.mainSetLocalOption(
+          await bind.crateFlutterFfiMainSetLocalOption(
               key: kOptionHideAbTagsPanel,
               value: hideAbTagsPanel.value ? defaultOptionNo : "Y");
           hideAbTagsPanel.value = !hideAbTagsPanel.value;
@@ -551,19 +607,23 @@ class _PeerTabPageState extends State<PeerTabPage>
 
   List<Widget> _landscapeRightActions(BuildContext context) {
     final model = Provider.of<PeerTabModel>(context);
+    // Managed clients get a locked-down toolbar: no multi-select (it's how
+    // users could select-all and bulk delete clients) and no sort picker
+    // (sorting is hardcoded to alphabetical-by-friendly-name for them).
+    final isManaged =
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
     return [
-      const PeerSearchBar().marginOnly(right: 13),
       _createRefresh(
           index: PeerTabIndex.ab, loading: gFFI.abModel.currentAbLoading),
       _createRefresh(
           index: PeerTabIndex.group, loading: gFFI.groupModel.groupLoading),
       Offstage(
-        offstage: model.currentTabCachedPeers.isEmpty,
+        offstage: isManaged || model.currentTabCachedPeers.isEmpty,
         child: _createMultiSelection(),
       ),
       _createPeerViewTypeSwitch(context),
       Offstage(
-        offstage: model.currentTab == PeerTabIndex.recent.index,
+        offstage: isManaged || model.currentTab == PeerTabIndex.recent.index,
         child: PeerSortDropdown(),
       ),
       Offstage(
@@ -617,9 +677,8 @@ class _PeerTabPageState extends State<PeerTabPage>
       );
     }
 
-    // Always show search, refresh
+    // Always show refresh
     List<Widget> actions = [
-      const PeerSearchBar(),
       if (model.currentTab == PeerTabIndex.ab.index)
         _createRefresh(
             index: PeerTabIndex.ab, loading: gFFI.abModel.currentAbLoading),
@@ -627,9 +686,15 @@ class _PeerTabPageState extends State<PeerTabPage>
         _createRefresh(
             index: PeerTabIndex.group, loading: gFFI.groupModel.groupLoading),
     ];
+    // See _landscapeRightActions: managed clients don't get multi-select or
+    // sort controls.
+    final isManaged =
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
     final List<Widget> dynamicActions = [
-      if (model.currentTabCachedPeers.isNotEmpty) _createMultiSelection(),
-      if (model.currentTab != PeerTabIndex.recent.index) PeerSortDropdown(),
+      if (!isManaged && model.currentTabCachedPeers.isNotEmpty)
+        _createMultiSelection(),
+      if (!isManaged && model.currentTab != PeerTabIndex.recent.index)
+        PeerSortDropdown(),
       if (model.currentTab == PeerTabIndex.ab.index) _toggleTags()
     ];
     final rightWidth = availableWidth -
@@ -657,7 +722,7 @@ class _PeerTabPageState extends State<PeerTabPage>
 }
 
 class PeerSearchBar extends StatefulWidget {
-  const PeerSearchBar({Key? key}) : super(key: key);
+  const PeerSearchBar({super.key});
 
   @override
   State<StatefulWidget> createState() => _PeerSearchBarState();
@@ -697,7 +762,7 @@ class _PeerSearchBarState extends State<PeerSearchBar> {
     return Obx(() => Container(
           width: stateGlobal.isPortrait.isTrue ? 120 : 140,
           decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.background,
+            color: Theme.of(context).colorScheme.surface,
             borderRadius: BorderRadius.circular(6),
           ),
           child: Row(
@@ -723,7 +788,7 @@ class _PeerSearchBarState extends State<PeerSearchBar> {
                             .textTheme
                             .titleLarge
                             ?.color
-                            ?.withOpacity(0.5),
+                            ?.withValues(alpha: 0.5),
                         cursorHeight: 18,
                         cursorWidth: 1,
                         style: const TextStyle(fontSize: 14),
@@ -820,7 +885,7 @@ class _PeerViewDropdownState extends State<PeerViewDropdown> {
                               if (v != null) {
                                 peerCardUiType.value = v;
                                 setState(() {});
-                                await bind.setLocalFlutterOption(
+                                await bind.crateFlutterFfiSetLocalFlutterOption(
                                   k: kOptionPeerCardUiType,
                                   v: peerCardUiType.value.index.toString(),
                                 );
@@ -875,7 +940,7 @@ class _PeerSortDropdownState extends State<PeerSortDropdown> {
 
   void _loadLocalOptions() {
     peerSort.value = PeerSortType.remoteId;
-    bind.setLocalFlutterOption(
+    bind.crateFlutterFfiSetLocalFlutterOption(
       k: kOptionPeerSorting,
       v: peerSort.value,
     );
@@ -903,7 +968,7 @@ class _PeerSortDropdownState extends State<PeerSortDropdown> {
                       dense: true, (String? v) async {
                     if (v != null) {
                       peerSort.value = v;
-                      await bind.setLocalFlutterOption(
+                      await bind.crateFlutterFfiSetLocalFlutterOption(
                         k: kOptionPeerSorting,
                         v: peerSort.value,
                       );
@@ -966,7 +1031,7 @@ class RefreshWidgetState extends State<RefreshWidget> {
   @override
   Widget build(BuildContext context) {
     final deco = BoxDecoration(
-      color: Theme.of(context).colorScheme.background,
+      color: Theme.of(context).colorScheme.surface,
       borderRadius: BorderRadius.circular(6),
     );
     return AnimatedRotation(
@@ -1008,7 +1073,7 @@ Widget _hoverAction(
     EdgeInsetsGeometry padding = const EdgeInsets.all(4.0)}) {
   final hover = false.obs;
   final deco = BoxDecoration(
-    color: Theme.of(context).colorScheme.background,
+    color: Theme.of(context).colorScheme.surface,
     borderRadius: BorderRadius.circular(6),
   );
   return Tooltip(

@@ -25,10 +25,10 @@ const double _kSpaceBetweenLeftRightButtons = 40;
 const double _kLeftRightButtonWidth = 55;
 const double _kLeftRightButtonHeight = 40;
 const double _kBorderWidth = 1;
-final Color _kDefaultBorderColor = Colors.white.withOpacity(0.7);
-final Color _kDefaultColor = Colors.black.withOpacity(0.4);
-final Color _kTapDownColor = Colors.blue.withOpacity(0.7);
-final Color _kWidgetHighlightColor = Colors.white.withOpacity(0.9);
+final Color _kDefaultBorderColor = Colors.white.withValues(alpha: 0.7);
+final Color _kDefaultColor = Colors.black.withValues(alpha: 0.4);
+final Color _kTapDownColor = Colors.blue.withValues(alpha: 0.7);
+final Color _kWidgetHighlightColor = Colors.white.withValues(alpha: 0.9);
 const int _kInputTimerIntervalMillis = 100;
 
 class FloatingMouseWidgets extends StatefulWidget {
@@ -452,13 +452,14 @@ class _FloatingLeftRightButtonState extends State<FloatingLeftRightButton> {
       'x': _position.dx,
       'y': _position.dy,
     });
-    bind.setLocalFlutterOption(
+    bind.crateFlutterFfiSetLocalFlutterOption(
         k: _getPositionKey(_previousOrientation!), v: pos);
     _preSavedPos = _position;
   }
 
   void _restorePosition(Orientation ori) {
-    final ps = bind.getLocalFlutterOption(k: _getPositionKey(ori));
+    final ps =
+        bind.crateFlutterFfiGetLocalFlutterOption(k: _getPositionKey(ori));
     final pos = _loadPositionFromString(ps);
     if (pos == null) {
       final size = MediaQuery.of(context).size;

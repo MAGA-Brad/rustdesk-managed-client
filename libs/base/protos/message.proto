@@ -84,6 +84,9 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
+  // Managed builds: the controller's RDS device certificate plus its signature over this login's
+  // challenge (see src/managed_peer_auth.rs). Ignored by clients that don't know it.
+  bytes managed_peer_proof = 100;
 }
 
 message Terminal {

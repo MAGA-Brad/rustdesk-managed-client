@@ -11,9 +11,9 @@ import 'package:provider/provider.dart';
 
 const int _kDotCount = 60;
 const double _kDotAngle = 2 * pi / _kDotCount;
-final Color _kDefaultColor = Colors.grey.withOpacity(0.7);
-final Color _kDefaultHighlightColor = Colors.white24.withOpacity(0.7);
-final Color _kTapDownColor = Colors.blue.withOpacity(0.7);
+final Color _kDefaultColor = Colors.grey.withValues(alpha: 0.7);
+final Color _kDefaultHighlightColor = Colors.white24.withValues(alpha: 0.7);
+final Color _kTapDownColor = Colors.blue.withValues(alpha: 0.7);
 const double _baseMouseWidth = 112.0;
 const double _baseMouseHeight = 138.0;
 const double _kShowPressedScale = 1.2;
@@ -987,7 +987,7 @@ class _MouseBodyState extends State<MouseBody> {
                           width: 22 * s,
                           height: 67 * s,
                           decoration: BoxDecoration(
-                            color: Colors.grey.withOpacity(0.7),
+                            color: Colors.grey.withValues(alpha: 0.7),
                             borderRadius: BorderRadius.vertical(
                               top: Radius.circular(12 * s),
                               bottom: Radius.circular(16 * s),
@@ -1116,7 +1116,7 @@ class BottomIndentPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = Colors.grey.withOpacity(0.7)
+      ..color = Colors.grey.withValues(alpha: 0.7)
       ..style = PaintingStyle.fill;
     // Draw bottom semicircle
     final center = Offset(size.width / 2, size.height);

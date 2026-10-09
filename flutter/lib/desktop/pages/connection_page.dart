@@ -16,14 +16,14 @@ import 'package:flutter_hbb/models/peer_model.dart';
 
 import '../../common.dart';
 import '../../common/formatter/id_formatter.dart';
+import '../../common/widgets/peer_card.dart' show getActiveSessionPill;
 import '../../common/widgets/peer_tab_page.dart';
 import '../../common/widgets/autocomplete.dart';
 import '../../models/platform_model.dart';
 import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
 
 class OnlineStatusWidget extends StatefulWidget {
-  const OnlineStatusWidget({Key? key, this.onSvcStatusChanged})
-      : super(key: key);
+  const OnlineStatusWidget({super.key, this.onSvcStatusChanged});
 
   final VoidCallback? onSvcStatusChanged;
 
@@ -35,10 +35,31 @@ class OnlineStatusWidget extends StatefulWidget {
 class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
   final _svcStopped = Get.find<RxBool>(tag: 'stop-service');
   final _svcIsUsingPublicServer = true.obs;
+  final _directoryState = ''.obs;
+  final _directoryStatusText = ''.obs;
+  final _reenrollmentRequested = false.obs;
+  final _reenrollmentAuthorized = false.obs;
+  final _reenrollmentRequestBusy = false.obs;
+  final RxnInt _managedOnlineClients = RxnInt();
+  final RxnInt _managedActiveSessions = RxnInt();
+  final RxnString _selfActiveSessionPeer = RxnString();
   Timer? _updateTimer;
 
+  // Managed clients auto-enroll into the directory, so the manual
+  // "Control Remote Desktop" ID field is hidden and this status area
+  // gets some of the freed-up space instead of its usual compact height
+  // (was em * 10 - halved per direct feedback that the full amount left
+  // too much dead space at the bottom of the window).
+  bool get _isManagedClient =>
+      bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
+
   double get em => 14.0;
-  double? get height => bind.isIncomingOnly() ? null : em * 3;
+  double? get height => bind.crateFlutterFfiIsIncomingOnly()
+      ? null
+      // +0.5em over the previous em*5 to fit the RustDrop launch button
+      // inline in statusRow() without clipping - the fixed height here
+      // only had room for exactly 2 rows before.
+      : (_isManagedClient ? em * 5.5 : em * 3);
 
   void onUsePublicServerGuide() {
     const url = "https://rustdesk.com/pricing";
@@ -65,7 +86,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
 
   @override
   Widget build(BuildContext context) {
-    final isIncomingOnly = bind.isIncomingOnly();
+    final isIncomingOnly = bind.crateFlutterFfiIsIncomingOnly();
     startServiceWidget() => Offstage(
           offstage: !_svcStopped.value,
           child: InkWell(
@@ -109,7 +130,28 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
           ),
         );
 
-    basicWidget() => Row(
+    statsRow() => (!isIncomingOnly &&
+            (_managedOnlineClients.value != null ||
+                _managedActiveSessions.value != null))
+        ? Row(
+            children: [
+              Text(
+                '${translate("Clients online")}: ${_managedOnlineClients.value?.toString() ?? '—'}',
+                style: TextStyle(
+                    fontSize: em - 1,
+                    color: Theme.of(context).textTheme.bodySmall?.color),
+              ).marginOnly(right: 16),
+              Text(
+                '${translate("Active sessions")}: ${_managedActiveSessions.value?.toString() ?? '—'}',
+                style: TextStyle(
+                    fontSize: em - 1,
+                    color: Theme.of(context).textTheme.bodySmall?.color),
+              ),
+            ],
+          ).marginOnly(top: 4, left: em + 8)
+        : const Offstage();
+
+    statusRow() => Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             Container(
@@ -117,28 +159,113 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
               width: 8,
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(4),
-                color: _svcStopped.value ||
-                        stateGlobal.svcStatus.value == SvcStatus.connecting
-                    ? kColorWarn
-                    : (stateGlobal.svcStatus.value == SvcStatus.ready
-                        ? Color.fromARGB(255, 50, 190, 166)
-                        : Color.fromARGB(255, 224, 79, 95)),
+                color: _directoryStatusText.value.isNotEmpty
+                    ? (_directoryState.value == 'ready'
+                        ? const Color.fromARGB(255, 50, 190, 166)
+                        : (_directoryState.value == 'denied' ||
+                                _directoryState.value == 'blocked' ||
+                                _directoryState.value == 'revoked')
+                            ? const Color.fromARGB(255, 224, 79, 95)
+                            : kColorWarn)
+                    : (_svcStopped.value ||
+                            stateGlobal.svcStatus.value == SvcStatus.connecting
+                        ? kColorWarn
+                        : (stateGlobal.svcStatus.value == SvcStatus.ready
+                            ? const Color.fromARGB(255, 50, 190, 166)
+                            : const Color.fromARGB(255, 224, 79, 95))),
               ),
             ).marginSymmetric(horizontal: em),
             Container(
               width: isIncomingOnly ? 226 : null,
               child: _buildConnStatusMsg(),
             ),
+            if (!isIncomingOnly)
+              Obx(() {
+                final pill = getActiveSessionPill(_selfActiveSessionPeer.value);
+                return pill == null
+                    ? const Offstage()
+                    : pill.marginOnly(left: 8);
+              }),
+            if (!isIncomingOnly &&
+                ['denied', 'blocked', 'revoked', 'identity_changed']
+                    .contains(_directoryState.value))
+              Obx(() => TextButton.icon(
+                    // _reenrollmentAuthorized alone must NOT disable this -
+                    // it only means an operator has already authorized a
+                    // re-enrollment (which can happen before this device
+                    // ever asks, since authorization and request are
+                    // independent server-side). The actual completion only
+                    // fires as a side effect of THIS button's own click
+                    // (request_reenrollment_once() discovers authorization
+                    // in its own response and completes immediately) - so
+                    // disabling on "already authorized" deadlocks the one
+                    // click that would finish the process. Only a request
+                    // already in flight, or one already sent and still
+                    // awaiting authorization, should disable it.
+                    onPressed: _reenrollmentRequestBusy.value ||
+                            (_reenrollmentRequested.value &&
+                                !_reenrollmentAuthorized.value)
+                        ? null
+                        : () async {
+                            _reenrollmentRequestBusy.value = true;
+                            try {
+                              await bind.crateFlutterFfiMainSetOption(
+                                key: 'managed-request-reenrollment',
+                                value: 'Y',
+                              );
+                            } finally {
+                              await Future<void>.delayed(
+                                  const Duration(milliseconds: 750));
+                              _reenrollmentRequestBusy.value = false;
+                              updateStatus();
+                            }
+                          },
+                    icon: const Icon(Icons.admin_panel_settings_outlined,
+                        size: 16),
+                    label: Text(
+                      _reenrollmentAuthorized.value
+                          ? 'Continue re-enrollment'
+                          : _reenrollmentRequested.value
+                              ? 'Requested'
+                              : 'Request re-enrollment',
+                    ),
+                  )).marginOnly(left: 8),
             // stop
             if (!isIncomingOnly) startServiceWidget(),
             // ready && public
             // No need to show the guide if is custom client.
             if (!isIncomingOnly) setupServerWidget(),
+            const Spacer(),
+            TextButton.icon(
+              onPressed: () => bind.crateFlutterFfiMainLaunchRustdrop(),
+              icon: const Icon(Icons.drive_file_move_outline, size: 28),
+              label: const Text(
+                'RustDrop',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              ),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+          ],
+        );
+
+    basicWidget() => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            statusRow(),
+            statsRow(),
           ],
         );
 
     return Container(
       height: height,
+      color: Theme.of(context).colorScheme.surface,
+      alignment:
+          (!isIncomingOnly && _isManagedClient) ? Alignment.centerLeft : null,
       child: Obx(() => isIncomingOnly
           ? Column(
               children: [
@@ -153,23 +280,32 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
     ).paddingOnly(right: isIncomingOnly ? 8 : 0);
   }
 
-  _buildConnStatusMsg() {
+  Text _buildConnStatusMsg() {
     widget.onSvcStatusChanged?.call();
+
+    final friendlyName =
+        bind.crateFlutterFfiMainGetOptionSync(key: 'preset-device-name').trim();
+    final readyText = friendlyName.isEmpty
+        ? translate('Ready')
+        : 'Ready \u2014 $friendlyName';
+
     return Text(
-      _svcStopped.value
-          ? translate("Service is not running")
-          : stateGlobal.svcStatus.value == SvcStatus.connecting
-              ? translate("connecting_status")
-              : stateGlobal.svcStatus.value == SvcStatus.notReady
-                  ? translate("not_ready_status")
-                  : translate('Ready'),
+      _directoryStatusText.value.isNotEmpty
+          ? _directoryStatusText.value
+          : _svcStopped.value
+              ? translate("Service is not running")
+              : stateGlobal.svcStatus.value == SvcStatus.connecting
+                  ? translate("connecting_status")
+                  : stateGlobal.svcStatus.value == SvcStatus.notReady
+                      ? translate("not_ready_status")
+                      : readyText,
       style: TextStyle(fontSize: em),
     );
   }
 
-  updateStatus() async {
-    final status =
-        jsonDecode(await bind.mainGetConnectStatus()) as Map<String, dynamic>;
+  Future<void> updateStatus() async {
+    final status = jsonDecode(await bind.crateFlutterFfiMainGetConnectStatus())
+        as Map<String, dynamic>;
     final statusNum = status['status_num'] as int;
     if (statusNum == 0) {
       stateGlobal.svcStatus.value = SvcStatus.connecting;
@@ -180,7 +316,75 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
     } else {
       stateGlobal.svcStatus.value = SvcStatus.notReady;
     }
-    _svcIsUsingPublicServer.value = await bind.mainIsUsingPublicServer();
+    _svcIsUsingPublicServer.value =
+        await bind.crateFlutterFfiMainIsUsingPublicServer();
+
+    final managedDirectory =
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus();
+
+    if (managedDirectory.isEmpty) {
+      _directoryState.value = '';
+      _directoryStatusText.value = '';
+      _reenrollmentRequested.value = false;
+      _reenrollmentAuthorized.value = false;
+      _managedOnlineClients.value = null;
+      _managedActiveSessions.value = null;
+      _selfActiveSessionPeer.value = null;
+    } else {
+      try {
+        final directory = jsonDecode(managedDirectory) as Map<String, dynamic>;
+
+        _directoryState.value = directory['state'] as String? ?? 'unavailable';
+        _reenrollmentRequested.value =
+            directory['reenrollment_requested'] as bool? ?? false;
+        _reenrollmentAuthorized.value =
+            directory['reenrollment_authorized'] as bool? ?? false;
+        _selfActiveSessionPeer.value =
+            directory['self_active_session_peer'] as String?;
+
+        final serverStats = directory['server_stats'];
+        if (serverStats is Map) {
+          _managedOnlineClients.value =
+              (serverStats['online_clients'] as num?)?.toInt();
+          _managedActiveSessions.value =
+              (serverStats['active_sessions'] as num?)?.toInt();
+        } else {
+          _managedOnlineClients.value = null;
+          _managedActiveSessions.value = null;
+        }
+
+        final directoryText = directory['text'] as String? ?? '';
+
+        if (directoryText.isNotEmpty) {
+          _directoryStatusText.value = directoryText;
+        } else {
+          final friendlyName = bind
+              .crateFlutterFfiMainGetOptionSync(
+                key: 'preset-device-name',
+              )
+              .trim();
+
+          _directoryStatusText.value =
+              'Directory unavailable \u2014 $friendlyName';
+        }
+      } catch (_) {
+        _directoryState.value = 'unavailable';
+        _reenrollmentRequested.value = false;
+        _reenrollmentAuthorized.value = false;
+        _managedOnlineClients.value = null;
+        _managedActiveSessions.value = null;
+        _selfActiveSessionPeer.value = null;
+
+        final friendlyName = bind
+            .crateFlutterFfiMainGetOptionSync(
+              key: 'preset-device-name',
+            )
+            .trim();
+
+        _directoryStatusText.value =
+            'Directory unavailable \u2014 $friendlyName';
+      }
+    }
     try {
       stateGlobal.videoConnCount.value = status['video_conn_count'] as int;
     } catch (_) {}
@@ -189,7 +393,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
 
 /// Connection page for connecting to a remote peer.
 class ConnectionPage extends StatefulWidget {
-  const ConnectionPage({Key? key}) : super(key: key);
+  const ConnectionPage({super.key});
 
   @override
   State<ConnectionPage> createState() => _ConnectionPageState();
@@ -223,7 +427,7 @@ class _ConnectionPageState extends State<ConnectionPage>
     _idFocusNode.addListener(onFocusChanged);
     if (_idController.text.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
-        final lastRemoteId = await bind.mainGetLastRemoteId();
+        final lastRemoteId = await bind.crateFlutterFfiMainGetLastRemoteId();
         if (lastRemoteId != _idController.id) {
           setState(() {
             _idController.id = lastRemoteId;
@@ -284,7 +488,7 @@ class _ConnectionPageState extends State<ConnectionPage>
   @override
   void onWindowClose() {
     super.onWindowClose();
-    bind.mainOnMainWindowClose();
+    bind.crateFlutterFfiMainOnMainWindowClose();
   }
 
   void onFocusChanged() {
@@ -303,18 +507,23 @@ class _ConnectionPageState extends State<ConnectionPage>
 
   @override
   Widget build(BuildContext context) {
-    final isOutgoingOnly = bind.isOutgoingOnly();
+    final isOutgoingOnly = bind.crateFlutterFfiIsOutgoingOnly();
+    // Managed clients auto-enroll into the directory below, so the manual
+    // "Control Remote Desktop" ID field isn't needed and is hidden.
+    final isManagedClient =
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
     return Column(
       children: [
         Expanded(
             child: Column(
           children: [
-            Row(
-              children: [
-                Flexible(child: _buildRemoteIDTextField(context)),
-              ],
-            ).marginOnly(top: 22),
-            SizedBox(height: 12),
+            if (!isManagedClient)
+              Row(
+                children: [
+                  Flexible(child: _buildRemoteIDTextField(context)),
+                ],
+              ).marginOnly(top: 22),
+            if (!isManagedClient) SizedBox(height: 12),
             Divider().paddingOnly(right: 12),
             Expanded(child: PeerTabPage()),
           ],
@@ -348,7 +557,7 @@ class _ConnectionPageState extends State<ConnectionPage>
       padding: const EdgeInsets.fromLTRB(20, 24, 20, 22),
       decoration: BoxDecoration(
           borderRadius: const BorderRadius.all(Radius.circular(13)),
-          border: Border.all(color: Theme.of(context).colorScheme.background)),
+          border: Border.all(color: Theme.of(context).colorScheme.surface)),
       child: Ink(
         child: Column(
           children: [
@@ -471,7 +680,7 @@ class _ConnectionPageState extends State<ConnectionPage>
                           decoration: BoxDecoration(
                             boxShadow: [
                               BoxShadow(
-                                color: Colors.black.withOpacity(0.3),
+                                color: Colors.black.withValues(alpha: 0.3),
                                 blurRadius: 5,
                                 spreadRadius: 1,
                               ),
@@ -558,10 +767,6 @@ class _ConnectionPageState extends State<ConnectionPage>
                                   context: context,
                                   position: RelativeRect.fromLTRB(x, y, x, y),
                                   items: [
-                                    (
-                                      'Transfer file',
-                                      () => onConnect(isFileTransfer: true)
-                                    ),
                                     (
                                       'View camera',
                                       () => onConnect(isViewCamera: true)

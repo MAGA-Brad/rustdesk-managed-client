@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 class IDTextEditingController extends TextEditingController {
-  IDTextEditingController({String? text}) : super(text: text);
+  IDTextEditingController({super.text});
 
   String get id => trimID(value.text);
 

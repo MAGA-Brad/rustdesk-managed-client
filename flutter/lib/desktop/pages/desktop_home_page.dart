@@ -24,9 +24,10 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:window_size/window_size.dart' as window_size;
 import '../widgets/button.dart';
+import '../../common/widgets/dialog.dart' show change2fa;
 
 class DesktopHomePage extends StatefulWidget {
-  const DesktopHomePage({Key? key}) : super(key: key);
+  const DesktopHomePage({super.key});
 
   @override
   State<DesktopHomePage> createState() => _DesktopHomePageState();
@@ -58,13 +59,19 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   @override
   Widget build(BuildContext context) {
     super.build(context);
-    final isIncomingOnly = bind.isIncomingOnly();
+    final isIncomingOnly = bind.crateFlutterFfiIsIncomingOnly();
+    // Managed clients auto-enroll into the directory, so the left sidebar
+    // (own ID/password, stats) is dropped entirely and the peer directory
+    // occupies the full window.
+    final isManagedClient =
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
     return _buildBlock(
         child: Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        buildLeftPane(context),
-        if (!isIncomingOnly) const VerticalDivider(width: 1),
+        if (!isManagedClient) buildLeftPane(context),
+        if (!isManagedClient && !isIncomingOnly)
+          const VerticalDivider(width: 1),
         if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
       ],
     ));
@@ -76,11 +83,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildLeftPane(BuildContext context) {
-    final isIncomingOnly = bind.isIncomingOnly();
-    final isOutgoingOnly = bind.isOutgoingOnly();
+    final isIncomingOnly = bind.crateFlutterFfiIsIncomingOnly();
+    final isOutgoingOnly = bind.crateFlutterFfiIsOutgoingOnly();
     final children = <Widget>[
       if (!isOutgoingOnly) buildPresetPasswordWarning(),
-      if (bind.isCustomClient())
+      if (bind.crateFlutterFfiIsCustomClient())
         Align(
           alignment: Alignment.center,
           child: loadPowered(context),
@@ -130,7 +137,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       value: gFFI.serverModel,
       child: Container(
         width: isIncomingOnly ? 280.0 : 200.0,
-        color: Theme.of(context).colorScheme.background,
+        color: Theme.of(context).colorScheme.surface,
         child: Stack(
           children: [
             Column(
@@ -157,7 +164,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                         Icons.settings,
                         color: _editHover.value
                             ? textColor
-                            : Colors.grey.withOpacity(0.5),
+                            : Colors.grey.withValues(alpha: 0.5),
                         size: 22,
                       ),
                     ),
@@ -178,14 +185,14 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
-  buildRightPane(BuildContext context) {
+  Container buildRightPane(BuildContext context) {
     return Container(
       color: Theme.of(context).scaffoldBackgroundColor,
       child: ConnectionPage(),
     );
   }
 
-  buildIDBoard(BuildContext context) {
+  Container buildIDBoard(BuildContext context) {
     final model = gFFI.serverModel;
     return Container(
       margin: const EdgeInsets.only(left: 20, right: 11),
@@ -211,14 +218,14 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          translate("ID"),
+                          'RustDesk ID',
                           style: TextStyle(
                               fontSize: 14,
                               color: Theme.of(context)
                                   .textTheme
                                   .titleLarge
                                   ?.color
-                                  ?.withOpacity(0.5)),
+                                  ?.withValues(alpha: 0.5)),
                         ).marginOnly(top: 5),
                         buildPopupMenu(context)
                       ],
@@ -265,11 +272,12 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             radius: 15,
             backgroundColor: hover.value
                 ? Theme.of(context).scaffoldBackgroundColor
-                : Theme.of(context).colorScheme.background,
+                : Theme.of(context).colorScheme.surface,
             child: Icon(
               Icons.more_vert_outlined,
               size: 20,
-              color: hover.value ? textColor : textColor?.withOpacity(0.5),
+              color:
+                  hover.value ? textColor : textColor?.withValues(alpha: 0.5),
             ),
           ),
         ),
@@ -278,7 +286,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
-  buildPasswordBoard(BuildContext context) {
+  ChangeNotifierProvider<ServerModel> buildPasswordBoard(BuildContext context) {
     return ChangeNotifierProvider.value(
         value: gFFI.serverModel,
         child: Consumer<ServerModel>(
@@ -288,7 +296,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         ));
   }
 
-  buildPasswordBoard2(BuildContext context, ServerModel model) {
+  Container buildPasswordBoard2(BuildContext context, ServerModel model) {
     RxBool refreshHover = false.obs;
     RxBool editHover = false.obs;
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
@@ -314,7 +322,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                   AutoSizeText(
                     translate("One-time Password"),
                     style: TextStyle(
-                        fontSize: 14, color: textColor?.withOpacity(0.5)),
+                        fontSize: 14, color: textColor?.withValues(alpha: 0.5)),
                     maxLines: 1,
                   ),
                   Row(
@@ -342,7 +350,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                       ),
                       if (showOneTime)
                         AnimatedRotationWidget(
-                          onPressed: () => bind.mainUpdateTemporaryPassword(),
+                          onPressed: () =>
+                              bind.crateFlutterFfiMainUpdateTemporaryPassword(),
                           child: Tooltip(
                             message: translate('Refresh Password'),
                             child: Obx(() => RotatedBox(
@@ -357,7 +366,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                           ),
                           onHover: (value) => refreshHover.value = value,
                         ).marginOnly(right: 8, top: 4),
-                      if (!bind.isDisableSettings())
+                      if (!bind.crateFlutterFfiIsDisableSettings())
                         InkWell(
                           child: Tooltip(
                             message: translate('Change Password'),
@@ -386,8 +395,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
-  buildTip(BuildContext context) {
-    final isOutgoingOnly = bind.isOutgoingOnly();
+  Padding buildTip(BuildContext context) {
+    final isOutgoingOnly = bind.crateFlutterFfiIsOutgoingOnly();
     return Padding(
       padding:
           const EdgeInsets.only(left: 20.0, right: 16, top: 16.0, bottom: 5),
@@ -428,11 +437,15 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
-    if (!bind.isCustomClient() &&
+    final managedClient = isWindows &&
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty;
+    if (!managedClient &&
+        !bind.crateFlutterFfiIsCustomClient() &&
         updateUrl.isNotEmpty &&
         !isCardClosed &&
-        bind.mainUriPrefixSync().contains('rustdesk')) {
-      final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
+        bind.crateFlutterFfiMainUriPrefixSync().contains('rustdesk')) {
+      final isToUpdate =
+          (isWindows || isMacOS) && bind.crateFlutterFfiMainIsInstalled();
       String btnText = isToUpdate ? 'Update' : 'Download';
       GestureTapCallback onPressed = () async {
         final Uri url = Uri.parse('https://rustdesk.com/download');
@@ -445,61 +458,65 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
       return buildInstallCard(
           "Status",
-          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
+          "${translate("new-version-of-{${bind.crateFlutterFfiMainGetAppNameSync()}}-tip")} (${bind.crateFlutterFfiMainGetNewVersion()}).",
           btnText,
           onPressed,
           closeButton: true,
           help: isToUpdate ? 'Changelog' : null,
           link: isToUpdate
-              ? 'https://github.com/rustdesk/rustdesk/releases/tag/${bind.mainGetNewVersion()}'
+              ? 'https://github.com/rustdesk/rustdesk/releases/tag/${bind.crateFlutterFfiMainGetNewVersion()}'
               : null);
     }
     if (systemError.isNotEmpty) {
       return buildInstallCard("", systemError, "", () {});
     }
 
-    if (isWindows && !bind.isDisableInstallation()) {
-      if (!bind.mainIsInstalled()) {
+    if (isWindows && !bind.crateFlutterFfiIsDisableInstallation()) {
+      if (!bind.crateFlutterFfiMainIsInstalled()) {
         return buildInstallCard(
-            "", bind.isOutgoingOnly() ? "" : "install_tip", "Install",
-            () async {
+            "",
+            bind.crateFlutterFfiIsOutgoingOnly() ? "" : "install_tip",
+            "Install", () async {
           await rustDeskWinManager.closeAllSubWindows();
-          bind.mainGotoInstall();
+          bind.crateFlutterFfiMainGotoInstall();
         });
-      } else if (bind.mainIsInstalledLowerVersion()) {
+      } else if (!managedClient &&
+          bind.crateFlutterFfiMainIsInstalledLowerVersion()) {
         return buildInstallCard(
             "Status", "Your installation is lower version.", "Click to upgrade",
             () async {
           await rustDeskWinManager.closeAllSubWindows();
-          bind.mainUpdateMe();
+          bind.crateFlutterFfiMainUpdateMe();
         });
       }
     } else if (isMacOS) {
-      final isOutgoingOnly = bind.isOutgoingOnly();
-      if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
+      final isOutgoingOnly = bind.crateFlutterFfiIsOutgoingOnly();
+      if (!(isOutgoingOnly ||
+          bind.crateFlutterFfiMainIsCanScreenRecording(prompt: false))) {
         return buildInstallCard("Permissions", "config_screen", "Configure",
             () async {
-          bind.mainIsCanScreenRecording(prompt: true);
+          bind.crateFlutterFfiMainIsCanScreenRecording(prompt: true);
           watchIsCanScreenRecording = true;
         }, help: 'Help', link: translate("doc_mac_permission"));
-      } else if (!isOutgoingOnly && !bind.mainIsProcessTrusted(prompt: false)) {
+      } else if (!isOutgoingOnly &&
+          !bind.crateFlutterFfiMainIsProcessTrusted(prompt: false)) {
         return buildInstallCard("Permissions", "config_acc", "Configure",
             () async {
-          bind.mainIsProcessTrusted(prompt: true);
+          bind.crateFlutterFfiMainIsProcessTrusted(prompt: true);
           watchIsProcessTrust = true;
         }, help: 'Help', link: translate("doc_mac_permission"));
-      } else if (!bind.mainIsCanInputMonitoring(prompt: false)) {
+      } else if (!bind.crateFlutterFfiMainIsCanInputMonitoring(prompt: false)) {
         return buildInstallCard("Permissions", "config_input", "Configure",
             () async {
-          bind.mainIsCanInputMonitoring(prompt: true);
+          bind.crateFlutterFfiMainIsCanInputMonitoring(prompt: true);
           watchIsInputMonitoring = true;
         }, help: 'Help', link: translate("doc_mac_permission"));
       } else if (!isOutgoingOnly &&
           !svcStopped.value &&
-          bind.mainIsInstalled() &&
-          !bind.mainIsInstalledDaemon(prompt: false)) {
+          bind.crateFlutterFfiMainIsInstalled() &&
+          !bind.crateFlutterFfiMainIsInstalledDaemon(prompt: false)) {
         return buildInstallCard("", "install_daemon_tip", "Install", () async {
-          bind.mainIsInstalledDaemon(prompt: true);
+          bind.crateFlutterFfiMainIsInstalledDaemon(prompt: true);
         });
       }
       //// Disable microphone configuration for macOS. We will request the permission when needed.
@@ -512,14 +529,16 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       //   });
       // }
     } else if (isLinux) {
-      if (bind.isOutgoingOnly()) {
+      if (bind.crateFlutterFfiIsOutgoingOnly()) {
         return Container();
       }
       final LinuxCards = <Widget>[];
-      if (bind.isSelinuxEnforcing()) {
+      if (bind.crateFlutterFfiIsSelinuxEnforcing()) {
         // Check is SELinux enforcing, but show user a tip of is SELinux enabled for simple.
         final keyShowSelinuxHelpTip = "show-selinux-help-tip";
-        if (bind.mainGetLocalOption(key: keyShowSelinuxHelpTip) != 'N') {
+        if (bind.crateFlutterFfiMainGetLocalOption(
+                key: keyShowSelinuxHelpTip) !=
+            'N') {
           LinuxCards.add(buildInstallCard(
             "Warning",
             "selinux_tip",
@@ -534,13 +553,13 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           ));
         }
       }
-      if (bind.mainCurrentIsWayland()) {
+      if (bind.crateFlutterFfiMainCurrentIsWayland()) {
         LinuxCards.add(buildInstallCard(
             "Warning", "wayland_experiment_tip", "", () async {},
             marginTop: LinuxCards.isEmpty ? 20.0 : 5.0,
             help: 'Help',
             link: 'https://rustdesk.com/docs/en/client/linux/#x11-required'));
-      } else if (bind.mainIsLoginWayland()) {
+      } else if (bind.crateFlutterFfiMainIsLoginWayland()) {
         LinuxCards.add(buildInstallCard("Warning",
             "Login screen using Wayland is not supported", "", () async {},
             marginTop: LinuxCards.isEmpty ? 20.0 : 5.0,
@@ -553,7 +572,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         );
       }
     }
-    if (bind.isIncomingOnly()) {
+    if (bind.crateFlutterFfiIsIncomingOnly()) {
       return Align(
         alignment: Alignment.centerRight,
         child: OutlinedButton(
@@ -578,14 +597,16 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       String? link,
       bool? closeButton,
       String? closeOption}) {
-    if (bind.mainGetBuildinOption(key: kOptionHideHelpCards) == 'Y' &&
+    if (bind.crateFlutterFfiMainGetBuildinOption(key: kOptionHideHelpCards) ==
+            'Y' &&
         content != 'install_daemon_tip') {
       return const SizedBox();
     }
     void closeCard() async {
       if (closeOption != null) {
-        await bind.mainSetLocalOption(key: closeOption, value: 'N');
-        if (bind.mainGetLocalOption(key: closeOption) == 'N') {
+        await bind.crateFlutterFfiMainSetLocalOption(
+            key: closeOption, value: 'N');
+        if (bind.crateFlutterFfiMainGetLocalOption(key: closeOption) == 'N') {
           setState(() {
             isCardClosed = true;
           });
@@ -600,8 +621,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     return Stack(
       children: [
         Container(
-          margin: EdgeInsets.fromLTRB(
-              0, marginTop, 0, bind.isIncomingOnly() ? marginTop : 0),
+          margin: EdgeInsets.fromLTRB(0, marginTop, 0,
+              bind.crateFlutterFfiIsIncomingOnly() ? marginTop : 0),
           child: Container(
               decoration: BoxDecoration(
                   gradient: LinearGradient(
@@ -697,7 +718,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     super.initState();
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
-      final error = await bind.mainGetError();
+      final error = await bind.crateFlutterFfiMainGetError();
       if (systemError != error) {
         systemError = error;
         setState(() {});
@@ -708,19 +729,19 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         setState(() {});
       }
       if (watchIsCanScreenRecording) {
-        if (bind.mainIsCanScreenRecording(prompt: false)) {
+        if (bind.crateFlutterFfiMainIsCanScreenRecording(prompt: false)) {
           watchIsCanScreenRecording = false;
           setState(() {});
         }
       }
       if (watchIsProcessTrust) {
-        if (bind.mainIsProcessTrusted(prompt: false)) {
+        if (bind.crateFlutterFfiMainIsProcessTrusted(prompt: false)) {
           watchIsProcessTrust = false;
           setState(() {});
         }
       }
       if (watchIsInputMonitoring) {
-        if (bind.mainIsCanInputMonitoring(prompt: false)) {
+        if (bind.crateFlutterFfiMainIsCanInputMonitoring(prompt: false)) {
           watchIsInputMonitoring = false;
           // Do not notify for now.
           // Monitoring may not take effect until the process is restarted.
@@ -765,7 +786,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
     bool isChattyMethod(String methodName) {
       switch (methodName) {
-        case kWindowBumpMouse: return true;
+        case kWindowBumpMouse:
+          return true;
       }
 
       return false;
@@ -774,7 +796,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     rustDeskWinManager.setMethodHandler((call, fromWindowId) async {
       if (!isChattyMethod(call.method)) {
         debugPrint(
-          "[Main] call ${call.method} with args ${call.arguments} from window $fromWindowId");
+            "[Main] call ${call.method} with args ${call.arguments} from window $fromWindowId");
       }
       if (call.method == kWindowMainWindowOnTop) {
         windowOnTop(null);
@@ -789,6 +811,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         await rustDeskWinManager.registerActiveWindow(call.arguments["id"]);
       } else if (call.method == kWindowEventHide) {
         await rustDeskWinManager.unregisterActiveWindow(call.arguments['id']);
+        // Cheap and harmless for any other window type - refreshes the
+        // Directory tab's unread-mail badge in case the window that just
+        // closed was a chat window whose messages just got marked read.
+        unawaited(gFFI.managedChatModel.loadLocalConversations());
       } else if (call.method == kWindowConnect) {
         await connectMainDesktop(
           call.arguments['id'],
@@ -802,9 +828,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           connToken: call.arguments['connToken'],
         );
       } else if (call.method == kWindowBumpMouse) {
-        return RdPlatformChannel.instance.bumpMouse(
-          dx: call.arguments['dx'],
-          dy: call.arguments['dy']);
+        return RdPlatformChannel.instance
+            .bumpMouse(dx: call.arguments['dx'], dy: call.arguments['dy']);
       } else if (call.method == kWindowEventMoveTabToNewWindow) {
         final args = call.arguments.split(',');
         int? windowId;
@@ -843,7 +868,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     });
     _uniLinksSubscription = listenUniLinks();
 
-    if (bind.isIncomingOnly()) {
+    if (bind.crateFlutterFfiIsIncomingOnly()) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _updateWindowSize();
       });
@@ -851,7 +876,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     WidgetsBinding.instance.addObserver(this);
   }
 
-  _updateWindowSize() {
+  void _updateWindowSize() {
     RenderObject? renderObject = _childKey.currentContext?.findRenderObject();
     if (renderObject == null) {
       return;
@@ -883,15 +908,36 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 }
 
-void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
+void setPasswordDialog({
+  VoidCallback? notEmptyCallback,
+  VoidCallback? managed2FaStateChanged,
+}) async {
+  if (isWindows &&
+      bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty &&
+      !bind.crateFlutterFfiMainHasValid2FaSync()) {
+    change2fa(callback: () {
+      Future.microtask(() {
+        if (bind.crateFlutterFfiMainHasValid2FaSync()) {
+          managed2FaStateChanged?.call();
+          setPasswordDialog(
+            notEmptyCallback: notEmptyCallback,
+            managed2FaStateChanged: managed2FaStateChanged,
+          );
+        }
+      });
+    });
+    return;
+  }
   final p0 = TextEditingController(text: "");
   final p1 = TextEditingController(text: "");
   var errMsg0 = "";
   var errMsg1 = "";
-  final localPasswordSet =
-      (await bind.mainGetCommon(key: "local-permanent-password-set")) == "true";
-  final permanentPasswordSet =
-      (await bind.mainGetCommon(key: "permanent-password-set")) == "true";
+  final localPasswordSet = (await bind.crateFlutterFfiMainGetCommon(
+          key: "local-permanent-password-set")) ==
+      "true";
+  final permanentPasswordSet = (await bind.crateFlutterFfiMainGetCommon(
+          key: "permanent-password-set")) ==
+      "true";
   final presetPassword = permanentPasswordSet && !localPasswordSet;
   var canSubmit = false;
   final RxString rxPass = "".obs;
@@ -902,7 +948,7 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
     // SpecialCharacterValidationRule(),
     MinCharactersValidationRule(8),
   ];
-  final maxLength = bind.mainMaxEncryptLen();
+  final maxLength = bind.crateFlutterFfiMainMaxEncryptLen();
   final statusTip = localPasswordSet
       ? translate('password-hidden-tip')
       : (presetPassword ? translate('preset-password-in-use-tip') : '');
@@ -940,7 +986,18 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
         });
         return;
       }
-      final ok = await bind.mainSetPermanentPasswordWithResult(password: pass);
+      if (pass.isNotEmpty &&
+          isWindows &&
+          bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty &&
+          !bind.crateFlutterFfiMainHasValid2FaSync()) {
+        setState(() {
+          errMsg0 =
+              '2FA enrollment is required before saving a permanent password.';
+        });
+        return;
+      }
+      final ok = await bind.crateFlutterFfiMainSetPermanentPasswordWithResult(
+          password: pass);
       if (!ok) {
         setState(() {
           errMsg0 = '${translate('Prompt')}: ${translate("Failed")}';
@@ -1071,7 +1128,8 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
               errMsg1 = "";
             });
             final ok =
-                await bind.mainSetPermanentPasswordWithResult(password: "");
+                await bind.crateFlutterFfiMainSetPermanentPasswordWithResult(
+                    password: "");
             if (!ok) {
               setState(() {
                 errMsg0 = '${translate('Prompt')}: ${translate("Failed")}';
@@ -1080,8 +1138,8 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
             }
             close();
           },
-          buttonStyle: ButtonStyle(
-              backgroundColor: MaterialStatePropertyAll(Colors.red)),
+          buttonStyle:
+              ButtonStyle(backgroundColor: WidgetStatePropertyAll(Colors.red)),
         );
         final okButton = dialogButton(
           "OK",

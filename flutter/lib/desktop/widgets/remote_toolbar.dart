@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:async';
 
+import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/widgets/audio_input.dart';
@@ -17,6 +18,7 @@ import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:window_size/window_size.dart' as window_size;
 
 import '../../common.dart';
+import '../../common/widgets/managed_chat_dialog.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
@@ -251,7 +253,8 @@ class ToolbarState {
 
   ToolbarState() {
     _pin = RxBool(false);
-    final s = bind.getLocalFlutterOption(k: kOptionRemoteMenubarState);
+    final s =
+        bind.crateFlutterFfiGetLocalFlutterOption(k: kOptionRemoteMenubarState);
     if (s.isEmpty) {
       return;
     }
@@ -277,9 +280,9 @@ class ToolbarState {
     try {
       // Load both states in parallel for better performance
       final results = await Future.wait([
-        bind.sessionGetToggleOption(
+        bind.crateFlutterFfiSessionGetToggleOption(
             sessionId: sessionId, arg: kOptionCollapseToolbar),
-        bind.sessionGetToggleOption(
+        bind.crateFlutterFfiSessionGetToggleOption(
             sessionId: sessionId, arg: kOptionHideToolbar),
       ]);
 
@@ -291,25 +294,26 @@ class ToolbarState {
     }
   }
 
-  switchCollapse(SessionID sessionId) async {
-    bind.sessionToggleOption(
+  Future<void> switchCollapse(SessionID sessionId) async {
+    bind.crateFlutterFfiSessionToggleOption(
         sessionId: sessionId, value: kOptionCollapseToolbar);
     collapse.value = !collapse.value;
   }
 
   // Switch hide state for entire toolbar visibility
-  switchHide(SessionID sessionId) async {
-    bind.sessionToggleOption(sessionId: sessionId, value: kOptionHideToolbar);
+  Future<void> switchHide(SessionID sessionId) async {
+    bind.crateFlutterFfiSessionToggleOption(
+        sessionId: sessionId, value: kOptionHideToolbar);
     hide.value = !hide.value;
   }
 
-  switchPin() async {
+  Future<void> switchPin() async {
     _pin.value = !_pin.value;
     // Save everytime changed, as this func will not be called frequently
     await _savePin();
   }
 
-  setPin(bool v) async {
+  Future<void> setPin(bool v) async {
     if (_pin.value != v) {
       _pin.value = v;
       // Save everytime changed, as this func will not be called frequently
@@ -317,8 +321,8 @@ class ToolbarState {
     }
   }
 
-  _savePin() async {
-    bind.setLocalFlutterOption(
+  Future<void> _savePin() async {
+    bind.crateFlutterFfiSetLocalFlutterOption(
         k: kOptionRemoteMenubarState, v: jsonEncode({'pin': _pin.value}));
   }
 }
@@ -356,19 +360,19 @@ class _ToolbarTheme {
       MyTheme.color(context).divider;
 
   static MenuStyle defaultMenuStyle(BuildContext context) => MenuStyle(
-        side: MaterialStateProperty.all(BorderSide(
+        side: WidgetStateProperty.all(BorderSide(
           width: 1,
           color: borderColor(context),
         )),
-        shape: MaterialStatePropertyAll(RoundedRectangleBorder(
+        shape: WidgetStatePropertyAll(RoundedRectangleBorder(
             borderRadius:
                 BorderRadius.circular(_ToolbarTheme.menuBorderRadius))),
-        padding: MaterialStateProperty.all(_ToolbarTheme.menuPadding),
+        padding: WidgetStateProperty.all(_ToolbarTheme.menuPadding),
       );
   static final defaultMenuButtonStyle = ButtonStyle(
-    backgroundColor: MaterialStatePropertyAll(Colors.transparent),
-    padding: MaterialStatePropertyAll(EdgeInsets.zero),
-    overlayColor: MaterialStatePropertyAll(Colors.transparent),
+    backgroundColor: WidgetStatePropertyAll(Colors.transparent),
+    padding: WidgetStatePropertyAll(EdgeInsets.zero),
+    overlayColor: WidgetStatePropertyAll(Colors.transparent),
   );
 
   static Widget borderWrapper(
@@ -401,7 +405,7 @@ class RemoteMenuEntry {
         style: style,
       ),
       proc: () {
-        bind.sessionLockScreen(sessionId: sessionId);
+        bind.crateFlutterFfiSessionLockScreen(sessionId: sessionId);
         if (dismissFunc != null) {
           dismissFunc();
         }
@@ -412,7 +416,7 @@ class RemoteMenuEntry {
     );
   }
 
-  static insertCtrlAltDel(
+  static MenuEntryButton<String> insertCtrlAltDel(
     SessionID sessionId,
     EdgeInsets? padding, {
     DismissFunc? dismissFunc,
@@ -424,7 +428,7 @@ class RemoteMenuEntry {
         style: style,
       ),
       proc: () {
-        bind.sessionCtrlAltDel(sessionId: sessionId);
+        bind.crateFlutterFfiSessionCtrlAltDel(sessionId: sessionId);
         if (dismissFunc != null) {
           dismissFunc();
         }
@@ -445,14 +449,14 @@ class RemoteToolbar extends StatefulWidget {
   final Function(VoidCallback) setRemoteState;
 
   RemoteToolbar({
-    Key? key,
+    super.key,
     required this.id,
     required this.ffi,
     required this.state,
     required this.onEnterOrLeaveImageSetter,
     required this.onEnterOrLeaveImageCleaner,
     required this.setRemoteState,
-  }) : super(key: key);
+  });
 
   @override
   State<RemoteToolbar> createState() => _RemoteToolbarState();
@@ -497,7 +501,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
   PeerInfo get pi => widget.ffi.ffiModel.pi;
   FfiModel get ffiModel => widget.ffi.ffiModel;
 
-  triggerAutoHide() => _debouncerHide.value = _debouncerHide.value + 1;
+  int triggerAutoHide() => _debouncerHide.value = _debouncerHide.value + 1;
 
   void _minimize() async =>
       await WindowController.fromWindowId(windowId).minimize();
@@ -529,10 +533,10 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       return;
     }
 
-    final savedFraction = await bind.sessionGetOption(
+    final savedFraction = await bind.crateFlutterFfiSessionGetOption(
         sessionId: widget.ffi.sessionId, arg: kOptionRemoteMenubarFraction);
     // Backward compat: legacy horizontal-only position.
-    final legacyFraction = await bind.sessionGetOption(
+    final legacyFraction = await bind.crateFlutterFfiSessionGetOption(
         sessionId: widget.ffi.sessionId, arg: _legacyRemoteMenubarDragX);
     if (!mounted || syncSerial != _dockingOptionSyncSerial) return;
 
@@ -542,7 +546,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     if (!multiEdgeEnabled) {
       nextEdge = _ToolbarEdge.top;
     } else if (force || wasMultiEdgeEnabled || cached == null) {
-      final edgeStr = await bind.sessionGetOption(
+      final edgeStr = await bind.crateFlutterFfiSessionGetOption(
           sessionId: widget.ffi.sessionId, arg: kOptionRemoteMenubarEdge);
       if (!mounted || syncSerial != _dockingOptionSyncSerial) return;
       nextEdge = _parseToolbarEdge(edgeStr);
@@ -563,11 +567,11 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     );
     // Clamp to the saved drag-bound contract so a corrupted or out-of-range
     // saved value can't bypass it until the user drags again.
-    final dragLeft = double.tryParse(
-            bind.mainGetLocalOption(key: kOptionRemoteMenubarDragLeft)) ??
+    final dragLeft = double.tryParse(bind.crateFlutterFfiMainGetLocalOption(
+            key: kOptionRemoteMenubarDragLeft)) ??
         0.0;
-    final dragRight = double.tryParse(
-            bind.mainGetLocalOption(key: kOptionRemoteMenubarDragRight)) ??
+    final dragRight = double.tryParse(bind.crateFlutterFfiMainGetLocalOption(
+            key: kOptionRemoteMenubarDragRight)) ??
         1.0;
     final fractionBounds =
         _fractionBoundsForEdge(nextEdge, dragLeft, dragRight);
@@ -591,12 +595,12 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     );
     _pendingDockingOptionSync = false;
     if (!multiEdgeEnabled || keepCurrentPosition) {
-      bind.sessionPeerOption(
+      bind.crateFlutterFfiSessionPeerOption(
         sessionId: widget.ffi.sessionId,
         name: kOptionRemoteMenubarEdge,
         value: _toolbarEdgeToString(nextEdge),
       );
-      bind.sessionPeerOption(
+      bind.crateFlutterFfiSessionPeerOption(
         sessionId: widget.ffi.sessionId,
         name: kOptionRemoteMenubarFraction,
         value: nextFraction.toString(),
@@ -668,7 +672,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     });
   }
 
-  _debouncerHideProc(int v) {
+  void _debouncerHideProc(int v) {
     if (!pin && collapse.isFalse && _isCursorOverImage && _dragging.isFalse) {
       collapse.value = true;
     }
@@ -709,11 +713,17 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
 
       final toolbar = Align(
         alignment: _alignmentForEdge(edge, _fraction.value),
-        child: KeyedSubtree(
-          key: _toolbarKey,
-          child: collapse.isFalse
-              ? _buildToolbar(context, edge, isHorizontal)
-              : _buildDraggableCollapse(context, edge, isHorizontal),
+        child: MouseRegion(
+          // The toolbar overlays the remote image. Make only the actual local
+          // control footprint opaque to mouse tracking so the image below gets
+          // PointerExit and releases remote input before toolbar/menu clicks.
+          opaque: true,
+          child: KeyedSubtree(
+            key: _toolbarKey,
+            child: collapse.isFalse
+                ? _buildToolbar(context, edge, isHorizontal)
+                : _buildDraggableCollapse(context, edge, isHorizontal),
+          ),
         ),
       );
 
@@ -753,9 +763,9 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
         width: previewSize.width,
         height: previewSize.height,
         decoration: BoxDecoration(
-          color: color.withOpacity(0.10),
+          color: color.withValues(alpha: 0.10),
           borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: color.withOpacity(0.55), width: 1.5),
+          border: Border.all(color: color.withValues(alpha: 0.55), width: 1.5),
         ),
       ),
     );
@@ -846,6 +856,10 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       toolbarItems.add(_KeyboardMenu(id: widget.id, ffi: widget.ffi));
     }
     toolbarItems.add(_ChatMenu(id: widget.id, ffi: widget.ffi));
+    if (!isWeb &&
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty) {
+      toolbarItems.add(_RustDropMenu());
+    }
     if (!isWeb) {
       toolbarItems.add(_VoiceCallMenu(id: widget.id, ffi: widget.ffi));
     }
@@ -868,7 +882,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
           .menuBarTheme
           .style
           ?.backgroundColor
-          ?.resolve(MaterialState.values.toSet()),
+          ?.resolve(WidgetState.values.toSet()),
       child: SingleChildScrollView(
         scrollDirection: innerAxis,
         child: Theme(
@@ -906,11 +920,11 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     return Theme.of(context).copyWith(
       menuButtonTheme: MenuButtonThemeData(
         style: ButtonStyle(
-          minimumSize: MaterialStatePropertyAll(Size(64, 32)),
-          textStyle: MaterialStatePropertyAll(
+          minimumSize: WidgetStatePropertyAll(Size(64, 32)),
+          textStyle: WidgetStatePropertyAll(
             TextStyle(fontWeight: FontWeight.normal),
           ),
-          shape: MaterialStatePropertyAll(RoundedRectangleBorder(
+          shape: WidgetStatePropertyAll(RoundedRectangleBorder(
               borderRadius:
                   BorderRadius.circular(_ToolbarTheme.menuButtonBorderRadius))),
         ),
@@ -921,9 +935,9 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       ),
       menuBarTheme: MenuBarThemeData(
           style: MenuStyle(
-        padding: MaterialStatePropertyAll(EdgeInsets.zero),
-        elevation: MaterialStatePropertyAll(0),
-        shape: MaterialStatePropertyAll(BeveledRectangleBorder()),
+        padding: WidgetStatePropertyAll(EdgeInsets.zero),
+        elevation: WidgetStatePropertyAll(0),
+        shape: WidgetStatePropertyAll(BeveledRectangleBorder()),
       ).copyWith(
               backgroundColor:
                   Theme.of(context).menuBarTheme.style?.backgroundColor)),
@@ -933,7 +947,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
 
 class _PinMenu extends StatelessWidget {
   final ToolbarState state;
-  const _PinMenu({Key? key, required this.state}) : super(key: key);
+  const _PinMenu({required this.state});
 
   @override
   Widget build(BuildContext context) {
@@ -954,7 +968,7 @@ class _PinMenu extends StatelessWidget {
 
 class _MobileActionMenu extends StatelessWidget {
   final FFI ffi;
-  const _MobileActionMenu({Key? key, required this.ffi}) : super(key: key);
+  const _MobileActionMenu({required this.ffi});
 
   @override
   Widget build(BuildContext context) {
@@ -993,7 +1007,8 @@ class _MonitorCycle {
     final from = _inRange ? _current : -1;
     final target = (from + 1) % t;
     final isChooseDisplayToOpenInNewWindow = _pi.isSupportMultiDisplay &&
-        bind.sessionGetDisplaysAsIndividualWindows(sessionId: ffi.sessionId) ==
+        bind.crateFlutterFfiSessionGetDisplaysAsIndividualWindows(
+                sessionId: ffi.sessionId) ==
             'Y';
     if (isChooseDisplayToOpenInNewWindow) {
       openMonitorInNewTabOrWindow(target, ffi.id, _pi);
@@ -1008,10 +1023,9 @@ class _MainMonitorSwitchButton extends StatelessWidget {
   final FFI ffi;
 
   const _MainMonitorSwitchButton({
-    Key? key,
     required this.id,
     required this.ffi,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1062,15 +1076,16 @@ class _MonitorMenu extends StatelessWidget {
   final _ToolbarEdge edge;
   final Function(VoidCallback) setRemoteState;
   const _MonitorMenu({
-    Key? key,
     required this.id,
     required this.ffi,
     required this.edge,
     required this.setRemoteState,
-  }) : super(key: key);
+  });
 
   bool get showMonitorsToolbar =>
-      bind.mainGetUserDefaultOption(key: kKeyShowMonitorsToolbar) == 'Y';
+      bind.crateFlutterFfiMainGetUserDefaultOption(
+          key: kKeyShowMonitorsToolbar) ==
+      'Y';
 
   bool get supportIndividualWindows =>
       !isWeb && ffi.ffiModel.pi.isSupportMultiDisplay;
@@ -1101,7 +1116,7 @@ class _MonitorMenu extends StatelessWidget {
         hoverColor: _ToolbarTheme.hoverBlueColor,
         menuStyle: MenuStyle(
             padding:
-                MaterialStatePropertyAll(EdgeInsets.symmetric(horizontal: 6))),
+                WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 6))),
         menuChildrenGetter: (_) => [buildMonitorSubmenuWidget(context)]);
   }
 
@@ -1121,21 +1136,21 @@ class _MonitorMenu extends StatelessWidget {
   }
 
   Widget chooseDisplayBehavior() {
-    final value =
-        bind.sessionGetDisplaysAsIndividualWindows(sessionId: ffi.sessionId) ==
-            'Y';
+    final value = bind.crateFlutterFfiSessionGetDisplaysAsIndividualWindows(
+            sessionId: ffi.sessionId) ==
+        'Y';
     return CkbMenuButton(
         value: value,
         onChanged: (value) async {
           if (value == null) return;
-          await bind.sessionSetDisplaysAsIndividualWindows(
+          await bind.crateFlutterFfiSessionSetDisplaysAsIndividualWindows(
               sessionId: ffi.sessionId, value: value ? 'Y' : 'N');
         },
         ffi: ffi,
         child: Text(translate('Show displays as individual windows')));
   }
 
-  buildOneMonitorButton(i, curDisplay) => Text(
+  Text buildOneMonitorButton(i, curDisplay) => Text(
         '${i + 1}',
         style: TextStyle(
           color: i == curDisplay
@@ -1207,7 +1222,7 @@ class _MonitorMenu extends StatelessWidget {
     return monitorList;
   }
 
-  globalMonitorsWidget(
+  Stack globalMonitorsWidget(
       SimpleWrapper<double> width, Color activeTextColor, Color activeBgColor) {
     getMonitors() {
       final pi = ffi.ffiModel.pi;
@@ -1278,7 +1293,7 @@ class _MonitorMenu extends StatelessWidget {
     );
   }
 
-  onPressed(int i, PeerInfo pi, bool isMulti) {
+  void onPressed(int i, PeerInfo pi, bool isMulti) {
     if (!isMulti) {
       // If show monitors in toolbar(`buildMultiMonitorMenu()`), then the menu will dismiss automatically.
       _menuDismissCallback(ffi);
@@ -1286,7 +1301,7 @@ class _MonitorMenu extends StatelessWidget {
     RxInt display = CurrentDisplayState.find(id);
     if (display.value != i) {
       final isChooseDisplayToOpenInNewWindow = pi.isSupportMultiDisplay &&
-          bind.sessionGetDisplaysAsIndividualWindows(
+          bind.crateFlutterFfiSessionGetDisplaysAsIndividualWindows(
                   sessionId: ffi.sessionId) ==
               'Y';
       if (isChooseDisplayToOpenInNewWindow) {
@@ -1302,9 +1317,7 @@ class _ControlMenu extends StatelessWidget {
   final String id;
   final FFI ffi;
   final ToolbarState state;
-  _ControlMenu(
-      {Key? key, required this.id, required this.ffi, required this.state})
-      : super(key: key);
+  _ControlMenu({required this.id, required this.ffi, required this.state});
 
   @override
   Widget build(BuildContext context) {
@@ -1358,7 +1371,7 @@ class ScreenAdjustor {
     }
   }
 
-  adjustWindow(BuildContext context) {
+  Widget adjustWindow(BuildContext context) {
     return futureBuilder(
         future: isWindowCanBeAdjusted(context),
         hasData: (data) {
@@ -1451,7 +1464,7 @@ class ScreenAdjustor {
       String monitorLayoutMode;
       try {
         monitorLayoutMode =
-            await bind.mainGetCommon(key: 'gnome-monitor-layout-mode');
+            await bind.crateFlutterFfiMainGetCommon(key: 'gnome-monitor-layout-mode');
       } catch (_) {
         monitorLayoutMode = '';
       }
@@ -1490,7 +1503,7 @@ class ScreenAdjustor {
       final canvasModel = ffi.canvasModel;
       // canvasModel.scale is the rendered scale and already applies kIgnoreDpi.
       // Use it instead of the remote source resolution.
-      final isWayland = isLinux && bind.mainCurrentIsWayland();
+      final isWayland = isLinux && bind.crateFlutterFfiMainCurrentIsWayland();
       final isX11 = isLinux && !isWayland;
       await _updateLinuxWorkAreaCache(
         screen: screen,
@@ -1589,7 +1602,7 @@ class ScreenAdjustor {
     return null;
   }
 
-  doAdjustWindow([BuildContext? context]) async {
+  Future<void> doAdjustWindow([BuildContext? context]) async {
     // A resolution change is adjusted after a delay, when the menu context may
     // already be disposed. Each desktop_multi_window window has its own engine,
     // so that engine's first view is the current window.
@@ -1641,7 +1654,7 @@ class ScreenAdjustor {
     }
   }
 
-  updateScreen() async {
+  Future<void> updateScreen() async {
     _screen = await _getCurrentScreen();
   }
 
@@ -1666,7 +1679,7 @@ class ScreenAdjustor {
     final view = context != null ? View.of(context) : views.first;
     final mediaSize = MediaQueryData.fromView(view).size;
     final viewStyle =
-        await bind.sessionGetViewStyle(sessionId: ffi.sessionId) ?? '';
+        await bind.crateFlutterFfiSessionGetViewStyle(sessionId: ffi.sessionId) ?? '';
     if (viewStyle != kRemoteViewStyleOriginal) {
       return false;
     }
@@ -1794,7 +1807,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
     );
   }
 
-  viewStyle({required RxInt customPercent}) {
+  Widget viewStyle({required RxInt customPercent}) {
     return futureBuilder(
         future: toolbarViewStyle(context, widget.id, widget.ffi),
         hasData: (data) {
@@ -1828,7 +1841,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
                   ffi: ffi,
                   // When entering custom, keep submenu open to show the slider controls
                   closeOnActivate: !keepOpenForThisItem);
-            }).toList(),
+            }),
             // Only show a divider when custom is NOT selected
             if (!isCustomSelected) Divider(),
             _customControlsIfCustomSelected(
@@ -1839,7 +1852,8 @@ class _DisplayMenuState extends State<_DisplayMenu> {
 
   Widget _customControlsIfCustomSelected({ValueChanged<int>? onChanged}) {
     return futureBuilder(future: () async {
-      final current = await bind.sessionGetViewStyle(sessionId: ffi.sessionId);
+      final current = await bind.crateFlutterFfiSessionGetViewStyle(
+          sessionId: ffi.sessionId);
       return current == kRemoteViewStyleCustom;
     }(), hasData: (data) {
       final isCustom = data as bool;
@@ -1854,16 +1868,19 @@ class _DisplayMenuState extends State<_DisplayMenu> {
     });
   }
 
-  scrollStyle(_IconSubmenuButtonState state, ColorScheme colorScheme) {
+  Widget scrollStyle(_IconSubmenuButtonState state, ColorScheme colorScheme) {
     return futureBuilder(future: () async {
-      final viewStyle =
-          await bind.sessionGetViewStyle(sessionId: ffi.sessionId) ?? '';
+      final viewStyle = await bind.crateFlutterFfiSessionGetViewStyle(
+              sessionId: ffi.sessionId) ??
+          '';
       final visible = viewStyle == kRemoteViewStyleOriginal ||
           viewStyle == kRemoteViewStyleCustom;
-      final scrollStyle =
-          await bind.sessionGetScrollStyle(sessionId: ffi.sessionId) ?? '';
-      final edgeScrollEdgeThickness = await bind
-          .sessionGetEdgeScrollEdgeThickness(sessionId: ffi.sessionId);
+      final scrollStyle = await bind.crateFlutterFfiSessionGetScrollStyle(
+              sessionId: ffi.sessionId) ??
+          '';
+      final edgeScrollEdgeThickness =
+          await bind.crateFlutterFfiSessionGetEdgeScrollEdgeThickness(
+              sessionId: ffi.sessionId);
       return {
         'visible': visible,
         'scrollStyle': scrollStyle,
@@ -1877,7 +1894,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
 
       onChangeScrollStyle(String? value) async {
         if (value == null) return;
-        await bind.sessionSetScrollStyle(
+        await bind.crateFlutterFfiSessionSetScrollStyle(
             sessionId: ffi.sessionId, value: value);
         widget.ffi.canvasModel.updateScrollStyle();
         state.setState(() {});
@@ -1886,7 +1903,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
       onChangeEdgeScrollEdgeThickness(double? value) async {
         if (value == null) return;
         final newThickness = value.round();
-        await bind.sessionSetEdgeScrollEdgeThickness(
+        await bind.crateFlutterFfiSessionSetEdgeScrollEdgeThickness(
             sessionId: ffi.sessionId, value: newThickness);
         widget.ffi.canvasModel.updateEdgeScrollEdgeThickness(newThickness);
         state.setState(() {});
@@ -1937,7 +1954,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
     });
   }
 
-  imageQuality() {
+  Widget imageQuality() {
     return futureBuilder(
         future: toolbarImageQuality(context, widget.id, widget.ffi),
         hasData: (data) {
@@ -1957,7 +1974,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
         });
   }
 
-  codec() {
+  Widget codec() {
     return futureBuilder(
         future: toolbarCodec(context, id, ffi),
         hasData: (data) {
@@ -1978,7 +1995,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
         });
   }
 
-  cursorToggles() {
+  Widget cursorToggles() {
     return futureBuilder(
         future: toolbarCursor(context, id, ffi),
         hasData: (data) {
@@ -1986,18 +2003,16 @@ class _DisplayMenuState extends State<_DisplayMenu> {
           if (v.isEmpty) return Offstage();
           return Column(children: [
             Divider(),
-            ...v
-                .map((e) => CkbMenuButton(
-                    value: e.value,
-                    onChanged: e.onChanged,
-                    child: e.child,
-                    ffi: ffi))
-                .toList(),
+            ...v.map((e) => CkbMenuButton(
+                value: e.value,
+                onChanged: e.onChanged,
+                child: e.child,
+                ffi: ffi)),
           ]);
         });
   }
 
-  toggles() {
+  Widget toggles() {
     return futureBuilder(
         future: toolbarDisplayToggle(context, id, ffi),
         hasData: (data) {
@@ -2018,8 +2033,7 @@ class _DisplayMenuState extends State<_DisplayMenu> {
 class _CustomScaleMenuControls extends StatefulWidget {
   final FFI ffi;
   final ValueChanged<int>? onChanged;
-  const _CustomScaleMenuControls({Key? key, required this.ffi, this.onChanged})
-      : super(key: key);
+  const _CustomScaleMenuControls({required this.ffi, this.onChanged});
 
   @override
   State<_CustomScaleMenuControls> createState() =>
@@ -2046,7 +2060,7 @@ class _CustomScaleMenuControlsState
         data: SliderTheme.of(context).copyWith(
           activeTrackColor: colorScheme.primary,
           thumbColor: colorScheme.primary,
-          overlayColor: colorScheme.primary.withOpacity(0.1),
+          overlayColor: colorScheme.primary.withValues(alpha: 0.1),
           showValueIndicator: ShowValueIndicator.never,
           thumbShape: _RectValueThumbShape(
             min: CustomScaleControls.minPercent.toDouble(),
@@ -2193,11 +2207,10 @@ class _ResolutionsMenu extends StatefulWidget {
   final ScreenAdjustor screenAdjustor;
 
   _ResolutionsMenu({
-    Key? key,
     required this.id,
     required this.ffi,
     required this.screenAdjustor,
-  }) : super(key: key);
+  });
 
   @override
   State<_ResolutionsMenu> createState() => _ResolutionsMenuState();
@@ -2220,7 +2233,7 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
   FfiModel get ffiModel => widget.ffi.ffiModel;
   Rect? get rect => scaledRect();
   List<Resolution> get resolutions => pi.resolutions;
-  bool get isWayland => bind.mainCurrentIsWayland();
+  bool get isWayland => bind.crateFlutterFfiMainCurrentIsWayland();
 
   @override
   void initState() {
@@ -2268,7 +2281,7 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
     );
   }
 
-  _setGroupValue() {
+  void _setGroupValue() {
     if (pi.currentDisplay == kAllDisplayValue) {
       return;
     }
@@ -2282,7 +2295,7 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
     }
   }
 
-  _menuDivider(
+  Offstage _menuDivider(
       bool showOriginalBtn, bool showFitLocalBtn, bool isVirtualDisplay) {
     return Offstage(
       offstage: !(showOriginalBtn || showFitLocalBtn || isVirtualDisplay),
@@ -2308,9 +2321,9 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
     }
   }
 
-  _getLocalResolution() {
+  void _getLocalResolution() {
     _localResolution = null;
-    final String mainDisplay = bind.mainGetMainDisplay();
+    final String mainDisplay = bind.crateFlutterFfiMainGetMainDisplay();
     if (mainDisplay.isNotEmpty) {
       try {
         final display = json.decode(mainDisplay);
@@ -2332,7 +2345,7 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
   }
 
   // This widget has been unmounted, so the State no longer has a context
-  _onChanged(String? value) async {
+  Future<void> _onChanged(String? value) async {
     if (pi.currentDisplay == kAllDisplayValue) {
       return;
     }
@@ -2360,11 +2373,11 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
     }
   }
 
-  _changeResolution(int w, int h) async {
+  Future<void> _changeResolution(int w, int h) async {
     if (pi.currentDisplay == kAllDisplayValue) {
       return;
     }
-    await bind.sessionChangeResolution(
+    await bind.crateFlutterFfiSessionChangeResolution(
       sessionId: ffi.sessionId,
       display: pi.currentDisplay,
       width: w,
@@ -2520,10 +2533,9 @@ class _KeyboardMenu extends StatelessWidget {
   final String id;
   final FFI ffi;
   _KeyboardMenu({
-    Key? key,
     required this.id,
     required this.ffi,
-  }) : super(key: key);
+  });
 
   PeerInfo get pi => ffi.ffiModel.pi;
 
@@ -2567,7 +2579,7 @@ class _KeyboardMenu extends StatelessWidget {
             ]);
   }
 
-  mouseSpeed() {
+  List<dynamic> mouseSpeed() {
     final speedWidgets = [];
     final sessionId = ffi.sessionId;
     if (isDesktop) {
@@ -2584,9 +2596,10 @@ class _KeyboardMenu extends StatelessWidget {
     return speedWidgets;
   }
 
-  keyboardMode() {
+  Widget keyboardMode() {
     return futureBuilder(future: () async {
-      return await bind.sessionGetKeyboardMode(sessionId: ffi.sessionId) ??
+      return await bind.crateFlutterFfiSessionGetKeyboardMode(
+              sessionId: ffi.sessionId) ??
           kKeyLegacyMode;
     }(), hasData: (data) {
       final groupValue = data as String;
@@ -2599,7 +2612,7 @@ class _KeyboardMenu extends StatelessWidget {
       final enabled = !ffi.ffiModel.viewOnly;
       onChanged(String? value) async {
         if (value == null) return;
-        await bind.sessionSetKeyboardMode(
+        await bind.crateFlutterFfiSessionSetKeyboardMode(
             sessionId: ffi.sessionId, value: value);
         await ffi.inputModel.updateKeyboardMode();
       }
@@ -2610,10 +2623,10 @@ class _KeyboardMenu extends StatelessWidget {
       // Keep both map and legacy mode on web at the moment.
       // TODO: Remove legacy mode after web supports translate mode on web.
       if (isInputSourceFlutter && isDesktop) {
-        if (bind.sessionIsKeyboardModeSupported(
+        if (bind.crateFlutterFfiSessionIsKeyboardModeSupported(
             sessionId: ffi.sessionId, mode: kKeyMapMode)) {
           modeOnly = kKeyMapMode;
-        } else if (bind.sessionIsKeyboardModeSupported(
+        } else if (bind.crateFlutterFfiSessionIsKeyboardModeSupported(
             sessionId: ffi.sessionId, mode: kKeyLegacyMode)) {
           modeOnly = kKeyLegacyMode;
         }
@@ -2622,7 +2635,7 @@ class _KeyboardMenu extends StatelessWidget {
       for (InputModeMenu mode in modes) {
         if (modeOnly != null && mode.key != modeOnly) {
           continue;
-        } else if (!bind.sessionIsKeyboardModeSupported(
+        } else if (!bind.crateFlutterFfiSessionIsKeyboardModeSupported(
             sessionId: ffi.sessionId, mode: mode.key)) {
           continue;
         }
@@ -2647,7 +2660,7 @@ class _KeyboardMenu extends StatelessWidget {
     });
   }
 
-  localKeyboardType() {
+  RenderObjectWidget localKeyboardType() {
     final localPlatform = getLocalPlatformForKBLayoutType(pi.platform);
     final visible = localPlatform != '';
     if (!visible) return Offstage();
@@ -2668,15 +2681,15 @@ class _KeyboardMenu extends StatelessWidget {
     );
   }
 
-  inputSource() {
-    final supportedInputSource = bind.mainSupportedInputSource();
+  RenderObjectWidget inputSource() {
+    final supportedInputSource = bind.crateFlutterFfiMainSupportedInputSource();
     if (supportedInputSource.isEmpty) return Offstage();
     late final List<dynamic> supportedInputSourceList;
     try {
       supportedInputSourceList = jsonDecode(supportedInputSource);
     } catch (e) {
       debugPrint('Failed to decode $supportedInputSource, $e');
-      return;
+      return Offstage();
     }
     if (supportedInputSourceList.length < 2) return Offstage();
     final inputSource = stateGlobal.getInputSource();
@@ -2705,7 +2718,7 @@ class _KeyboardMenu extends StatelessWidget {
     return Column(children: children);
   }
 
-  viewMode() {
+  CkbMenuButton viewMode() {
     final ffiModel = ffi.ffiModel;
     final enabled = versionCmp(pi.version, '1.2.0') >= 0 && ffiModel.keyboard;
     return CkbMenuButton(
@@ -2713,13 +2726,16 @@ class _KeyboardMenu extends StatelessWidget {
         onChanged: enabled
             ? (value) async {
                 if (value == null) return;
-                await bind.sessionToggleOption(
+                await bind.crateFlutterFfiSessionToggleOption(
                     sessionId: ffi.sessionId, value: kOptionToggleViewOnly);
-                final viewOnly = await bind.sessionGetToggleOption(
-                    sessionId: ffi.sessionId, arg: kOptionToggleViewOnly);
+                final viewOnly =
+                    await bind.crateFlutterFfiSessionGetToggleOption(
+                        sessionId: ffi.sessionId, arg: kOptionToggleViewOnly);
                 ffiModel.setViewOnly(id, viewOnly ?? value);
-                final showMyCursor = await bind.sessionGetToggleOption(
-                    sessionId: ffi.sessionId, arg: kOptionToggleShowMyCursor);
+                final showMyCursor =
+                    await bind.crateFlutterFfiSessionGetToggleOption(
+                        sessionId: ffi.sessionId,
+                        arg: kOptionToggleShowMyCursor);
                 ffiModel.setShowMyCursor(showMyCursor ?? value);
               }
             : null,
@@ -2727,26 +2743,28 @@ class _KeyboardMenu extends StatelessWidget {
         child: Text(translate('View Mode')));
   }
 
-  showMyCursor() {
+  Widget showMyCursor() {
     final ffiModel = ffi.ffiModel;
     return CkbMenuButton(
             value: ffiModel.showMyCursor,
             onChanged: (value) async {
               if (value == null) return;
-              await bind.sessionToggleOption(
+              await bind.crateFlutterFfiSessionToggleOption(
                   sessionId: ffi.sessionId, value: kOptionToggleShowMyCursor);
-              final showMyCursor = await bind.sessionGetToggleOption(
-                      sessionId: ffi.sessionId,
-                      arg: kOptionToggleShowMyCursor) ??
-                  value;
+              final showMyCursor =
+                  await bind.crateFlutterFfiSessionGetToggleOption(
+                          sessionId: ffi.sessionId,
+                          arg: kOptionToggleShowMyCursor) ??
+                      value;
               ffiModel.setShowMyCursor(showMyCursor);
 
               // Also set view only if showMyCursor is enabled and viewOnly is not enabled.
               if (showMyCursor && !ffiModel.viewOnly) {
-                await bind.sessionToggleOption(
+                await bind.crateFlutterFfiSessionToggleOption(
                     sessionId: ffi.sessionId, value: kOptionToggleViewOnly);
-                final viewOnly = await bind.sessionGetToggleOption(
-                    sessionId: ffi.sessionId, arg: kOptionToggleViewOnly);
+                final viewOnly =
+                    await bind.crateFlutterFfiSessionGetToggleOption(
+                        sessionId: ffi.sessionId, arg: kOptionToggleViewOnly);
                 ffiModel.setViewOnly(id, viewOnly ?? value);
               }
             },
@@ -2755,7 +2773,7 @@ class _KeyboardMenu extends StatelessWidget {
         .paddingOnly(left: 26.0);
   }
 
-  mobileActions() {
+  List<dynamic> mobileActions() {
     if (pi.platform != kPeerPlatformAndroid) return [];
     final enabled = versionCmp(pi.version, '1.2.7') >= 0;
     if (!enabled) return [];
@@ -2793,10 +2811,9 @@ class _ChatMenu extends StatefulWidget {
   final String id;
   final FFI ffi;
   _ChatMenu({
-    Key? key,
     required this.id,
     required this.ffi,
-  }) : super(key: key);
+  });
 
   @override
   State<_ChatMenu> createState() => _ChatMenuState();
@@ -2818,11 +2835,11 @@ class _ChatMenuState extends State<_ChatMenu> {
           ffi: widget.ffi,
           color: _ToolbarTheme.blueColor,
           hoverColor: _ToolbarTheme.hoverBlueColor,
-          menuChildrenGetter: (_) => [textChat(), voiceCall()]);
+          menuChildrenGetter: (_) => [textChat()]);
     }
   }
 
-  buildTextChatButton() {
+  _IconMenuButton buildTextChatButton() {
     return _IconMenuButton(
       assetName: 'assets/message_24dp_5F6368.svg',
       tooltip: 'Text chat',
@@ -2833,14 +2850,23 @@ class _ChatMenuState extends State<_ChatMenu> {
     );
   }
 
-  textChat() {
+  MenuButton textChat() {
     return MenuButton(
         child: Text(translate('Text chat')),
         ffi: widget.ffi,
         onPressed: _textChatOnPressed);
   }
 
-  _textChatOnPressed() {
+  void _textChatOnPressed() {
+    // Managed builds route this through the same persistent managed-chat
+    // conversation the CM side's Chat button and the Directory tab's
+    // "Message" action use, keyed by the peer's numeric RustDesk id
+    // (widget.ffi.id, i.e. the id this session is connected to) - see the
+    // matching change in server_page.dart's _StandaloneChatButton.
+    if (bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty) {
+      unawaited(openManagedChatWithPeer(widget.ffi.id));
+      return;
+    }
     RenderBox? renderBox =
         chatButtonKey.currentContext?.findRenderObject() as RenderBox?;
     Offset? initPos;
@@ -2852,13 +2878,30 @@ class _ChatMenuState extends State<_ChatMenu> {
         .changeCurrentKey(MessageKey(widget.ffi.id, ChatModel.clientModeID));
     widget.ffi.chatModel.toggleChatOverlay(chatInitPos: initPos);
   }
+}
 
-  voiceCall() {
-    return MenuButton(
-      child: Text(translate('Voice call')),
-      ffi: widget.ffi,
-      onPressed: () =>
-          bind.sessionRequestVoiceCall(sessionId: widget.ffi.sessionId),
+// Launches this machine's own local RustDrop.exe (the controller's copy,
+// installed alongside RustDesk.exe) - no signaling to the remote peer at
+// all. See main_launch_rustdrop() in flutter_ffi.rs for why that's
+// sufficient: the machine being controlled gets its own equivalent button
+// in server_page.dart, and each side only ever launches its own local copy.
+class _RustDropMenu extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return _IconMenuButton(
+      icon: Icon(Icons.drive_file_move_outline,
+          color: Colors.white, size: _ToolbarTheme.buttonSize),
+      tooltip: 'RustDrop',
+      color: _ToolbarTheme.blueColor,
+      hoverColor: _ToolbarTheme.hoverBlueColor,
+      onPressed: () {
+        if (!bind.crateFlutterFfiMainLaunchRustdrop()) {
+          BotToast.showText(
+            text: translate('RustDrop is not installed on this machine.'),
+            contentColor: Colors.red,
+          );
+        }
+      },
     );
   }
 }
@@ -2867,10 +2910,9 @@ class _VoiceCallMenu extends StatelessWidget {
   final String id;
   final FFI ffi;
   _VoiceCallMenu({
-    Key? key,
     required this.id,
     required this.ffi,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -2905,7 +2947,8 @@ class _VoiceCallMenu extends StatelessWidget {
         Divider(),
         MenuButton(
           child: Text(translate('End call')),
-          onPressed: () => bind.sessionCloseVoiceCall(sessionId: ffi.sessionId),
+          onPressed: () => bind.crateFlutterFfiSessionCloseVoiceCall(
+              sessionId: ffi.sessionId),
           ffi: ffi,
         ),
       ];
@@ -2936,7 +2979,8 @@ class _VoiceCallMenu extends StatelessWidget {
     return _IconMenuButton(
       assetName: "assets/call_wait.svg",
       tooltip: "Waiting",
-      onPressed: () => bind.sessionCloseVoiceCall(sessionId: ffi.sessionId),
+      onPressed: () =>
+          bind.crateFlutterFfiSessionCloseVoiceCall(sessionId: ffi.sessionId),
       color: _ToolbarTheme.redColor,
       hoverColor: _ToolbarTheme.hoverRedColor,
     );
@@ -2944,14 +2988,15 @@ class _VoiceCallMenu extends StatelessWidget {
 }
 
 class _RecordMenu extends StatelessWidget {
-  const _RecordMenu({Key? key}) : super(key: key);
+  const _RecordMenu();
 
   @override
   Widget build(BuildContext context) {
     var ffi = Provider.of<FfiModel>(context);
     var recordingModel = Provider.of<RecordingModel>(context);
-    final hideRecordingButton =
-        bind.mainGetLocalOption(key: kOptionHideRecordingButton) == 'Y';
+    final hideRecordingButton = bind.crateFlutterFfiMainGetLocalOption(
+            key: kOptionHideRecordingButton) ==
+        'Y';
     final visible = !hideRecordingButton &&
         (recordingModel.start || ffi.permissions['recording'] != false);
     if (!visible) return Offstage();
@@ -2974,8 +3019,7 @@ class _RecordMenu extends StatelessWidget {
 class _CloseMenu extends StatelessWidget {
   final String id;
   final FFI ffi;
-  const _CloseMenu({Key? key, required this.id, required this.ffi})
-      : super(key: key);
+  const _CloseMenu({required this.id, required this.ffi});
 
   @override
   Widget build(BuildContext context) {
@@ -3006,7 +3050,7 @@ class _IconMenuButton extends StatefulWidget {
   final bool topLevel;
   final double? width;
   const _IconMenuButton({
-    Key? key,
+    super.key,
     this.assetName,
     this.icon,
     required this.tooltip,
@@ -3017,7 +3061,7 @@ class _IconMenuButton extends StatefulWidget {
     this.vMargin,
     this.topLevel = true,
     this.width,
-  }) : super(key: key);
+  });
 
   @override
   State<_IconMenuButton> createState() => _IconMenuButtonState();
@@ -3041,9 +3085,9 @@ class _IconMenuButtonState extends State<_IconMenuButton> {
       height: _ToolbarTheme.buttonSize,
       child: MenuItemButton(
           style: ButtonStyle(
-              backgroundColor: MaterialStatePropertyAll(Colors.transparent),
-              padding: MaterialStatePropertyAll(EdgeInsets.zero),
-              overlayColor: MaterialStatePropertyAll(Colors.transparent)),
+              backgroundColor: WidgetStatePropertyAll(Colors.transparent),
+              padding: WidgetStatePropertyAll(EdgeInsets.zero),
+              overlayColor: WidgetStatePropertyAll(Colors.transparent)),
           onHover: (value) => setState(() {
                 hover = value;
               }),
@@ -3087,7 +3131,7 @@ class _IconSubmenuButton extends StatefulWidget {
   final double? width;
 
   _IconSubmenuButton({
-    Key? key,
+    super.key,
     this.svg,
     this.icon,
     required this.tooltip,
@@ -3097,7 +3141,7 @@ class _IconSubmenuButton extends StatefulWidget {
     this.ffi,
     this.menuStyle,
     this.width,
-  }) : super(key: key);
+  });
 
   @override
   State<_IconSubmenuButton> createState() => _IconSubmenuButtonState();
@@ -3159,11 +3203,10 @@ class _SubmenuButton extends StatelessWidget {
   final Widget? child;
   final FFI ffi;
   const _SubmenuButton({
-    Key? key,
     required this.menuChildren,
     required this.child,
     required this.ffi,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -3183,12 +3226,11 @@ class MenuButton extends StatelessWidget {
   final Widget? child;
   final FFI? ffi;
   MenuButton(
-      {Key? key,
+      {super.key,
       this.onPressed,
       this.trailingIcon,
       required this.child,
-      this.ffi})
-      : super(key: key);
+      this.ffi});
 
   @override
   Widget build(BuildContext context) {
@@ -3213,12 +3255,11 @@ class CkbMenuButton extends StatelessWidget {
   final Widget? child;
   final FFI? ffi;
   const CkbMenuButton(
-      {Key? key,
+      {super.key,
       required this.value,
       required this.onChanged,
       required this.child,
-      this.ffi})
-      : super(key: key);
+      this.ffi});
 
   @override
   Widget build(BuildContext context) {
@@ -3247,14 +3288,14 @@ class RdoMenuButton<T> extends StatelessWidget {
   // When true, submenu will be dismissed on activate; when false, it stays open.
   final bool closeOnActivate;
   const RdoMenuButton({
-    Key? key,
+    super.key,
     required this.value,
     required this.groupValue,
     required this.child,
     this.ffi,
     this.onChanged,
     this.closeOnActivate = true,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -3299,7 +3340,6 @@ class _DraggableShowHide extends StatefulWidget {
   final Function() setMinimize;
 
   const _DraggableShowHide({
-    Key? key,
     required this.id,
     required this.ffi,
     required this.sessionId,
@@ -3317,7 +3357,7 @@ class _DraggableShowHide extends StatefulWidget {
     required this.setFullscreen,
     required this.setMinimize,
     required this.borderRadius,
-  }) : super(key: key);
+  });
 
   @override
   State<_DraggableShowHide> createState() => _DraggableShowHideState();
@@ -3337,18 +3377,18 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
   initState() {
     super.initState();
 
-    final confLeft = double.tryParse(
-        bind.mainGetLocalOption(key: kOptionRemoteMenubarDragLeft));
+    final confLeft = double.tryParse(bind.crateFlutterFfiMainGetLocalOption(
+        key: kOptionRemoteMenubarDragLeft));
     if (confLeft == null) {
-      bind.mainSetLocalOption(
+      bind.crateFlutterFfiMainSetLocalOption(
           key: kOptionRemoteMenubarDragLeft, value: left.toString());
     } else {
       left = confLeft;
     }
-    final confRight = double.tryParse(
-        bind.mainGetLocalOption(key: kOptionRemoteMenubarDragRight));
+    final confRight = double.tryParse(bind.crateFlutterFfiMainGetLocalOption(
+        key: kOptionRemoteMenubarDragRight));
     if (confRight == null) {
-      bind.mainSetLocalOption(
+      bind.crateFlutterFfiMainSetLocalOption(
           key: kOptionRemoteMenubarDragRight, value: right.toString());
     } else {
       right = confRight;
@@ -3471,12 +3511,12 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
       fraction: frac,
       multiEdgeEnabled: widget.multiEdgeEnabled,
     );
-    bind.sessionPeerOption(
+    bind.crateFlutterFfiSessionPeerOption(
       sessionId: widget.sessionId,
       name: kOptionRemoteMenubarEdge,
       value: _toolbarEdgeToString(newEdge),
     );
-    bind.sessionPeerOption(
+    bind.crateFlutterFfiSessionPeerOption(
       sessionId: widget.sessionId,
       name: kOptionRemoteMenubarFraction,
       value: frac.toString(),
@@ -3484,7 +3524,7 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
     if (widget.multiEdgeEnabled) {
       return;
     }
-    bind.sessionPeerOption(
+    bind.crateFlutterFfiSessionPeerOption(
       sessionId: widget.sessionId,
       name: _legacyRemoteMenubarDragX,
       value: frac.toString(),
@@ -3529,8 +3569,8 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
   @override
   Widget build(BuildContext context) {
     final ButtonStyle buttonStyle = ButtonStyle(
-      minimumSize: MaterialStateProperty.all(const Size(0, 0)),
-      padding: MaterialStateProperty.all(EdgeInsets.zero),
+      minimumSize: WidgetStateProperty.all(const Size(0, 0)),
+      padding: WidgetStateProperty.all(EdgeInsets.zero),
     );
     final isFullscreen = stateGlobal.fullscreen;
     const double iconSize = 20;
@@ -3542,9 +3582,9 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
         onPressed: onPressed,
         child: child,
         style: buttonStyle.copyWith(
-          backgroundColor: MaterialStateProperty.resolveWith((states) {
-            if (states.contains(MaterialState.hovered)) {
-              return (bgColor ?? hoverColor).withOpacity(0.15);
+          backgroundColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.hovered)) {
+              return (bgColor ?? hoverColor).withValues(alpha: 0.15);
             }
             return bgColor;
           }),
@@ -3632,7 +3672,7 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
               .menuBarTheme
               .style
               ?.backgroundColor
-              ?.resolve(MaterialState.values.toSet()),
+              ?.resolve(WidgetState.values.toSet()),
           border: Border.all(
             color: _ToolbarTheme.borderColor(context),
             width: 1,
@@ -3656,7 +3696,7 @@ class InputModeMenu {
   InputModeMenu({required this.key, required this.menu});
 }
 
-_menuDismissCallback(FFI ffi) => ffi.inputModel.refreshMousePos();
+void _menuDismissCallback(FFI ffi) => ffi.inputModel.refreshMousePos();
 
 Widget _buildPointerTrackWidget(Widget child, FFI? ffi) {
   return Listener(
@@ -3675,11 +3715,11 @@ class EdgeThicknessControl extends StatelessWidget {
   final ColorScheme? colorScheme;
 
   const EdgeThicknessControl({
-    Key? key,
+    super.key,
     required this.value,
     this.onChanged,
     this.colorScheme,
-  }) : super(key: key);
+  });
 
   static const double kMin = 20;
   static const double kMax = 150;
@@ -3692,7 +3732,7 @@ class EdgeThicknessControl extends StatelessWidget {
       data: SliderTheme.of(context).copyWith(
         activeTrackColor: colorScheme.primary,
         thumbColor: colorScheme.primary,
-        overlayColor: colorScheme.primary.withOpacity(0.1),
+        overlayColor: colorScheme.primary.withValues(alpha: 0.1),
         showValueIndicator: ShowValueIndicator.never,
         thumbShape: _RectValueThumbShape(
           min: EdgeThicknessControl.kMin,
@@ -3727,10 +3767,9 @@ class _MinimizedMonitorSwitchButton extends StatelessWidget {
   final FFI ffi;
 
   const _MinimizedMonitorSwitchButton({
-    Key? key,
     required this.id,
     required this.ffi,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -3756,11 +3795,11 @@ class _MinimizedMonitorSwitchButton extends StatelessWidget {
         child: TextButton(
           onPressed: cycle.next,
           style: ButtonStyle(
-            minimumSize: MaterialStateProperty.all(const Size(0, 0)),
-            padding: MaterialStateProperty.all(EdgeInsets.zero),
-            backgroundColor: MaterialStateProperty.resolveWith((states) {
-              if (states.contains(MaterialState.hovered)) {
-                return _ToolbarTheme.blueColor.withOpacity(0.15);
+            minimumSize: WidgetStateProperty.all(const Size(0, 0)),
+            padding: WidgetStateProperty.all(EdgeInsets.zero),
+            backgroundColor: WidgetStateProperty.resolveWith((states) {
+              if (states.contains(WidgetState.hovered)) {
+                return _ToolbarTheme.blueColor.withValues(alpha: 0.15);
               }
               return null;
             }),

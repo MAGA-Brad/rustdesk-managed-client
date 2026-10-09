@@ -148,7 +148,7 @@ class ChatModel with ChangeNotifier {
 
   ChatUser? get currentUser => _messages[_currentKey]?.chatUser;
 
-  showChatIconOverlay({Offset offset = const Offset(200, 50)}) {
+  void showChatIconOverlay({Offset offset = const Offset(200, 50)}) {
     if (chatIconOverlayEntry != null) {
       chatIconOverlayEntry!.remove();
     }
@@ -187,14 +187,14 @@ class ChatModel with ChangeNotifier {
     chatIconOverlayEntry = overlay;
   }
 
-  hideChatIconOverlay() {
+  void hideChatIconOverlay() {
     if (chatIconOverlayEntry != null) {
       chatIconOverlayEntry!.remove();
       chatIconOverlayEntry = null;
     }
   }
 
-  showChatWindowOverlay({Offset? chatInitPos}) {
+  void showChatWindowOverlay({Offset? chatInitPos}) {
     if (chatWindowOverlayEntry != null) return;
     isWindowFocus.value = true;
     _blockableOverlayState.setMiddleBlocked(true);
@@ -226,7 +226,7 @@ class ChatModel with ChangeNotifier {
     requestChatInputFocus();
   }
 
-  hideChatWindowOverlay() {
+  void hideChatWindowOverlay() {
     if (chatWindowOverlayEntry != null) {
       _blockableOverlayState.setMiddleBlocked(false);
       chatWindowOverlayEntry!.remove();
@@ -235,11 +235,11 @@ class ChatModel with ChangeNotifier {
     }
   }
 
-  _isChatOverlayHide() =>
+  bool _isChatOverlayHide() =>
       ((!(isDesktop || isWebDesktop) && chatIconOverlayEntry == null) ||
           chatWindowOverlayEntry == null);
 
-  toggleChatOverlay({Offset? chatInitPos}) {
+  void toggleChatOverlay({Offset? chatInitPos}) {
     if (_isChatOverlayHide()) {
       gFFI.invokeMethod("enable_soft_keyboard", true);
       if (!(isDesktop || isWebDesktop)) {
@@ -252,14 +252,14 @@ class ChatModel with ChangeNotifier {
     }
   }
 
-  hideChatOverlay() {
+  void hideChatOverlay() {
     if (!_isChatOverlayHide()) {
       hideChatIconOverlay();
       hideChatWindowOverlay();
     }
   }
 
-  showChatPage(MessageKey key) async {
+  Future<void> showChatPage(MessageKey key) async {
     if (isDesktop) {
       if (isConnManager) {
         if (!_isShowCMSidePage) {
@@ -267,39 +267,42 @@ class ChatModel with ChangeNotifier {
         }
       } else {
         if (_isChatOverlayHide()) {
-          await toggleChatOverlay();
+          toggleChatOverlay();
         }
       }
     } else {
       if (key.connId == clientModeID) {
         if (_isChatOverlayHide()) {
-          await toggleChatOverlay();
+          toggleChatOverlay();
         }
       }
     }
   }
 
-  toggleCMChatPage(MessageKey key) async {
+  Future<void> toggleCMChatPage(MessageKey key) async {
     if (gFFI.chatModel.currentKey != key) {
       gFFI.chatModel.changeCurrentKey(key);
     }
     await toggleCMSidePage();
   }
 
-  toggleCMFilePage() async {
+  Future<void> toggleCMFilePage() async {
     await toggleCMSidePage();
   }
 
   var _togglingCMSidePage = false; // protect order for await
-  toggleCMSidePage() async {
+  Future<bool> toggleCMSidePage() async {
     if (_togglingCMSidePage) return false;
     _togglingCMSidePage = true;
     if (_isShowCMSidePage) {
       _isShowCMSidePage = !_isShowCMSidePage;
       notifyListeners();
       await windowManager.show();
-      await windowManager.setSizeAlignment(
-          kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
+      // Resize only - do not re-anchor to a fixed screen position. This
+      // window is meant to float wherever the user has dragged it (see
+      // buildTitleBar()'s startDragging() in server_page.dart); forcing an
+      // alignment here on every chat open/close was overriding that.
+      await windowManager.setSize(kConnectionManagerWindowSizeClosedChat);
     } else {
       final currentSelectedTab =
           gFFI.serverModel.tabController.state.value.selectedTabInfo;
@@ -310,15 +313,19 @@ class ChatModel with ChangeNotifier {
       }
       requestChatInputFocus();
       await windowManager.show();
-      await windowManager.setSizeAlignment(
-          kConnectionManagerWindowSizeOpenChat, Alignment.topRight);
+      // Resize only - see the matching note in the other branch above.
+      await windowManager.setSize(kConnectionManagerWindowSizeOpenChat);
       _isShowCMSidePage = !_isShowCMSidePage;
       notifyListeners();
     }
+    if (gFFI.serverModel.isManagedDirectoryBuild) {
+      gFFI.serverModel.noteManagedCmInteraction();
+    }
     _togglingCMSidePage = false;
+    return true;
   }
 
-  changeCurrentKey(MessageKey key) {
+  void changeCurrentKey(MessageKey key) {
     updateConnIdOfKey(key);
     String? peerName;
     if (key.connId == clientModeID) {
@@ -326,7 +333,7 @@ class ChatModel with ChangeNotifier {
     } else {
       peerName = parent.target?.serverModel.clients
           .firstWhereOrNull((client) => client.peerId == key.peerId)
-          ?.name;
+          ?.displayName;
     }
     if (!_messages.containsKey(key)) {
       final chatUser = ChatUser(
@@ -344,7 +351,7 @@ class ChatModel with ChangeNotifier {
     mobileClearClientUnread(key.connId);
   }
 
-  receive(int id, String text) async {
+  Future<void> receive(int id, String text) async {
     final session = parent.target;
     if (session == null) {
       debugPrint("Failed to receive msg, session state is null");
@@ -412,7 +419,24 @@ class ChatModel with ChangeNotifier {
         return;
       }
       if (isDesktop) {
-        windowOnTop(null);
+        // showChatPage() above (called unconditionally near the top of
+        // receive()) already opens the chat side page when running as a CM,
+        // which itself shows/focuses/resizes the window to
+        // kConnectionManagerWindowSizeOpenChat. Only fall back to
+        // expandManagedCmWindow()/windowOnTop() - which resize to the
+        // *closed*-chat size - when that didn't happen, otherwise this was
+        // silently stomping the correct "open chat" resize immediately
+        // after it ran, which is why an incoming message showed the plain
+        // connection card instead of the chat conversation.
+        if (!isShowCMSidePage) {
+          if (session.serverModel.isManagedDirectoryBuild &&
+              session.serverModel.managedCmCollapsed) {
+            await session.serverModel
+                .expandManagedCmWindow(scheduleRecollapse: false);
+          } else {
+            await windowOnTop(null);
+          }
+        }
         // disable auto jumpTo other tab when hasFocus, and mark unread message
         final currentSelectedTab =
             session.serverModel.tabController.state.value.selectedTabInfo;
@@ -428,7 +452,7 @@ class ChatModel with ChangeNotifier {
           mobileUpdateUnreadSum();
         }
       }
-      chatUser = ChatUser(id: client.peerId, firstName: client.name);
+      chatUser = ChatUser(id: client.peerId, firstName: client.displayName);
     }
     insertMessage(messagekey,
         ChatMessage(text: text, user: chatUser, createdAt: DateTime.now()));
@@ -441,7 +465,7 @@ class ChatModel with ChangeNotifier {
     notifyListeners();
   }
 
-  send(ChatMessage message) {
+  void send(ChatMessage message) {
     String trimmedText = message.text.trim();
     if (trimmedText.isEmpty) {
       return;
@@ -449,16 +473,18 @@ class ChatModel with ChangeNotifier {
     message.text = trimmedText;
     insertMessage(_currentKey, message);
     if (_currentKey.connId == clientModeID && parent.target != null) {
-      bind.sessionSendChat(sessionId: sessionId, text: message.text);
+      bind.crateFlutterFfiSessionSendChat(
+          sessionId: sessionId, text: message.text);
     } else {
-      bind.cmSendChat(connId: _currentKey.connId, msg: message.text);
+      bind.crateFlutterFfiCmSendChat(
+          connId: _currentKey.connId, msg: message.text);
     }
 
     notifyListeners();
     inputNode.requestFocus();
   }
 
-  insertMessage(MessageKey key, ChatMessage message) {
+  void insertMessage(MessageKey key, ChatMessage message) {
     updateConnIdOfKey(key);
     if (!_messages.containsKey(key)) {
       _messages[key] = MessageBody(message.user, []);
@@ -466,7 +492,7 @@ class ChatModel with ChangeNotifier {
     _messages[key]?.insert(message);
   }
 
-  updateConnIdOfKey(MessageKey key) {
+  void updateConnIdOfKey(MessageKey key) {
     if (_messages.keys
             .toList()
             .firstWhereOrNull((e) => e == key && e.connId != key.connId) !=
@@ -504,13 +530,13 @@ class ChatModel with ChangeNotifier {
     }
   }
 
-  close() {
+  void close() {
     hideChatIconOverlay();
     hideChatWindowOverlay();
     notifyListeners();
   }
 
-  resetClientMode() {
+  void resetClientMode() {
     _messages[clientModeID]?.clear();
   }
 
@@ -549,7 +575,7 @@ class ChatModel with ChangeNotifier {
   }
 
   void closeVoiceCall() {
-    bind.sessionCloseVoiceCall(sessionId: sessionId);
+    bind.crateFlutterFfiSessionCloseVoiceCall(sessionId: sessionId);
   }
 }
 

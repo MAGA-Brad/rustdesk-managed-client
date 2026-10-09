@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +15,8 @@ import '../../models/peer_model.dart';
 import '../../models/platform_model.dart';
 import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
 import '../../desktop/widgets/popup_menu.dart';
+import '../../utils/multi_window_manager.dart';
+import 'managed_chat_dialog.dart';
 import 'dart:math' as math;
 
 typedef PopupMenuEntryBuilder = Future<List<mod_menu.PopupMenuEntry<String>>>
@@ -35,9 +38,7 @@ class _PeerCard extends StatefulWidget {
       {required this.peer,
       required this.tab,
       required this.connect,
-      required this.popupMenuEntryBuilder,
-      Key? key})
-      : super(key: key);
+      required this.popupMenuEntryBuilder});
 
   @override
   _PeerCardState createState() => _PeerCardState();
@@ -50,6 +51,57 @@ class _PeerCardState extends State<_PeerCard>
   final double _cardRadius = 16;
   final double _tileRadius = 5;
   final double _borderWidth = 2;
+
+  String _managedFriendlyNameForPeer(String peerId) {
+    if (!isWindows ||
+        bind.crateFlutterFfiMainGetManagedDirectoryStatus().isEmpty ||
+        peerId.trim().isEmpty) {
+      return '';
+    }
+
+    try {
+      final decoded =
+          jsonDecode(bind.crateFlutterFfiMainGetManagedDirectoryStatus());
+      if (decoded is! Map<String, dynamic>) return '';
+      final devices = decoded['devices'];
+      if (devices is! List) return '';
+
+      for (final item in devices) {
+        if (item is! Map) continue;
+        if ((item['rustdesk_id'] ?? '').toString().trim() != peerId.trim()) {
+          continue;
+        }
+        return (item['display_name'] ?? '').toString().trim();
+      }
+    } catch (e) {
+      debugPrint('Managed History friendly-name lookup failed for $peerId: $e');
+    }
+
+    return '';
+  }
+
+  // Hostname is deliberately never shown here (or anywhere else in the
+  // managed directory UI) - see peer.hostname's own doc comment in
+  // peer_model.dart for why the field itself still has to stay populated.
+  ({String primary, String secondary}) _peerDisplayLabels(Peer peer) {
+    final legacyPrimary = peer.alias.isEmpty ? formatID(peer.id) : peer.alias;
+    final legacySecondary = hideUsernameOnCard == true ? '' : peer.username;
+
+    if (widget.tab != PeerTabIndex.recent) {
+      return (primary: legacyPrimary, secondary: legacySecondary);
+    }
+
+    final rustDeskId = peer.id.trim();
+    final friendlyName = _managedFriendlyNameForPeer(peer.id);
+    final primary = friendlyName.isNotEmpty
+        ? friendlyName
+        : (rustDeskId.isNotEmpty ? rustDeskId : legacyPrimary);
+
+    final secondary =
+        (rustDeskId.isNotEmpty && rustDeskId != primary) ? rustDeskId : '';
+
+    return (primary: primary, secondary: secondary);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -131,13 +183,15 @@ class _PeerCardState extends State<_PeerCard>
     return peerTabShowNote(widget.tab) && peer.note.isNotEmpty;
   }
 
-  makeChild(bool isPortrait, Peer peer) {
-    final name = hideUsernameOnCard == true
-        ? peer.hostname
-        : '${peer.username}${peer.username.isNotEmpty && peer.hostname.isNotEmpty ? '@' : ''}${peer.hostname}';
+  Row makeChild(bool isPortrait, Peer peer) {
+    final labels = _peerDisplayLabels(peer);
     final greyStyle = TextStyle(
         fontSize: 11,
-        color: Theme.of(context).textTheme.titleLarge?.color?.withOpacity(0.6));
+        color: Theme.of(context)
+            .textTheme
+            .titleLarge
+            ?.color
+            ?.withValues(alpha: 0.6));
     final showNote = _showNote(peer);
 
     return Row(
@@ -171,7 +225,7 @@ class _PeerCardState extends State<_PeerCard>
         Expanded(
           child: Container(
             decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.background,
+              color: Theme.of(context).colorScheme.surface,
               borderRadius: BorderRadius.only(
                 topRight: Radius.circular(_tileRadius),
                 bottomRight: Radius.circular(_tileRadius),
@@ -186,21 +240,22 @@ class _PeerCardState extends State<_PeerCard>
                         getOnline(isPortrait ? 4 : 8, peer.online),
                         Expanded(
                             child: Text(
-                          peer.alias.isEmpty ? formatID(peer.id) : peer.alias,
+                          labels.primary,
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.titleSmall,
                         )),
+                        UnreadMailBadge(rustdeskId: peer.id),
                       ]).marginOnly(top: isPortrait ? 0 : 2),
                       Row(
                         children: [
                           Flexible(
                             child: Tooltip(
-                              message: name,
+                              message: labels.secondary,
                               waitDuration: const Duration(seconds: 1),
                               child: Align(
                                 alignment: Alignment.centerLeft,
                                 child: Text(
-                                  name,
+                                  labels.secondary,
                                   style: isPortrait ? null : greyStyle,
                                   textAlign: TextAlign.start,
                                   overflow: TextOverflow.ellipsis,
@@ -230,6 +285,12 @@ class _PeerCardState extends State<_PeerCard>
                             )
                         ],
                       ),
+                      if (getActiveSessionPill(peer.activeSessionPeer) != null)
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: getActiveSessionPill(peer.activeSessionPeer)!
+                              .marginOnly(top: 3),
+                        ),
                     ],
                   ).marginOnly(top: 2),
                 ),
@@ -247,7 +308,8 @@ class _PeerCardState extends State<_PeerCard>
   Widget _buildPeerTile(
       BuildContext context, Peer peer, Rx<BoxDecoration?>? deco) {
     hideUsernameOnCard ??=
-        bind.mainGetBuildinOption(key: kHideUsernameOnCard) == 'Y';
+        bind.crateFlutterFfiMainGetBuildinOption(key: kHideUsernameOnCard) ==
+            'Y';
     final colors = _frontN(peer.tags, 25)
         .map((e) => gFFI.abModel.getCurrentAbTagColor(e))
         .toList();
@@ -281,10 +343,9 @@ class _PeerCardState extends State<_PeerCard>
   Widget _buildPeerCard(
       BuildContext context, Peer peer, Rx<BoxDecoration?> deco) {
     hideUsernameOnCard ??=
-        bind.mainGetBuildinOption(key: kHideUsernameOnCard) == 'Y';
-    final name = hideUsernameOnCard == true
-        ? peer.hostname
-        : '${peer.username}${peer.username.isNotEmpty && peer.hostname.isNotEmpty ? '@' : ''}${peer.hostname}';
+        bind.crateFlutterFfiMainGetBuildinOption(key: kHideUsernameOnCard) ==
+            'Y';
+    final labels = _peerDisplayLabels(peer);
     final child = Card(
       color: Colors.transparent,
       elevation: 0,
@@ -319,10 +380,10 @@ class _PeerCardState extends State<_PeerCard>
                                 children: [
                                   Expanded(
                                     child: Tooltip(
-                                      message: name,
+                                      message: labels.secondary,
                                       waitDuration: const Duration(seconds: 1),
                                       child: Text(
-                                        name,
+                                        labels.secondary,
                                         style: const TextStyle(
                                             color: Colors.white70,
                                             fontSize: 12),
@@ -359,7 +420,7 @@ class _PeerCardState extends State<_PeerCard>
                   ),
                 ),
                 Container(
-                  color: Theme.of(context).colorScheme.background,
+                  color: Theme.of(context).colorScheme.surface,
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -368,11 +429,15 @@ class _PeerCardState extends State<_PeerCard>
                         getOnline(8, peer.online),
                         Expanded(
                             child: Text(
-                          peer.alias.isEmpty ? formatID(peer.id) : peer.alias,
+                          labels.primary,
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.titleSmall,
                         )),
+                        UnreadMailBadge(rustdeskId: peer.id),
                       ]).paddingSymmetric(vertical: 8)),
+                      if (getActiveSessionPill(peer.activeSessionPeer) != null)
+                        getActiveSessionPill(peer.activeSessionPeer)!
+                            .marginOnly(right: 8),
                       checkBoxOrActionMoreLandscape(peer, isTile: false),
                     ],
                   ).paddingSymmetric(horizontal: 12.0),
@@ -509,8 +574,7 @@ abstract class BasePeerCard extends StatelessWidget {
   final EdgeInsets? menuPadding;
 
   BasePeerCard(
-      {required this.peer, required this.tab, this.menuPadding, Key? key})
-      : super(key: key);
+      {required this.peer, required this.tab, this.menuPadding, super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -577,18 +641,7 @@ abstract class BasePeerCard extends StatelessWidget {
   MenuEntryBase<String> _connectAction(BuildContext context) {
     return _connectCommonAction(
       context,
-      (peer.alias.isEmpty
-          ? translate('Connect')
-          : '${translate('Connect')} ${peer.id}'),
-    );
-  }
-
-  @protected
-  MenuEntryBase<String> _transferFileAction(BuildContext context) {
-    return _connectCommonAction(
-      context,
-      translate('Transfer file'),
-      isFileTransfer: true,
+      translate('Connect'),
     );
   }
 
@@ -674,7 +727,7 @@ abstract class BasePeerCard extends StatelessWidget {
         style: style,
       ),
       proc: () {
-        bind.mainWol(id: id);
+        bind.crateFlutterFfiMainWol(id: id);
       },
       padding: menuPadding,
       dismissOnClicked: true,
@@ -690,7 +743,7 @@ abstract class BasePeerCard extends StatelessWidget {
         style: style,
       ),
       proc: () {
-        bind.mainCreateShortcut(id: id);
+        bind.crateFlutterFfiMainCreateShortcut(id: id);
         showToast(translate('Successful'));
       },
       padding: menuPadding,
@@ -705,7 +758,7 @@ abstract class BasePeerCard extends StatelessWidget {
       text: translate(label),
       getter: () async => mainGetPeerBoolOptionSync(id, key),
       setter: (bool v) async {
-        await bind.mainSetPeerOption(
+        await bind.crateFlutterFfiMainSetPeerOption(
             id: id, key: key, value: bool2option(key, v));
         showToast(translate('Successful'));
       },
@@ -714,22 +767,25 @@ abstract class BasePeerCard extends StatelessWidget {
     );
   }
 
-  _openInTabsAction(String id) async =>
+  Future<MenuEntryBase<String>> _openInTabsAction(String id) async =>
       await _openNewConnInAction(id, 'Open in New Tab', kOptionOpenInTabs);
 
-  _openInWindowsAction(String id) async => await _openNewConnInAction(
-      id, 'Open in new window', kOptionOpenInWindows);
+  Future<MenuEntryBase<String>> _openInWindowsAction(String id) async =>
+      await _openNewConnInAction(
+          id, 'Open in new window', kOptionOpenInWindows);
 
   // ignore: unused_element
-  _openNewConnInOptAction(String id) async =>
+  Future<dynamic> _openNewConnInOptAction(String id) async =>
       mainGetLocalBoolOptionSync(kOptionOpenNewConnInTabs)
           ? await _openInWindowsAction(id)
           : await _openInTabsAction(id);
 
   @protected
   Future<bool> _isForceAlwaysRelay(String id) async {
-    return option2bool(kOptionForceAlwaysRelay,
-        (await bind.mainGetPeerOption(id: id, key: kOptionForceAlwaysRelay)));
+    return option2bool(
+        kOptionForceAlwaysRelay,
+        (await bind.crateFlutterFfiMainGetPeerOption(
+            id: id, key: kOptionForceAlwaysRelay)));
   }
 
   @protected
@@ -741,7 +797,7 @@ abstract class BasePeerCard extends StatelessWidget {
         return await _isForceAlwaysRelay(id);
       },
       setter: (bool v) async {
-        await bind.mainSetPeerOption(
+        await bind.crateFlutterFfiMainSetPeerOption(
             id: id,
             key: kOptionForceAlwaysRelay,
             value: bool2option(kOptionForceAlwaysRelay, v));
@@ -767,14 +823,31 @@ abstract class BasePeerCard extends StatelessWidget {
               if (newName != oldName) {
                 if (tab == PeerTabIndex.ab) {
                   await gFFI.abModel.changeAlias(id: id, alias: newName);
-                  await bind.mainSetPeerAlias(id: id, alias: newName);
+                  await bind.crateFlutterFfiMainSetPeerAlias(
+                      id: id, alias: newName);
                 } else {
-                  await bind.mainSetPeerAlias(id: id, alias: newName);
+                  await bind.crateFlutterFfiMainSetPeerAlias(
+                      id: id, alias: newName);
                   showToast(translate('Successful'));
                   _update();
                 }
               }
             });
+      },
+      padding: menuPadding,
+      dismissOnClicked: true,
+    );
+  }
+
+  @protected
+  MenuEntryBase<String> _messageAction(String id) {
+    return MenuEntryButton<String>(
+      childBuilder: (TextStyle? style) => Text(
+        translate('Message'),
+        style: style,
+      ),
+      proc: () {
+        openManagedChatWithPeer(id);
       },
       padding: menuPadding,
       dismissOnClicked: true,
@@ -804,19 +877,19 @@ abstract class BasePeerCard extends StatelessWidget {
         onSubmit() async {
           switch (tab) {
             case PeerTabIndex.recent:
-              await bind.mainRemovePeer(id: id);
-              bind.mainLoadRecentPeers();
+              await bind.crateFlutterFfiMainRemovePeer(id: id);
+              bind.crateFlutterFfiMainLoadRecentPeers();
               break;
             case PeerTabIndex.fav:
-              final favs = (await bind.mainGetFav()).toList();
+              final favs = (await bind.crateFlutterFfiMainGetFav()).toList();
               if (favs.remove(id)) {
-                await bind.mainStoreFav(favs: favs);
-                bind.mainLoadFavPeers();
+                await bind.crateFlutterFfiMainStoreFav(favs: favs);
+                bind.crateFlutterFfiMainLoadFavPeers();
               }
               break;
             case PeerTabIndex.lan:
-              await bind.mainRemoveDiscovered(id: id);
-              bind.mainLoadLanPeers();
+              await bind.crateFlutterFfiMainRemoveDiscovered(id: id);
+              bind.crateFlutterFfiMainLoadLanPeers();
               break;
             case PeerTabIndex.ab:
               await gFFI.abModel.deletePeers([id]);
@@ -846,7 +919,7 @@ abstract class BasePeerCard extends StatelessWidget {
       ),
       proc: () async {
         bool succ = await gFFI.abModel.changePersonalHashPassword(id, '');
-        await bind.mainForgetPassword(id: id);
+        await bind.crateFlutterFfiMainForgetPassword(id: id);
         if (succ) {
           showToast(translate('Successful'));
         } else {
@@ -882,10 +955,10 @@ abstract class BasePeerCard extends StatelessWidget {
       ),
       proc: () {
         () async {
-          final favs = (await bind.mainGetFav()).toList();
+          final favs = (await bind.crateFlutterFfiMainGetFav()).toList();
           if (!favs.contains(id)) {
             favs.add(id);
-            await bind.mainStoreFav(favs: favs);
+            await bind.crateFlutterFfiMainStoreFav(favs: favs);
           }
           showToast(translate('Successful'));
         }();
@@ -917,9 +990,9 @@ abstract class BasePeerCard extends StatelessWidget {
       ),
       proc: () {
         () async {
-          final favs = (await bind.mainGetFav()).toList();
+          final favs = (await bind.crateFlutterFfiMainGetFav()).toList();
           if (favs.remove(id)) {
-            await bind.mainStoreFav(favs: favs);
+            await bind.crateFlutterFfiMainStoreFav(favs: favs);
             await reloadFunc();
           }
           showToast(translate('Successful'));
@@ -949,215 +1022,102 @@ abstract class BasePeerCard extends StatelessWidget {
 
   @protected
   Future<String> _getAlias(String id) async =>
-      await bind.mainGetPeerOption(id: id, key: 'alias');
+      await bind.crateFlutterFfiMainGetPeerOption(id: id, key: 'alias');
 
   @protected
   void _update();
 }
 
 class RecentPeerCard extends BasePeerCard {
-  RecentPeerCard({required Peer peer, EdgeInsets? menuPadding, Key? key})
-      : super(
-            peer: peer,
-            tab: PeerTabIndex.recent,
-            menuPadding: menuPadding,
-            key: key);
+  RecentPeerCard({required super.peer, super.menuPadding, super.key})
+      : super(tab: PeerTabIndex.recent);
 
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
-    final List<MenuEntryBase<String>> menuItems = [
+    final favs = (await bind.crateFlutterFfiMainGetFav()).toList();
+    final menuItems = <MenuEntryBase<String>>[
       _connectAction(context),
-      _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
+      MenuEntryDivider(),
     ];
-
-    if (peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_terminalRunAsAdminAction(context));
-    }
-
-    final List favs = (await bind.mainGetFav()).toList();
-
-    if (isDesktop && peer.platform != kPeerPlatformAndroid) {
-      menuItems.add(_tcpTunnelingAction(context));
-    }
-    // menuItems.add(await _openNewConnInOptAction(peer.id));
-    if (!isWeb) {
-      menuItems.add(await _forceAlwaysRelayAction(peer.id));
-    }
-    if (isWindows && peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_rdpAction(context, peer.id));
-    }
-    if (isWindows) {
-      menuItems.add(_createShortCutAction(peer.id));
-    }
-    menuItems.add(MenuEntryDivider());
-    if (isMobile || isDesktop || isWebDesktop) {
-      menuItems.add(_renameAction(peer.id));
-    }
-    if (await bind.mainPeerHasPassword(id: peer.id)) {
-      menuItems.add(_unrememberPasswordAction(peer.id));
-    }
-
     if (!favs.contains(peer.id)) {
       menuItems.add(_addFavAction(peer.id));
     } else {
       menuItems.add(_rmFavAction(peer.id, () async {}));
     }
-
-    if (gFFI.userModel.userName.isNotEmpty) {
-      menuItems.add(_addToAb(peer));
-    }
-
-    menuItems.add(MenuEntryDivider());
     menuItems.add(_removeAction(peer.id));
     return menuItems;
   }
 
   @protected
   @override
-  void _update() => bind.mainLoadRecentPeers();
+  void _update() => bind.crateFlutterFfiMainLoadRecentPeers();
 }
 
 class FavoritePeerCard extends BasePeerCard {
-  FavoritePeerCard({required Peer peer, EdgeInsets? menuPadding, Key? key})
-      : super(
-            peer: peer,
-            tab: PeerTabIndex.fav,
-            menuPadding: menuPadding,
-            key: key);
+  FavoritePeerCard({required super.peer, super.menuPadding, super.key})
+      : super(tab: PeerTabIndex.fav);
 
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
-    final List<MenuEntryBase<String>> menuItems = [
+    return <MenuEntryBase<String>>[
       _connectAction(context),
-      _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
+      MenuEntryDivider(),
+      _rmFavAction(peer.id, () async {
+        await bind.crateFlutterFfiMainLoadFavPeers();
+      }),
     ];
-
-    if (peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_terminalRunAsAdminAction(context));
-    }
-
-    if (isDesktop && peer.platform != kPeerPlatformAndroid) {
-      menuItems.add(_tcpTunnelingAction(context));
-    }
-    // menuItems.add(await _openNewConnInOptAction(peer.id));
-    if (!isWeb) {
-      menuItems.add(await _forceAlwaysRelayAction(peer.id));
-    }
-    if (isWindows && peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_rdpAction(context, peer.id));
-    }
-    if (isWindows) {
-      menuItems.add(_createShortCutAction(peer.id));
-    }
-    menuItems.add(MenuEntryDivider());
-    if (isMobile || isDesktop || isWebDesktop) {
-      menuItems.add(_renameAction(peer.id));
-    }
-    if (await bind.mainPeerHasPassword(id: peer.id)) {
-      menuItems.add(_unrememberPasswordAction(peer.id));
-    }
-    menuItems.add(_rmFavAction(peer.id, () async {
-      await bind.mainLoadFavPeers();
-    }));
-
-    if (gFFI.userModel.userName.isNotEmpty) {
-      menuItems.add(_addToAb(peer));
-    }
-
-    menuItems.add(MenuEntryDivider());
-    menuItems.add(_removeAction(peer.id));
-    return menuItems;
   }
 
   @protected
   @override
-  void _update() => bind.mainLoadFavPeers();
+  void _update() => bind.crateFlutterFfiMainLoadFavPeers();
 }
 
-class DiscoveredPeerCard extends BasePeerCard {
-  DiscoveredPeerCard({required Peer peer, EdgeInsets? menuPadding, Key? key})
-      : super(
-            peer: peer,
-            tab: PeerTabIndex.lan,
-            menuPadding: menuPadding,
-            key: key);
+class DirectoryPeerCard extends BasePeerCard {
+  DirectoryPeerCard({required super.peer, super.menuPadding, super.key})
+      : super(tab: PeerTabIndex.lan);
 
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
-    final List<MenuEntryBase<String>> menuItems = [
+    final favs = (await bind.crateFlutterFfiMainGetFav()).toList();
+    final menuItems = <MenuEntryBase<String>>[
       _connectAction(context),
-      _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
     ];
-
-    if (peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_terminalRunAsAdminAction(context));
+    // Managed chat is desktop-only; RDC for Android has none.
+    if (!isAndroid && bind.crateFlutterFfiMainGetManagedDirectoryStatus().isNotEmpty) {
+      menuItems.add(_messageAction(peer.id));
     }
-
-    final List favs = (await bind.mainGetFav()).toList();
-
-    if (isDesktop && peer.platform != kPeerPlatformAndroid) {
-      menuItems.add(_tcpTunnelingAction(context));
-    }
-    // menuItems.add(await _openNewConnInOptAction(peer.id));
-    if (!isWeb) {
-      menuItems.add(await _forceAlwaysRelayAction(peer.id));
-    }
-    if (isWindows && peer.platform == kPeerPlatformWindows) {
-      menuItems.add(_rdpAction(context, peer.id));
-    }
-    menuItems.add(_wolAction(peer.id));
-    if (isWindows) {
-      menuItems.add(_createShortCutAction(peer.id));
-    }
-
+    menuItems.add(MenuEntryDivider());
     if (!favs.contains(peer.id)) {
       menuItems.add(_addFavAction(peer.id));
     } else {
       menuItems.add(_rmFavAction(peer.id, () async {}));
     }
-
-    if (gFFI.userModel.userName.isNotEmpty) {
-      menuItems.add(_addToAb(peer));
-    }
-
-    menuItems.add(MenuEntryDivider());
-    menuItems.add(_removeAction(peer.id));
     return menuItems;
   }
 
   @protected
   @override
-  void _update() => bind.mainLoadLanPeers();
+  void _update() {}
 }
 
 class AddressBookPeerCard extends BasePeerCard {
-  AddressBookPeerCard({required Peer peer, EdgeInsets? menuPadding, Key? key})
-      : super(
-            peer: peer,
-            tab: PeerTabIndex.ab,
-            menuPadding: menuPadding,
-            key: key);
+  AddressBookPeerCard({required super.peer, super.menuPadding, super.key})
+      : super(tab: PeerTabIndex.ab);
 
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
-      _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
+      if (!isManagedClientBuild()) _viewCameraAction(context),
+      if (!isManagedClientBuild()) _terminalAction(context),
     ];
 
-    if (peer.platform == kPeerPlatformWindows) {
+    if (peer.platform == kPeerPlatformWindows && !isManagedClientBuild()) {
       menuItems.add(_terminalRunAsAdminAction(context));
     }
 
@@ -1297,24 +1257,19 @@ class AddressBookPeerCard extends BasePeerCard {
 }
 
 class MyGroupPeerCard extends BasePeerCard {
-  MyGroupPeerCard({required Peer peer, EdgeInsets? menuPadding, Key? key})
-      : super(
-            peer: peer,
-            tab: PeerTabIndex.group,
-            menuPadding: menuPadding,
-            key: key);
+  MyGroupPeerCard({required super.peer, super.menuPadding, super.key})
+      : super(tab: PeerTabIndex.group);
 
   @override
   Future<List<MenuEntryBase<String>>> _buildMenuItems(
       BuildContext context) async {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
-      _transferFileAction(context),
-      _viewCameraAction(context),
-      _terminalAction(context),
+      if (!isManagedClientBuild()) _viewCameraAction(context),
+      if (!isManagedClientBuild()) _terminalAction(context),
     ];
 
-    if (peer.platform == kPeerPlatformWindows) {
+    if (peer.platform == kPeerPlatformWindows && !isManagedClientBuild()) {
       menuItems.add(_terminalRunAsAdminAction(context));
     }
 
@@ -1333,7 +1288,7 @@ class MyGroupPeerCard extends BasePeerCard {
     }
     // menuItems.add(MenuEntryDivider());
     // menuItems.add(_renameAction(peer.id));
-    // if (await bind.mainPeerHasPassword(id: peer.id)) {
+    // if (await bind.crateFlutterFfiMainPeerHasPassword(id: peer.id)) {
     //   menuItems.add(_unrememberPasswordAction(peer.id));
     // }
     if (gFFI.userModel.userName.isNotEmpty) {
@@ -1348,13 +1303,16 @@ class MyGroupPeerCard extends BasePeerCard {
 }
 
 void _rdpDialog(String id) async {
-  final maxLength = bind.mainMaxEncryptLen();
-  final port = await bind.mainGetPeerOption(id: id, key: 'rdp_port');
-  final username = await bind.mainGetPeerOption(id: id, key: 'rdp_username');
+  final maxLength = bind.crateFlutterFfiMainMaxEncryptLen();
+  final port =
+      await bind.crateFlutterFfiMainGetPeerOption(id: id, key: 'rdp_port');
+  final username =
+      await bind.crateFlutterFfiMainGetPeerOption(id: id, key: 'rdp_username');
   final portController = TextEditingController(text: port);
   final userController = TextEditingController(text: username);
   final passwordController = TextEditingController(
-      text: await bind.mainGetPeerOption(id: id, key: 'rdp_password'));
+      text: await bind.crateFlutterFfiMainGetPeerOption(
+          id: id, key: 'rdp_password'));
   RxBool secure = true.obs;
 
   gFFI.dialogManager.show((setState, close, context) {
@@ -1362,10 +1320,11 @@ void _rdpDialog(String id) async {
       String port = portController.text.trim();
       String username = userController.text;
       String password = passwordController.text;
-      await bind.mainSetPeerOption(id: id, key: 'rdp_port', value: port);
-      await bind.mainSetPeerOption(
+      await bind.crateFlutterFfiMainSetPeerOption(
+          id: id, key: 'rdp_port', value: port);
+      await bind.crateFlutterFfiMainSetPeerOption(
           id: id, key: 'rdp_username', value: username);
-      await bind.mainSetPeerOption(
+      await bind.crateFlutterFfiMainSetPeerOption(
           id: id, key: 'rdp_password', value: password);
       showToast(translate('Successful'));
       close();
@@ -1474,6 +1433,81 @@ Widget getOnline(double rightPadding, bool online) {
               radius: 3, backgroundColor: online ? Colors.green : kColorWarn)));
 }
 
+/// Mail-icon badge shown on a Directory card when there's an unread
+/// managed-chat conversation with that peer - lets the user notice and
+/// open it even when a live push's popup window failed to grab focus
+/// (Windows blocks a background process from stealing foreground focus)
+/// or was missed outright (see managed_chat.rs's notify_gui_of_incoming_message
+/// retry comment). Matched by RustDesk id.
+class UnreadMailBadge extends StatelessWidget {
+  final String rustdeskId;
+
+  const UnreadMailBadge({super.key, required this.rustdeskId});
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      final conversation =
+          gFFI.managedChatModel.conversationForPeerRustdeskId(rustdeskId);
+      if (conversation == null || conversation.unreadCount <= 0) {
+        return const SizedBox.shrink();
+      }
+      return Tooltip(
+        message: translate('Unread messages'),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(999),
+          onTap: () =>
+              rustDeskWinManager.openManagedChatWindow(conversation.id),
+          child: Padding(
+            padding: const EdgeInsets.all(2),
+            child: Icon(Icons.mail, size: 16, color: kColorActiveSession),
+          ),
+        ),
+      );
+    });
+  }
+}
+
+Widget? getActiveSessionPill(String? activeSessionPeer) {
+  if (activeSessionPeer == null || activeSessionPeer.isEmpty) return null;
+  // Friendly names are expected to follow a "Name-DeviceType" convention
+  // (e.g. "Alice-Home", "Bob-Laptop") - show just the name part before the
+  // first dash, since the device-type suffix isn't useful in this
+  // already-tight pill. Falls back to the full string if there's no dash.
+  final shortName = activeSessionPeer.split('-').first;
+  // Solid fill + white text rather than tinted-background/colored-text -
+  // the latter tested unreadable over a compressed remote session (low
+  // contrast at 10px compounds with video compression blur on fine text).
+  return Container(
+    // vertical: 5 (was) made the pill taller than its sibling row in the
+    // grid-card layout, overflowing the fixed-height card by a few
+    // pixels whenever an active session was shown - confirmed via the
+    // debug-only RenderFlex overflow banner ("BOTTOM OVERFLOWED BY 3.0
+    // PIXELS"), which release builds silently swallow but still clip
+    // (unlikely to be visible, but genuinely a real layout bug).
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+    decoration: BoxDecoration(
+      color: kColorActiveSession,
+      borderRadius: BorderRadius.circular(999),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.screen_share_outlined, size: 12, color: Colors.white)
+            .marginOnly(right: 4),
+        Flexible(
+          child: Text(
+            '${translate('In session')} - $shortName',
+            style: const TextStyle(
+                fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
 Widget build_more(BuildContext context, {bool invert = false}) {
   final RxBool hover = false.obs;
   return InkWell(
@@ -1484,11 +1518,11 @@ Widget build_more(BuildContext context, {bool invert = false}) {
           radius: 14,
           backgroundColor: hover.value
               ? (invert
-                  ? Theme.of(context).colorScheme.background
+                  ? Theme.of(context).colorScheme.surface
                   : Theme.of(context).scaffoldBackgroundColor)
               : (invert
                   ? Theme.of(context).scaffoldBackgroundColor
-                  : Theme.of(context).colorScheme.background),
+                  : Theme.of(context).colorScheme.surface),
           child: Icon(Icons.more_vert,
               size: 18,
               color: hover.value
@@ -1497,7 +1531,7 @@ Widget build_more(BuildContext context, {bool invert = false}) {
                       .textTheme
                       .titleLarge
                       ?.color
-                      ?.withOpacity(0.5)))));
+                      ?.withValues(alpha: 0.5)))));
 }
 
 class TagPainter extends CustomPainter {
@@ -1550,8 +1584,9 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
     // If recent peer's alias is empty, set it to ab's alias
     // Because the platform is not set, it may not take effect, but it is more important not to display if the connection is not successful
     if (peer.alias.isNotEmpty &&
-        (await bind.mainGetPeerOption(id: peer.id, key: "alias")).isEmpty) {
-      await bind.mainSetPeerAlias(
+        (await bind.crateFlutterFfiMainGetPeerOption(id: peer.id, key: "alias"))
+            .isEmpty) {
+      await bind.crateFlutterFfiMainSetPeerAlias(
         id: peer.id,
         alias: peer.alias,
       );
