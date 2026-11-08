@@ -22,7 +22,8 @@ Future<void> handleUpdate(String releasePageUrl) async {
   final String? downloadUrl;
   try {
     downloadUrl = await waitForUpdateVerification(
-      bind.mainGetCommon(key: 'verified-download-url-$releasePageUrl'),
+      bind.crateFlutterFfiMainGetCommon(
+          key: 'verified-download-url-$releasePageUrl'),
       dialogClosed,
     );
   } catch (error) {
@@ -51,13 +52,13 @@ Future<void> handleUpdate(String releasePageUrl) async {
         actions: [
           dialogButton('Cancel', onPressed: () async {
             onCanceled.value();
-            await bind.mainSetCommon(
+            await bind.crateFlutterFfiMainSetCommon(
                 key: 'cancel-downloader', value: downloadId.value);
             // Wait for the downloader to be removed.
             for (int i = 0; i < 10; i++) {
               await Future.delayed(const Duration(milliseconds: 300));
               final isCanceled = 'error:Downloader not found' ==
-                  await bind.mainGetCommon(
+                  await bind.crateFlutterFfiMainGetCommon(
                       key: 'download-data-${downloadId.value}');
               if (isCanceled) {
                 break;
@@ -110,8 +111,7 @@ class UpdateProgress extends StatefulWidget {
   final SimpleWrapper onCanceled;
   UpdateProgress(
       this.releasePageUrl, this.downloadUrl, this.downloadId, this.onCanceled,
-      {Key? key})
-      : super(key: key);
+      {super.key});
 
   @override
   State<UpdateProgress> createState() => UpdateProgressState();
@@ -134,7 +134,8 @@ class UpdateProgressState extends State<UpdateProgress> {
     platformFFI.registerEventHandler(_eventKeyDownloadNewVersion,
         _eventKeyDownloadNewVersion, handleDownloadNewVersion,
         replace: true);
-    bind.mainSetCommon(key: 'download-new-version', value: widget.downloadUrl);
+    bind.crateFlutterFfiMainSetCommon(
+        key: 'download-new-version', value: widget.downloadUrl);
   }
 
   @override
@@ -210,8 +211,8 @@ class UpdateProgressState extends State<UpdateProgress> {
 
   void _updateDownloadData() {
     String err = '';
-    String downloadData =
-        bind.mainGetCommonSync(key: 'download-data-${widget.downloadId.value}');
+    String downloadData = bind.crateFlutterFfiMainGetCommonSync(
+        key: 'download-data-${widget.downloadId.value}');
     if (downloadData.startsWith('error:')) {
       err = downloadData.substring('error:'.length);
     } else {
@@ -247,7 +248,7 @@ class UpdateProgressState extends State<UpdateProgress> {
           _totalSize != null &&
           _downloadedSize >= _totalSize!) {
         cancelQueryTimer();
-        bind.mainSetCommon(
+        bind.crateFlutterFfiMainSetCommon(
             key: 'remove-downloader', value: widget.downloadId.value);
         if (_totalSize == 0) {
           _onError('The download file size is 0.');
@@ -277,7 +278,8 @@ class UpdateProgressState extends State<UpdateProgress> {
             (evt) => _handleUpdateMe(releasePageUrl, evt),
             replace: true);
         try {
-          await bind.mainSetCommon(key: 'update-me', value: downloadUrl);
+          await bind.crateFlutterFfiMainSetCommon(
+              key: 'update-me', value: downloadUrl);
         } catch (error) {
           platformFFI.unregisterEventHandler(
               _eventKeyUpdateMe, _eventKeyUpdateMe);

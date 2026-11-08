@@ -38,8 +38,10 @@ pub fn signal_receiver() -> broadcast::Receiver<Vec<i32>> {
 #[cfg(not(any(target_os = "ios")))]
 fn start_hbbs_sync() -> broadcast::Sender<Vec<i32>> {
     let (tx, _rx) = broadcast::channel::<Vec<i32>>(16);
-    std::thread::spawn(move || start_hbbs_sync_async());
-    return tx;
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        std::thread::spawn(move || start_hbbs_sync_async());
+    }
+    tx
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -347,6 +349,10 @@ pub fn is_pro() -> bool {
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn register_switch_grant(switch_uuid: String) {
+    // RDS has no switch-grant endpoint; managed switch sides is checked by the peer proof instead.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return;
+    }
     tokio::spawn(async move {
         let api_server = crate::ui_interface::get_api_server();
         if api_server.is_empty() || crate::is_public(&api_server) {

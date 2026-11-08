@@ -1,17 +1,24 @@
+Subject: [PATCH] avcodec/qsvenc: bound QSV encode submission and sync waits
+
+Ported to FFmpeg 9.0.2 for RDC: the code is unchanged; only the include
+context moved (refstruct.h is now libavutil/refstruct.h) and line offsets.
+FFmpeg 9 still retries EncodeFrameAsync and SyncOperation without a bound.
+
 diff --git a/libavcodec/qsvenc.c b/libavcodec/qsvenc.c
+index c79db08..60a1fd5 100644
 --- a/libavcodec/qsvenc.c
 +++ b/libavcodec/qsvenc.c
-@@ -43,6 +43,9 @@
- #include "qsv_internal.h"
+@@ -42,6 +42,9 @@
  #include "qsvenc.h"
- #include "refstruct.h"
-+
+ #include "libavutil/refstruct.h"
+ 
 +#define QSV_MAX_ENCODE_RETRIES 100
 +#define QSV_SYNC_TIMEOUT_US 2000000
- 
++
  struct profile_names {
      mfxU16 profile;
-@@ -2468,6 +2471,7 @@
+     const char *name;
+@@ -2470,6 +2473,7 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
      QSVFrame *qsv_frame = NULL;
      mfxEncodeCtrl* enc_ctrl = NULL;
      int ret;
@@ -19,7 +26,7 @@ diff --git a/libavcodec/qsvenc.c b/libavcodec/qsvenc.c
  
      if (frame) {
          ret = submit_frame(q, frame, &qsv_frame);
-@@ -2538,6 +2542,18 @@
+@@ -2540,8 +2544,20 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
  
      do {
          ret = MFXVideoENCODE_EncodeFrameAsync(q->session, enc_ctrl, surf, pkt.bs, pkt.sync);
@@ -38,14 +45,15 @@ diff --git a/libavcodec/qsvenc.c b/libavcodec/qsvenc.c
              av_usleep(500);
 +#endif
      } while (ret == MFX_WRN_DEVICE_BUSY || ret == MFX_WRN_IN_EXECUTION);
-@@ -2656,12 +2672,23 @@
+ 
+     if (ret > 0)
+@@ -2658,12 +2674,23 @@ int ff_qsv_encode(AVCodecContext *avctx, QSVEncContext *q,
          mfxExtAVCEncodedFrameInfo *enc_info;
          mfxExtBuffer **enc_buf;
          enum AVPictureType pict_type;
--
--        av_fifo_read(q->async_fifo, &qpkt, 1);
 +        int64_t sync_deadline = av_gettime_relative() + QSV_SYNC_TIMEOUT_US;
-+
+ 
+-        av_fifo_read(q->async_fifo, &qpkt, 1);
 +        // The SDK may still use these buffers after a synchronization timeout.
 +        av_fifo_peek(q->async_fifo, &qpkt, 1, 0);
  

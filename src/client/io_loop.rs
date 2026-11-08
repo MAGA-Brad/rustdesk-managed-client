@@ -103,6 +103,8 @@ pub struct Remote<T: InvokeUiSession> {
     last_record_state: bool,
     sent_close_reason: bool,
     cursor_dedupe: CursorDedupe,
+    #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+    managed_report: Option<crate::managed_connection_report::ConnectionReport>,
     trusted_device: crate::trusted_devices::client::Session,
 }
 
@@ -157,6 +159,8 @@ impl<T: InvokeUiSession> Remote<T> {
             last_record_state: false,
             sent_close_reason: false,
             cursor_dedupe: Default::default(),
+            #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+            managed_report: None,
             trusted_device: Default::default(),
         }
     }
@@ -195,6 +199,8 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
+        #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+        let connect_started = Instant::now();
         match Client::start(
             &self.handler.get_id(),
             key,
@@ -210,6 +216,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     .lock()
                     .unwrap()
                     .set_connected();
+                #[cfg(all(windows, feature = "flutter"))]
+                crate::flutter::sessions::report_controlling_sessions();
                 let is_secured = peer.is_secured();
                 let trust = crate::trusted_devices::client::Session::new(
                     &self.handler.lc.read().unwrap(),
@@ -237,8 +245,26 @@ impl<T: InvokeUiSession> Remote<T> {
                 };
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
+                #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+                {
+                    let session_id = self.handler.lc.read().unwrap().session_id;
+                    let direct_outcome = self.handler.lc.write().unwrap().managed_direct_outcome.take();
+                    self.managed_report = crate::managed_connection_report::ConnectionReport::new(
+                        session_id,
+                        round,
+                        &self.handler.get_id(),
+                        self.handler.is_file_transfer(),
+                        self.handler.is_default(),
+                        direct,
+                        stream_type,
+                        connect_started.elapsed().as_millis() as u64,
+                        Client::relay_fallback_delay_ms(),
+                        direct_outcome,
+                    );
+                }
                 if !is_secured
-                    && !crate::common::is_direct_ip_access(&self.handler.get_id())
+                    && (option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+                        || !crate::common::is_direct_ip_access(&self.handler.get_id()))
                     && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
                 {
                     self.send_close_reason(&mut peer, "").await;
@@ -447,6 +473,10 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler.on_establish_connection_error(err.to_string());
             }
         }
+        #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+        if let Some(mut report) = self.managed_report.take() {
+            report.ended();
+        }
         self.handle_disconnected(round);
         #[cfg(target_os = "android")]
         for job in &mut self.write_jobs {
@@ -471,6 +501,8 @@ impl<T: InvokeUiSession> Remote<T> {
             .lock()
             .unwrap()
             .set_disconnected(round);
+        #[cfg(all(windows, feature = "flutter"))]
+        crate::flutter::sessions::report_controlling_sessions();
 
         #[cfg(not(target_os = "ios"))]
         if self.handler.is_default() && _set_disconnected_ok {
@@ -798,7 +830,9 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
             }
             Data::Message(msg) => {
-                let msg = self.trusted_device.outgoing(msg);
+                let msg = self
+                    .trusted_device
+                    .outgoing(Self::managed_2fa_trust_request(msg));
                 // The Flutter clipboard broadcast is process-wide, so a clipboard can reach this
                 // round's queue before the round has logged in; it is dropped here, on the round
                 // itself.
@@ -1477,6 +1511,10 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     async fn send_toggle_virtual_display_msg(&self, peer: &mut Stream) {
+        // Managed builds ship no virtual display driver: don't replay a saved request.
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+            return;
+        }
         if self.handler.is_view_camera() {
             return;
         }
@@ -1742,11 +1780,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         return false;
                     }
                 }
-                Some(message::Union::LoginResponse(lr)) => match self
-                    .trusted_device
-                    .respond(lr, &self.handler)
-                    .await
-                    .union
+                Some(message::Union::LoginResponse(lr)) => match self.respond_login(lr).await.union
                 {
                     Some(login_response::Union::Error(err)) => {
                         if !self.handler.handle_login_error(&err) {
@@ -1770,6 +1804,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         self.handler.handle_peer_info(pi);
+                        #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+                        if let Some(report) = self.managed_report.as_mut() {
+                            report.established();
+                        }
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
                         self.check_clipboard_file_context();
                         if self.handler.is_default() {
@@ -2267,10 +2305,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
                 Some(message::Union::Misc(misc)) => match misc.union {
                     Some(misc::Union::AudioFormat(f)) => {
-                        self.audio_sender.send(MediaData::AudioFormat(f)).ok();
+                        // Managed builds never play the remote device's audio.
+                        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+                            self.audio_sender.send(MediaData::AudioFormat(f)).ok();
+                        }
                     }
                     Some(misc::Union::ChatMessage(c)) => {
-                        self.handler.new_message(c.text);
+                        // Managed builds have no in-session text chat.
+                        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+                            self.handler.new_message(c.text);
+                        }
                     }
                     Some(misc::Union::PermissionInfo(p)) => {
                         log::info!("Change permission {:?} -> {}", p.permission, p.enabled);
@@ -2316,7 +2360,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.set_permission("restart", p.enabled);
                             }
                             Ok(Permission::Recording) => {
-                                self.handler.lc.write().unwrap().record_permission = p.enabled;
+                                self.handler.lc.write().unwrap().record_permission =
+                                    p.enabled && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none();
                                 self.update_record_state();
                                 self.handler.set_permission("recording", p.enabled);
                             }
@@ -2458,7 +2503,11 @@ impl<T: InvokeUiSession> Remote<T> {
                             .write()
                             .unwrap()
                             .consume_switch_back_permission();
-                        if allow_switch_back {
+                        // Managed builds ask the user to accept it first, so the side being
+                        // controlled may ask even when this session didn't come from a switch.
+                        if allow_switch_back
+                            || option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+                        {
                             self.handler.switch_back(&self.handler.get_id());
                         } else {
                             log::warn!(
@@ -2477,10 +2526,14 @@ impl<T: InvokeUiSession> Remote<T> {
                     _ => {}
                 },
                 Some(message::Union::TestDelay(t)) => {
+                    #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+                    if let Some(report) = self.managed_report.as_mut() {
+                        report.note_delay(t.last_delay);
+                    }
                     self.handler.handle_test_delay(t, peer).await;
                 }
                 Some(message::Union::AudioFrame(frame)) => {
-                    if !self.handler.lc.read().unwrap().disable_audio.v {
+                    if !self.handler.lc.read().unwrap().disable_audio.v && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
                         self.audio_sender
                             .send(MediaData::AudioFrame(Box::new(frame)))
                             .ok();
@@ -2527,6 +2580,14 @@ impl<T: InvokeUiSession> Remote<T> {
                     _ => {}
                 },
                 Some(message::Union::MessageBox(msgbox)) => {
+                    // Managed Switch Sides: the other side accepted and closes this connection.
+                    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+                        && msgbox.msgtype == "switch-sides-accepted"
+                    {
+                        self.handler
+                            .msgbox(&msgbox.msgtype, &msgbox.title, &msgbox.text, "");
+                        return false;
+                    }
                     let mut link = msgbox.link;
                     if let Some(v) = config::HELPER_URL.get(&link as &str) {
                         link = v.to_string();
@@ -2589,6 +2650,38 @@ impl<T: InvokeUiSession> Remote<T> {
             }
         }
         true
+    }
+
+    /// Upstream's trusted devices (V2) set `enable_trusted_devices` on every login response. A
+    /// managed host never offers V2: it offers its own 2FA trust (managed_2fa_trust.rs) with the
+    /// legacy flag on the 2FA prompt, which then holds through a mistyped code, as before V2.
+    async fn respond_login(&mut self, lr: LoginResponse) -> LoginResponse {
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+            return self.trusted_device.respond(lr, &self.handler).await;
+        }
+        let enabled = self.handler.lc.read().unwrap().enable_trusted_devices;
+        let lr = self.trusted_device.respond(lr, &self.handler).await;
+        let enabled = match &lr.union {
+            Some(login_response::Union::Error(err)) if err == client::REQUIRE_2FA => {
+                lr.enable_trusted_devices
+            }
+            _ => enabled,
+        };
+        self.handler.lc.write().unwrap().enable_trusted_devices = enabled;
+        lr
+    }
+
+    /// Managed hosts take a 2FA trust request as a non-empty hwid, the way managed controllers
+    /// asked before V2; V2 clears `trust_this_device` for a host that does not offer V2.
+    fn managed_2fa_trust_request(mut msg: Message) -> Message {
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+            if let Some(message::Union::Auth2fa(auth)) = msg.union.as_mut() {
+                if auth.trust_this_device && auth.hwid.is_empty() {
+                    auth.hwid = crate::get_hwid();
+                }
+            }
+        }
+        msg
     }
 
     fn set_peer_info(&mut self, pi: &PeerInfo) {

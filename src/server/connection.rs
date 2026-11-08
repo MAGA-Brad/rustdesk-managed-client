@@ -202,7 +202,15 @@ lazy_static::lazy_static! {
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-const SWITCH_SIDES_UUID_TTL: Duration = Duration::from_secs(10);
+// Managed builds wait for the other side to accept Switch Sides before it connects back.
+const SWITCH_SIDES_UUID_TTL: Duration =
+    Duration::from_secs(if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        90
+    } else {
+        10
+    });
+#[cfg(all(feature = "flutter", windows))]
+const MANAGED_SWITCH_SIDES_ANSWER_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -213,6 +221,31 @@ lazy_static::lazy_static! {
 
 #[cfg(target_os = "windows")]
 const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
+
+#[cfg(target_os = "windows")]
+const MANAGED_LOCAL_INPUT_PRIORITY_DEFAULT_MS: u64 = 2000;
+
+// User-configurable via Settings > Security ("Local Input Priority"). Values
+// outside 1000-5000ms fall back to the default rather than being rejected,
+// since a stray/corrupt config value should degrade safely, not disable the
+// local-user-always-wins guarantee entirely.
+#[cfg(target_os = "windows")]
+fn managed_local_input_priority_ms() -> u64 {
+    Config::get_option(keys::OPTION_MANAGED_LOCAL_INPUT_PRIORITY_MS)
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| (1000..=5000).contains(ms))
+        .unwrap_or(MANAGED_LOCAL_INPUT_PRIORITY_DEFAULT_MS)
+}
+
+#[inline]
+#[cfg(target_os = "windows")]
+fn managed_local_input_has_priority() -> bool {
+    option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+        && crate::platform::windows::local_mouse_has_priority(
+            managed_local_input_priority_ms(),
+        )
+}
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -321,6 +354,17 @@ impl ConnAuditPrimaryAuth {
     fn as_i64(self) -> i64 {
         self as i64
     }
+
+    #[cfg(windows)]
+    fn from_i64(value: i64) -> Self {
+        match value {
+            1 => Self::Click,
+            2 => Self::TemporaryPassword,
+            3 => Self::PermanentPassword,
+            4 => Self::SwitchSides,
+            _ => Self::None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -334,6 +378,15 @@ enum ConnAuditTwoFactor {
 impl ConnAuditTwoFactor {
     fn as_i64(self) -> i64 {
         self as i64
+    }
+
+    #[cfg(windows)]
+    fn from_i64(value: i64) -> Self {
+        match value {
+            1 => Self::Totp,
+            2 => Self::TrustedDevice,
+            _ => Self::None,
+        }
     }
 }
 
@@ -424,6 +477,12 @@ pub struct Connection {
     #[cfg(windows)]
     portable: PortableState,
     from_switch: bool,
+    // Managed builds: a peer's Switch Sides request waiting for the local user's answer.
+    #[cfg(all(feature = "flutter", windows))]
+    managed_switch_sides_pending: Option<(uuid::Uuid, Instant)>,
+    // When this side asked the peer to switch back; the request that follows is our own.
+    #[cfg(all(feature = "flutter", windows))]
+    switch_back_requested_at: Option<Instant>,
     voice_call_request_timestamp: Option<NonZeroI64>,
     voice_calling: bool,
     options_in_login: Option<OptionMessage>,
@@ -465,6 +524,28 @@ pub struct Connection {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     terminal_user_token: Option<TerminalUserToken>,
     terminal_generic_service: Option<Box<GenericService>>,
+    managed_session_telemetry:
+        Option<crate::hbbs_http::directory_enrollment::ManagedSessionTelemetry>,
+    // Managed builds (managed_reconnect.rs): the controller verified its RDS certificate on this
+    // login; this login came in on a reconnect pass; when this connection last renewed its pass.
+    #[cfg(windows)]
+    managed_peer_verified: bool,
+    // The identity key that certificate proved (managed_2fa_trust.rs).
+    #[cfg(windows)]
+    managed_peer_key: Option<String>,
+    // RDS lists the controller as the RustDWeb gateway (one login for every web operator).
+    #[cfg(windows)]
+    managed_peer_is_gateway: bool,
+    // A fresh directory lists the controller: 2FA trust needs this, not the certificate alone.
+    #[cfg(windows)]
+    managed_peer_listed_fresh: bool,
+    #[cfg(windows)]
+    reconnect_pass: bool,
+    #[cfg(windows)]
+    reconnect_pass_kept: Option<Instant>,
+    // When this connection started keeping its pass: what managed_reconnect.rs knows it by.
+    #[cfg(windows)]
+    reconnect_pass_since: Option<std::time::Instant>,
 }
 
 impl ConnInner {
@@ -593,13 +674,13 @@ impl Connection {
             unauthorized_id: Some(unauthorized),
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
-            audio: Self::permission(keys::OPTION_ENABLE_AUDIO, &control_permissions),
+            audio: false,
             // to-do: make sure is the option correct here
             file: Self::permission(keys::OPTION_ENABLE_FILE_TRANSFER, &control_permissions),
             restart: Self::permission(keys::OPTION_ENABLE_REMOTE_RESTART, &control_permissions),
-            recording: Self::permission(keys::OPTION_ENABLE_RECORD_SESSION, &control_permissions),
-            block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions),
-            privacy_mode: Self::permission(keys::OPTION_ENABLE_PRIVACY_MODE, &control_permissions),
+            recording: false,
+            block_input: false,
+            privacy_mode: false,
             control_permissions,
             last_test_delay: None,
             network_delay: 0,
@@ -609,7 +690,7 @@ impl Connection {
             follow_remote_window: false,
             multi_ui_session: false,
             ip: "".to_owned(),
-            disable_audio: false,
+            disable_audio: true,
             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             enable_file_transfer: false,
             disable_clipboard: false,
@@ -630,6 +711,10 @@ impl Connection {
             #[cfg(windows)]
             portable: Default::default(),
             from_switch: false,
+            #[cfg(all(feature = "flutter", windows))]
+            managed_switch_sides_pending: None,
+            #[cfg(all(feature = "flutter", windows))]
+            switch_back_requested_at: None,
             audio_sender: None,
             voice_call_request_timestamp: None,
             voice_calling: false,
@@ -660,6 +745,21 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal_user_token: None,
             terminal_generic_service: None,
+            managed_session_telemetry: None,
+            #[cfg(windows)]
+            managed_peer_verified: false,
+            #[cfg(windows)]
+            managed_peer_key: None,
+            #[cfg(windows)]
+            managed_peer_is_gateway: false,
+            #[cfg(windows)]
+            managed_peer_listed_fresh: false,
+            #[cfg(windows)]
+            reconnect_pass: false,
+            #[cfg(windows)]
+            reconnect_pass_kept: None,
+            #[cfg(windows)]
+            reconnect_pass_since: None,
             conn_audit_primary_auth: ConnAuditPrimaryAuth::None,
             conn_audit_two_factor: ConnAuditTwoFactor::None,
         };
@@ -756,6 +856,14 @@ impl Connection {
                             conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);
                             conn.trusted_device = None;
                             conn.require_2fa.take();
+                            // Managed attended approval means view-only. Local control must be
+                            // granted separately from the receiving computer after connection.
+                            conn.keyboard = false;
+                            conn.send_permission(Permission::Keyboard, false).await;
+                            conn.send_to_cm(ipc::Data::SwitchPermission {
+                                name: "keyboard".to_owned(),
+                                enabled: false,
+                            });
                             if !conn.send_logon_response_and_keep_alive().await {
                                 break;
                             }
@@ -789,7 +897,8 @@ impl Connection {
                                 break;
                             }
                         }
-                        ipc::Data::ChatMessage{text} => {
+                        // Managed builds have no in-session text chat (the managed chat app replaces it).
+                        ipc::Data::ChatMessage{text} if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() => {
                             let mut misc = Misc::new();
                             misc.set_chat_message(ChatMessage {
                                 text,
@@ -801,6 +910,7 @@ impl Connection {
                             conn.chat_unanswered = false;
                         }
                         ipc::Data::SwitchPermission{name, enabled} => {
+                            let enabled = enabled && !Self::managed_permission_never_granted(&name);
                             log::info!("Change permission {} -> {}", name, enabled);
                             if &name == "keyboard" {
                                 conn.keyboard = enabled;
@@ -910,6 +1020,8 @@ impl Connection {
                                 conn.privacy_mode = enabled;
                                 conn.send_permission(Permission::PrivacyMode, enabled).await;
                             }
+                            #[cfg(windows)]
+                            conn.update_reconnect_pass();
                         }
                         ipc::Data::RawMessage(bytes) => {
                             allow_err!(conn.stream.send_raw(bytes).await);
@@ -973,11 +1085,21 @@ impl Connection {
                         #[cfg(feature = "flutter")]
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         ipc::Data::SwitchSidesBack => {
+                            #[cfg(windows)]
+                            {
+                                conn.switch_back_requested_at = Some(Instant::now());
+                            }
                             let mut misc = Misc::new();
                             misc.set_switch_back(SwitchBack::default());
                             let mut msg = Message::new();
                             msg.set_misc(misc);
                             conn.send(msg).await;
+                        }
+                        #[cfg(all(feature = "flutter", windows))]
+                        ipc::Data::SwitchSidesAnswer(accept) => {
+                            if !conn.managed_switch_sides_answer(accept).await {
+                                break;
+                            }
                         }
                         ipc::Data::VoiceCallResponse(accepted) => {
                             conn.handle_voice_call(accepted).await;
@@ -1160,11 +1282,8 @@ impl Connection {
                         }
                         #[cfg(all(target_os = "windows", feature = "flutter"))]
                         ipc::Data::PrinterData(data) => {
-                            if Self::permission(keys::OPTION_ENABLE_REMOTE_PRINTER, &conn.control_permissions) {
-                                conn.send_printer_request(data).await;
-                            } else {
-                                conn.send_remote_printing_disallowed().await;
-                            }
+                            let _ = data;
+                            conn.send_remote_printing_disallowed().await;
                         }
                         _ => {}
                     }
@@ -1172,6 +1291,10 @@ impl Connection {
                 _ = second_timer.tick() => {
                     #[cfg(windows)]
                     conn.portable_check();
+                    #[cfg(windows)]
+                    conn.renew_reconnect_pass();
+                    #[cfg(all(feature = "flutter", windows))]
+                    conn.managed_switch_sides_check_timeout().await;
                     raii::AuthedConnID::check_wake_lock_on_setting_changed();
                     if let Some((instant, minute)) = conn.auto_disconnect_timer.as_ref() {
                         if instant.elapsed().as_secs() > minute * 60 {
@@ -1421,11 +1544,7 @@ impl Connection {
     }
 
     async fn check_whitelist(&mut self, addr: &SocketAddr) -> bool {
-        let whitelist: Vec<String> = Config::get_option("whitelist")
-            .split(",")
-            .filter(|x| !x.is_empty())
-            .map(|x| x.to_owned())
-            .collect();
+        let whitelist = ip_whitelist_entries(&Config::get_option("whitelist"));
         if !whitelist.is_empty()
             && whitelist
                 .iter()
@@ -1509,9 +1628,6 @@ impl Connection {
 
     async fn on_open(&mut self, addr: SocketAddr) -> bool {
         log::debug!("#{} Connection opened from {}.", self.inner.id, addr);
-        if !self.check_whitelist(&addr).await {
-            return false;
-        }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if crate::is_server() && Config::get_option("allow-only-conn-window-open") == "Y" {
             if !crate::check_process("", !crate::platform::is_root()) {
@@ -1857,7 +1973,52 @@ impl Connection {
         if self.authorized {
             return true;
         }
-        if self.require_2fa.is_some() && !self.is_recent_session(true) && !self.from_switch {
+
+        let managed_password_auth = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && matches!(
+                self.conn_audit_primary_auth,
+                ConnAuditPrimaryAuth::TemporaryPassword | ConnAuditPrimaryAuth::PermanentPassword
+            );
+
+        // Managed unattended/password access always requires an actually configured
+        // TOTP factor. A password by itself must never authorize the connection.
+        if managed_password_auth
+            && self.require_2fa.is_none()
+            && !matches!(
+                self.conn_audit_two_factor,
+                ConnAuditTwoFactor::Totp | ConnAuditTwoFactor::TrustedDevice
+            )
+        {
+            log::warn!("Managed password authentication rejected because 2FA is not configured");
+            self.send_login_error("Two-factor authentication is required for unattended access")
+                .await;
+            return false;
+        }
+
+        // Do not reuse a recent-session 2FA result for managed password authentication.
+        // Each new password-authenticated connection must complete TOTP itself.
+        let recent_2fa = if managed_password_auth {
+            false
+        } else {
+            self.is_recent_session(true)
+        };
+        let switch_bypasses_2fa = self.from_switch && !managed_password_auth;
+        #[cfg(windows)]
+        let session_switch_2fa = managed_password_auth
+            && self.require_2fa.is_some()
+            && self.claim_session_switch_2fa().await;
+        #[cfg(not(windows))]
+        let session_switch_2fa = false;
+        #[cfg(windows)]
+        let reconnect_pass = self.reconnect_pass;
+        #[cfg(not(windows))]
+        let reconnect_pass = false;
+        if self.require_2fa.is_some()
+            && !recent_2fa
+            && !switch_bypasses_2fa
+            && !session_switch_2fa
+            && !reconnect_pass
+        {
             self.require_2fa.as_ref().map(|totp| {
                 let bot = crate::auth_2fa::TelegramBot::get();
                 let bot = match bot {
@@ -1911,6 +2072,10 @@ impl Connection {
         self.lr.trusted_device_v2_token.clear();
         self.authorized = true;
         self.unauthorized_id = None;
+        #[cfg(windows)]
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() && self.managed_peer_verified {
+            self.keep_reconnect_pass();
+        }
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
         // session remembers, so they are not affected.
@@ -1936,6 +2101,25 @@ impl Connection {
             self.tx_from_authed.clone(),
             self.lr.clone(),
         ));
+        let managed_session_type = match auth_conn_type {
+            AuthConnType::Remote => Some("remote_desktop"),
+            AuthConnType::FileTransfer => Some("file_transfer"),
+            _ => None,
+        };
+        if let Some(managed_session_type) = managed_session_type {
+            let managed_session_id = format!(
+                "{}:{}:{}",
+                self.lr.my_id,
+                self.lr.session_id,
+                self.inner.id()
+            );
+            self.managed_session_telemetry =
+                crate::hbbs_http::directory_enrollment::start_managed_session_telemetry(
+                    managed_session_id,
+                    managed_session_type,
+                    Some(self.lr.my_id.clone()),
+                );
+        }
         self.session_last_recv_time = SESSIONS
             .lock()
             .unwrap()
@@ -2028,6 +2212,20 @@ impl Connection {
             platform_additions.insert("support_view_camera".into(), json!(true));
         }
 
+        // Managed peers report "1.5.0", so a managed controller can't use the 1.5.1 version gate.
+        #[cfg(target_os = "windows")]
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+            platform_additions.insert("managed_os_login".into(), json!(true));
+        }
+        // Tells a controller that typed a code into the combined password dialog that TOTP was
+        // skipped because this PC trusts it, not because 2FA is missing (model.dart).
+        #[cfg(target_os = "windows")]
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && self.conn_audit_two_factor == ConnAuditTwoFactor::TrustedDevice
+        {
+            platform_additions.insert("managed_2fa_trusted".into(), json!(true));
+        }
+
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if !platform_additions.is_empty() {
             pi.platform_additions = serde_json::to_string(&platform_additions).unwrap_or("".into());
@@ -2100,7 +2298,9 @@ impl Connection {
         pi.username = username;
         pi.sas_enabled = sas_enabled;
         pi.features = Some(Features {
-            privacy_mode: privacy_mode::is_privacy_mode_supported(),
+            // Managed builds ignore TogglePrivacyMode, so they don't offer it.
+            privacy_mode: option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none()
+                && privacy_mode::is_privacy_mode_supported(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal,
             ..Default::default()
@@ -2198,6 +2398,8 @@ impl Connection {
         msg_out.set_login_response(res);
         self.send(msg_out).await;
         self.update_scoped_login_options().await;
+        #[cfg(target_os = "windows")]
+        self.enforce_managed_mutual_cursor_visibility();
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
             self.keyboard = false;
             let is_existing_dir = !dir.is_empty() && std::path::Path::new(&dir).is_dir();
@@ -2257,6 +2459,25 @@ impl Connection {
             && !self.terminal
     }
 
+    #[cfg(target_os = "windows")]
+    fn enforce_managed_mutual_cursor_visibility(&mut self) {
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() || !self.is_remote() {
+            return;
+        }
+
+        // Apply this only after authentication. This preserves the intentional
+        // password-entry black-screen privacy behavior while ensuring that, once
+        // authorized, both parties can see the other party's cursor even during
+        // the attended view-only phase.
+        self.show_remote_cursor = true;
+        self.show_my_cursor = true;
+        if crate::platform::windows::is_win_10_or_greater() {
+            crate::whiteboard::register_whiteboard(crate::whiteboard::get_key_cursor(
+                self.inner.id,
+            ));
+        }
+    }
+
     #[inline]
     fn is_port_forward(&self) -> bool {
         self.port_forward_socket.is_some() || self.port_forward_mux.is_some()
@@ -2303,6 +2524,10 @@ impl Connection {
         pi: &mut PeerInfo,
         wait_session_id_confirm: &mut bool,
     ) {
+        // Managed builds always serve the active Windows session; connecting clients get no choice.
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+            return;
+        }
         let sessions = crate::platform::get_available_sessions(true);
         if let Some(current_sid) = crate::platform::get_current_process_session_id() {
             if crate::platform::is_installed()
@@ -2351,6 +2576,13 @@ impl Connection {
 
     fn clipboard_enabled(&self) -> bool {
         self.clipboard && !self.disable_clipboard
+    }
+
+    /// Managed builds (Brad 2026-10-18): in a Click-approved, view-only session nothing the
+    /// controller sends reaches this PC's clipboard, text or files, until the local user grants
+    /// control (keyboard), as the host-to-controller direction already requires.
+    fn managed_inbound_clipboard_held(&self) -> bool {
+        option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() && !self.peer_keyboard_enabled()
     }
 
     #[inline]
@@ -2424,6 +2656,10 @@ impl Connection {
         let mut msg_out = Message::new();
         let mut res = LoginResponse::new();
         res.set_error(err.to_string());
+        // Managed builds offer their own 2FA trust (managed_2fa_trust.rs) on the legacy flag.
+        if err.to_string() == crate::client::REQUIRE_2FA {
+            res.enable_trusted_devices = self.managed_2fa_trust_offered();
+        }
         res.trusted_device_v2_supported =
             self.lr.trusted_device_v2_supported && self.trusted_device.is_some();
         msg_out.set_login_response(res);
@@ -2469,6 +2705,20 @@ impl Connection {
                 show_cursor,
             }))
             .ok();
+    }
+
+    // The whiteboard mutual-cursor overlay labels the remote party's cursor
+    // with lr.my_name, which is the connecting client's raw OS/computer
+    // account name (e.g. "Brad Doe"), not this fork's managed-fleet
+    // "Name-DeviceType" friendly-name convention (e.g. "Brad-Laptop") used
+    // elsewhere in the UI. Take just the first token on either separator so
+    // both forms reduce to the same short, human name for this label.
+    fn whiteboard_cursor_label(my_name: &str) -> String {
+        my_name
+            .split(['-', ' '])
+            .next()
+            .unwrap_or(my_name)
+            .to_string()
     }
 
     #[inline]
@@ -2696,6 +2946,315 @@ impl Connection {
         false
     }
 
+    // Managed password logins complete TOTP on every connection. The one exception is the
+    // reconnect a Windows session switch forces: the --server that ended this client session's
+    // TOTP-verified connection leaves a one-time pass for it with the service (see SelectedSid).
+    #[cfg(windows)]
+    fn session_switch_handoff_key(&self) -> Option<ipc::SessionSwitchKey> {
+        (option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && self.authorized
+            && self.conn_audit_two_factor == ConnAuditTwoFactor::Totp)
+            .then(|| ipc::SessionSwitchKey {
+                peer_id: self.lr.my_id.clone(),
+                name: self.lr.my_name.clone(),
+                session_id: self.lr.session_id,
+            })
+    }
+
+    // Managed builds: only RDS-approved devices may connect (see managed_peer_auth.rs). The
+    // controller proves its RDS certificate over this connection's login challenge; RDS's mode
+    // decides whether a failure is only logged or rejects the login. The mode is remembered so a
+    // briefly unreachable service keeps the last policy instead of dropping to "log". Before the
+    // first directory it enforces (Brad 2026-10-18); a valid RDS certificate still passes then.
+    #[cfg(windows)]
+    async fn check_managed_peer_proof(&mut self, lr: &LoginRequest) -> bool {
+        use crate::managed_peer_auth::{verify_proof, MODE_ENFORCE, MODE_OFF};
+        static LAST_MODE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        self.managed_peer_verified = false;
+        self.managed_peer_key = None;
+        self.managed_peer_is_gateway = false;
+        self.managed_peer_listed_fresh = false;
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+            return true;
+        }
+        let info = match ipc::query_managed_peer_auth(lr.my_id.clone()).await {
+            Ok(info) => info,
+            Err(err) => {
+                log::warn!("#{} managed peer auth: service query failed: {}", self.inner.id(), err);
+                Default::default()
+            }
+        };
+        self.managed_peer_is_gateway = info.rustdweb_gateway;
+        let mode = {
+            let mut last = LAST_MODE.lock().unwrap();
+            if !info.mode.is_empty() {
+                *last = info.mode.clone();
+            }
+            if last.is_empty() {
+                MODE_ENFORCE.to_owned()
+            } else {
+                last.clone()
+            }
+        };
+        if mode == MODE_OFF {
+            return true;
+        }
+        match verify_proof(
+            &lr.managed_peer_proof,
+            &self.hash.challenge,
+            &Config::get_id(),
+            &lr.my_id,
+            lr.session_id,
+            &info,
+        ) {
+            Ok(cert) => {
+                log::info!(
+                    "#{} managed peer auth: {} presented valid RDS certificate {} (mode {})",
+                    self.inner.id(),
+                    lr.my_id,
+                    cert.sn,
+                    mode
+                );
+                self.managed_peer_verified = true;
+                self.managed_peer_key = Some(cert.pk);
+                self.managed_peer_listed_fresh = info.directory_fresh && info.peer_key.is_some();
+                true
+            }
+            Err(reason) if mode == MODE_ENFORCE => {
+                log::warn!(
+                    "#{} managed peer auth: login from {} ({}) rejected: {}",
+                    self.inner.id(),
+                    lr.my_id,
+                    self.ip,
+                    reason
+                );
+                self.send_login_error("This device is not approved in RDS").await;
+                sleep(1.).await;
+                false
+            }
+            Err(reason) => {
+                log::warn!(
+                    "#{} managed peer auth (log only): login from {} ({}) would be rejected: {}",
+                    self.inner.id(),
+                    lr.my_id,
+                    self.ip,
+                    reason
+                );
+                true
+            }
+        }
+    }
+
+    /// The verified controller key a managed 2FA trust is keyed on (managed_2fa_trust.rs).
+    #[cfg(windows)]
+    fn managed_2fa_trust_key(&self) -> Option<&str> {
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() || !self.managed_peer_verified {
+            return None;
+        }
+        // A stale directory cannot say the controller is still approved; its 96 h certificate
+        // alone must not bring back the trust of a controller RDS has since revoked.
+        if !self.managed_peer_listed_fresh {
+            return None;
+        }
+        // The RustDWeb gateway (the fleet's Linux device) logs in with one certificate for every
+        // web operator, so trusting it would let all of them skip the code.
+        if self.managed_controller_is_gateway() {
+            return None;
+        }
+        self.managed_peer_key.as_deref()
+    }
+
+    /// The RustDWeb gateway, by RDS's directory (not only by what the controller reports): it
+    /// gets no 2FA trust and no Switch Sides.
+    #[cfg(windows)]
+    fn managed_controller_is_gateway(&self) -> bool {
+        self.managed_peer_is_gateway || self.lr.my_platform == "Linux"
+    }
+
+    /// A controller this PC trusts skips the TOTP prompt; its password is still checked.
+    #[cfg(windows)]
+    fn apply_managed_2fa_trust(&mut self) {
+        let trusted = self.require_2fa.is_some()
+            && self
+                .managed_2fa_trust_key()
+                .map_or(false, |key| crate::managed_2fa_trust::trusted(&self.lr.my_id, key));
+        if trusted {
+            log::info!(
+                "#{} 2FA skipped: {} is a trusted controller",
+                self.inner.id(),
+                self.lr.my_id
+            );
+            self.set_conn_audit_two_factor(ConnAuditTwoFactor::TrustedDevice);
+            self.require_2fa = None;
+        }
+    }
+
+    #[cfg(windows)]
+    fn managed_2fa_trust_offered(&self) -> bool {
+        self.managed_2fa_trust_key()
+            .map_or(false, |key| crate::managed_2fa_trust::may_offer(&self.lr.my_id, key))
+    }
+
+    #[cfg(not(windows))]
+    fn managed_2fa_trust_offered(&self) -> bool {
+        false
+    }
+
+    /// Counts a password + TOTP login toward the trust offer, and saves the trust when asked.
+    #[cfg(windows)]
+    fn note_managed_2fa_login(&self, trust_requested: bool) {
+        if !matches!(
+            self.conn_audit_primary_auth,
+            ConnAuditPrimaryAuth::TemporaryPassword | ConnAuditPrimaryAuth::PermanentPassword
+        ) {
+            return;
+        }
+        let Some(key) = self.managed_2fa_trust_key() else {
+            return;
+        };
+        if crate::managed_2fa_trust::note_login(&self.lr.my_id, key, trust_requested)
+            && trust_requested
+        {
+            log::info!(
+                "#{} {} is now a trusted controller for 90 days",
+                self.inner.id(),
+                self.lr.my_id
+            );
+        }
+    }
+
+    /// Keeps this authorized connection's reconnect pass fresh (managed_reconnect.rs).
+    #[cfg(windows)]
+    fn renew_reconnect_pass(&mut self) {
+        let due = self.reconnect_pass_kept.map_or(false, |at| {
+            at.elapsed() >= Duration::from_secs(crate::managed_reconnect::RENEW_EVERY_SECS)
+        });
+        if self.authorized && due {
+            self.keep_reconnect_pass();
+        }
+    }
+
+    /// Keeps this connection's reconnect pass, carrying what the session holds now. Once a
+    /// reconnect has taken the pass over, or it was revoked, this connection stops keeping it for
+    /// good: its older permissions must not overwrite the reconnect's, nor bring a revoked pass
+    /// back.
+    #[cfg(windows)]
+    fn keep_reconnect_pass(&mut self) {
+        let since = *self
+            .reconnect_pass_since
+            .get_or_insert_with(std::time::Instant::now);
+        let grant = crate::managed_reconnect::Grant {
+            primary_auth: self.conn_audit_primary_auth.as_i64(),
+            two_factor: self.conn_audit_two_factor.as_i64(),
+            keyboard: self.keyboard,
+            clipboard: self.clipboard,
+            audio: self.audio,
+            file: self.file,
+            restart: self.restart,
+            recording: self.recording,
+            block_input: self.block_input,
+            privacy_mode: self.privacy_mode,
+        };
+        let kept = crate::managed_reconnect::keep(
+            &self.lr.my_id,
+            self.lr.session_id,
+            &Self::reconnect_pass_scope(&self.lr),
+            grant,
+            since,
+        );
+        self.reconnect_pass_kept = kept.then(Instant::now);
+    }
+
+    /// A permission the local user changed reaches the pass at once, not at the next renewal.
+    #[cfg(windows)]
+    fn update_reconnect_pass(&mut self) {
+        if self.authorized && self.reconnect_pass_kept.is_some() {
+            self.keep_reconnect_pass();
+        }
+    }
+
+    // A pass is bound to the kind of session it was issued for. A file transfer's starting folder
+    // is left out: the controller reconnects at whatever folder it had reached.
+    #[cfg(windows)]
+    fn reconnect_pass_scope(lr: &LoginRequest) -> [u8; 32] {
+        if matches!(lr.union.as_ref(), Some(login_request::Union::FileTransfer(_))) {
+            let mut kind = LoginRequest {
+                my_id: lr.my_id.clone(),
+                ..Default::default()
+            };
+            kind.set_file_transfer(FileTransfer::default());
+            return Self::login_scope_digest(&kind);
+        }
+        Self::login_scope_digest(lr)
+    }
+
+    /// What this controller session had been granted, if it holds a live reconnect pass for the
+    /// kind of session it asks for now.
+    #[cfg(windows)]
+    fn reconnect_pass_grant(&self, lr: &LoginRequest) -> Option<crate::managed_reconnect::Grant> {
+        if !self.managed_peer_verified {
+            return None;
+        }
+        crate::managed_reconnect::grant(&lr.my_id, lr.session_id, &Self::reconnect_pass_scope(lr))
+    }
+
+    /// Puts back the login a pass continues, and narrows this connection's permissions to what the
+    /// session still had: nothing beyond that, nor beyond this connection's own defaults. The pass
+    /// stands in for the 2FA that login completed.
+    #[cfg(windows)]
+    async fn apply_reconnect_grant(&mut self, grant: &crate::managed_reconnect::Grant) {
+        self.require_2fa = None;
+        self.conn_audit_primary_auth = ConnAuditPrimaryAuth::from_i64(grant.primary_auth);
+        self.conn_audit_two_factor = ConnAuditTwoFactor::from_i64(grant.two_factor);
+        let mut revoked = Vec::new();
+        for (permission, enabled, granted) in [
+            (Permission::Keyboard, &mut self.keyboard, grant.keyboard),
+            (Permission::Clipboard, &mut self.clipboard, grant.clipboard),
+            (Permission::Audio, &mut self.audio, grant.audio),
+            (Permission::File, &mut self.file, grant.file),
+            (Permission::Restart, &mut self.restart, grant.restart),
+            (Permission::Recording, &mut self.recording, grant.recording),
+            (Permission::BlockInput, &mut self.block_input, grant.block_input),
+            (Permission::PrivacyMode, &mut self.privacy_mode, grant.privacy_mode),
+        ] {
+            if *enabled && !granted {
+                *enabled = false;
+                revoked.push(permission);
+            }
+        }
+        for permission in revoked {
+            self.send_permission(permission, false).await;
+        }
+    }
+
+    #[cfg(windows)]
+    async fn claim_session_switch_2fa(&mut self) -> bool {
+        let key = ipc::SessionSwitchKey {
+            peer_id: self.lr.my_id.clone(),
+            name: self.lr.my_name.clone(),
+            session_id: self.lr.session_id,
+        };
+        match ipc::claim_session_switch_handoff(key).await {
+            Ok(true) => {
+                log::info!(
+                    "#{} 2FA carried over from a Windows session switch",
+                    self.inner.id()
+                );
+                self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                log::debug!(
+                    "#{} session switch 2FA pass not claimed: {}",
+                    self.inner.id(),
+                    err
+                );
+                false
+            }
+        }
+    }
+
     #[inline]
     pub fn is_permission_enabled_locally(enable_prefix_option: &str) -> bool {
         #[cfg(feature = "flutter")]
@@ -2714,11 +3273,31 @@ impl Connection {
         )
     }
 
+    fn managed_permission_never_granted(name: &str) -> bool {
+        option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && matches!(name, "audio" | "recording" | "block_input" | "privacy_mode")
+    }
+
     fn permission(
         enable_prefix_option: &str,
         control_permissions: &Option<ControlPermissions>,
     ) -> bool {
         use hbb_common::rendezvous_proto::control_permissions::Permission;
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && matches!(
+                enable_prefix_option,
+                keys::OPTION_ENABLE_REMOTE_PRINTER
+                    | keys::OPTION_ENABLE_AUDIO
+                    | keys::OPTION_ENABLE_CAMERA
+                    | keys::OPTION_ENABLE_TERMINAL
+                    | keys::OPTION_ENABLE_TUNNEL
+                    | keys::OPTION_ENABLE_RECORD_SESSION
+                    | keys::OPTION_ENABLE_BLOCK_INPUT
+                    | keys::OPTION_ENABLE_PRIVACY_MODE
+            )
+        {
+            return false;
+        }
         if let Some(control_permissions) = control_permissions {
             let permission = match enable_prefix_option {
                 keys::OPTION_ENABLE_KEYBOARD => Some(Permission::keyboard),
@@ -2912,19 +3491,22 @@ impl Connection {
             if !self.check_login_scope(&lr).await {
                 return false;
             }
+            #[cfg(windows)]
+            if !self.check_managed_peer_proof(&lr).await {
+                return false;
+            }
             self.awaiting_2fa = false;
             self.trusted_device = None;
             if !self.authorized {
                 self.require_2fa = crate::auth_2fa::get_2fa(None);
             }
             self.handle_login_request_without_validation(&lr).await;
+            #[cfg(windows)]
+            self.apply_managed_2fa_trust();
             if self.authorized {
                 return true;
             }
             self.reset_session_scope_for_login();
-            if !self.check_id_whitelist().await {
-                return false;
-            }
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
                     if !Self::permission(
@@ -2939,43 +3521,19 @@ impl Connection {
                     self.file_transfer = Some((ft.dir, ft.show_hidden));
                 }
                 Some(login_request::Union::ViewCamera(_vc)) => {
-                    if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
-                        self.send_login_error("No permission of viewing camera")
-                            .await;
-                        sleep(1.).await;
-                        return false;
-                    }
-                    self.view_camera = true;
+                    self.send_login_error("Camera sessions are disabled by managed policy")
+                        .await;
+                    return false;
                 }
-                Some(login_request::Union::Terminal(terminal)) => {
-                    if !Self::permission(keys::OPTION_ENABLE_TERMINAL, &self.control_permissions) {
-                        self.send_login_error("No permission of terminal").await;
-                        sleep(1.).await;
-                        return false;
-                    }
-                    #[cfg(target_os = "windows")]
-                    if !lr.os_login.username.is_empty() && !crate::platform::is_installed() {
-                        self.send_login_error("Supported only in the installed version.")
-                            .await;
-                        sleep(1.).await;
-                        return false;
-                    }
-
-                    self.terminal = true;
-                    if let Some(o) = self.options_in_login.as_ref() {
-                        self.terminal_persistent =
-                            o.terminal_persistent.enum_value() == Ok(BoolOption::Yes);
-                    }
-                    self.terminal_service_id = terminal.service_id;
+                Some(login_request::Union::Terminal(_terminal)) => {
+                    self.send_login_error("Terminal sessions are disabled by managed policy")
+                        .await;
+                    return false;
                 }
-                Some(login_request::Union::PortForward(mut pf)) => {
-                    if !Self::permission(keys::OPTION_ENABLE_TUNNEL, &self.control_permissions) {
-                        self.send_login_error("No permission of IP tunneling").await;
-                        sleep(1.).await;
-                        return false;
-                    }
-                    let (addr, _is_rdp) = Self::normalize_port_forward_target(&mut pf);
-                    self.port_forward_address = addr;
+                Some(login_request::Union::PortForward(_pf)) => {
+                    self.send_login_error("Tunneling is disabled by managed policy")
+                        .await;
+                    return false;
                 }
                 _ => {
                     if !self.check_privacy_mode_on().await {
@@ -3044,6 +3602,25 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
+            // Managed builds: a quick reconnect of a session this verified controller already
+            // authenticated comes back in on its reconnect pass (managed_reconnect.rs), without
+            // the password, TOTP or a click.
+            #[cfg(windows)]
+            if let Some(grant) = self.reconnect_pass_grant(&self.lr) {
+                log::info!(
+                    "#{} reconnect of {} let in on its reconnect pass",
+                    self.inner.id(),
+                    lr.my_id
+                );
+                self.reconnect_pass = true;
+                self.apply_reconnect_grant(&grant).await;
+                if !self.send_logon_response_and_keep_alive().await {
+                    return false;
+                }
+                self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+                return true;
+            }
+
             if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
@@ -3079,9 +3656,21 @@ impl Connection {
             } else {
                 let (failure, res) = self.check_failure(0).await;
                 if !res {
+                    log::warn!(
+                        "#{} login rejected: too many failed password attempts (peer {}, ip {})",
+                        self.inner.id(),
+                        self.lr.my_id,
+                        self.ip
+                    );
                     return true;
                 }
                 if !self.validate_password(allow_logon_screen_password) {
+                    log::warn!(
+                        "#{} login rejected: wrong password (peer {}, ip {})",
+                        self.inner.id(),
+                        self.lr.my_id,
+                        self.ip
+                    );
                     self.update_failure_with_scope(failure, false, 0, FailureScope::Default);
                     self.check_update_temporary_password(false);
                     self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
@@ -3089,7 +3678,11 @@ impl Connection {
                     self.try_start_cm(lr.my_id, lr.my_name, false);
                 } else {
                     self.update_failure_with_scope(failure, true, 0, FailureScope::Default);
-                    if !self.begin_trusted_device().await {
+                    // Managed builds keep their own 2FA trust (managed_2fa_trust.rs), never
+                    // upstream's trusted devices.
+                    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+                        self.lr.trusted_device_v2_token.clear();
+                    } else if !self.begin_trusted_device().await {
                         return false;
                     }
                     if !self.send_logon_response_and_keep_alive().await {
@@ -3106,6 +3699,12 @@ impl Connection {
             }
             let (failure, res) = self.check_failure(1).await;
             if !res {
+                log::warn!(
+                    "#{} login rejected: too many failed 2FA attempts (peer {}, ip {})",
+                    self.inner.id(),
+                    self.lr.my_id,
+                    self.ip
+                );
                 return true;
             }
             if let Some(totp) = self.require_2fa.as_ref() {
@@ -3114,6 +3713,10 @@ impl Connection {
                         self.update_failure(failure, true, 1);
                         self.require_2fa.take();
                         self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
+                        // Before managed hosts knew `trust_this_device`, managed controllers asked
+                        // with a non-empty hwid; both still do (io_loop.rs).
+                        #[cfg(windows)]
+                        self.note_managed_2fa_login(!tfa.hwid.is_empty() || tfa.trust_this_device);
                         if let Some(attempt) = self.trusted_device.as_mut() {
                             attempt.enroll = tfa.trust_this_device;
                         }
@@ -3127,6 +3730,12 @@ impl Connection {
                             self.authorized,
                         );
                     } else {
+                        log::warn!(
+                            "#{} login rejected: wrong 2FA code (peer {}, ip {})",
+                            self.inner.id(),
+                            self.lr.my_id,
+                            self.ip
+                        );
                         self.update_failure(failure, false, 1);
                         self.send_login_error(crate::client::LOGIN_MSG_2FA_WRONG)
                             .await;
@@ -3168,13 +3777,14 @@ impl Connection {
                                 self.send_login_error("Connection not allowed").await;
                                 return false;
                             }
+                            #[cfg(windows)]
+                            if !self.check_managed_peer_proof(&lr).await {
+                                return false;
+                            }
                             self.reset_session_scope_for_login();
                             self.handle_login_request_without_validation(&lr).await;
                             // Switching sides authorizes without a password, so it must not bypass
                             // the whitelist, which can be a locked policy pushed by the server.
-                            if !self.check_id_whitelist().await {
-                                return false;
-                            }
                             self.from_switch = true;
                             self.trusted_device = None;
                             self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::SwitchSides);
@@ -3202,6 +3812,11 @@ impl Connection {
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }
+                    #[cfg(target_os = "windows")]
+                    if managed_local_input_has_priority() {
+                        self.update_auto_disconnect_timer();
+                        return true;
+                    }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
@@ -3218,7 +3833,7 @@ impl Connection {
                         self.input_mouse(
                             me,
                             self.inner.id(),
-                            self.lr.my_name.clone(),
+                            Self::whiteboard_cursor_label(&self.lr.my_name),
                             self.peer_argb,
                             true,
                             self.show_my_cursor,
@@ -3229,7 +3844,7 @@ impl Connection {
                         self.input_mouse(
                             me,
                             self.inner.id(),
-                            self.lr.my_name.clone(),
+                            Self::whiteboard_cursor_label(&self.lr.my_name),
                             self.peer_argb,
                             false,
                             true,
@@ -3239,6 +3854,11 @@ impl Connection {
                 }
                 Some(message::Union::PointerDeviceEvent(pde)) => {
                     if self.is_authed_view_camera_conn() {
+                        return true;
+                    }
+                    #[cfg(target_os = "windows")]
+                    if managed_local_input_has_priority() {
+                        self.update_auto_disconnect_timer();
                         return true;
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -3338,6 +3958,17 @@ impl Connection {
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }
+                    #[cfg(target_os = "windows")]
+                    if managed_local_input_has_priority() {
+                        // Recent local physical input (mouse or keyboard) temporarily owns the
+                        // complete remote input channel. The input-simulation process
+                        // independently blocks queued key events and releases tracked remote
+                        // keys for this same priority window, so every remote KeyEvent is
+                        // suppressed here.
+                        self.pressed_modifiers.clear();
+                        self.update_auto_disconnect_timer();
+                        return true;
+                    }
                     if self.peer_keyboard_enabled() {
                         if is_enter(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
@@ -3402,7 +4033,10 @@ impl Connection {
                     self.update_auto_disconnect_timer();
                 }
                 Some(message::Union::Clipboard(cb)) => {
-                    if self.should_handle_text_clipboard_message() && self.clipboard_enabled() {
+                    if self.should_handle_text_clipboard_message()
+                        && self.clipboard_enabled()
+                        && !self.managed_inbound_clipboard_held()
+                    {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Host);
                         // ios as the controlled side is actually not supported for now.
@@ -3430,7 +4064,10 @@ impl Connection {
                     }
                 }
                 Some(message::Union::MultiClipboards(_mcb)) => {
-                    if self.should_handle_text_clipboard_message() && self.clipboard_enabled() {
+                    if self.should_handle_text_clipboard_message()
+                        && self.clipboard_enabled()
+                        && !self.managed_inbound_clipboard_held()
+                    {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(_mcb.clipboards, ClipboardSide::Host);
                         #[cfg(target_os = "android")]
@@ -3454,6 +4091,8 @@ impl Connection {
                         && crate::get_builtin_option(keys::OPTION_ONE_WAY_FILE_TRANSFER) == "Y"
                     {
                         // One-way file transfer: never serve this side's clipboard files to the peer.
+                    } else if self.managed_inbound_clipboard_held() {
+                        // View-only until the local user grants control: no file clipboard either way.
                     } else if let Some(clip) = msg_2_clip(clip) {
                         #[cfg(target_os = "windows")]
                         {
@@ -3518,14 +4157,7 @@ impl Connection {
                     }
                 }
                 Some(message::Union::FileAction(fa)) => {
-                    let mut handle_fa = self.file_transfer.is_some();
-                    if !handle_fa {
-                        if let Some(file_action::Union::Send(s)) = fa.union.as_ref() {
-                            if JobType::from_proto(s.file_type) == JobType::Printer {
-                                handle_fa = true;
-                            }
-                        }
-                    }
+                    let handle_fa = self.file_transfer.is_some();
                     if handle_fa {
                         if self.delayed_read_dir.is_some() {
                             if let Some(file_action::Union::ReadDir(rd)) = fa.union {
@@ -3727,31 +4359,8 @@ impl Connection {
                                         }
                                     }
                                     JobType::Printer => {
-                                        if let Some((_, _, data)) = self
-                                            .printer_data
-                                            .iter()
-                                            .position(|(_, p, _)| *p == path)
-                                            .map(|index| self.printer_data.remove(index))
-                                        {
-                                            let data_source = fs::DataSource::MemoryCursor(
-                                                std::io::Cursor::new(data),
-                                            );
-                                            // Printer jobs don't need file count limit check
-                                            self.create_and_start_read_job(
-                                                id,
-                                                job_type,
-                                                data_source,
-                                                s.file_num,
-                                                s.include_hidden,
-                                                true, // always enable overwrite detection for printer
-                                                path,
-                                                false, // no file count limit for printer
-                                            )
-                                            .await;
-                                        } else {
-                                            // Ignore this message if the printer data is not found
-                                            return true;
-                                        }
+                                        log::debug!("Remote printing job ignored by managed policy");
+                                        return true;
                                     }
                                 }
                                 self.file_transferred = true;
@@ -3912,17 +4521,19 @@ impl Connection {
                         self.capture_displays(&add, &sub, &set).await;
                     }
                     #[cfg(windows)]
+                    Some(misc::Union::ToggleVirtualDisplay(_)) if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() => {
+                        log::debug!("Virtual display request ignored by managed policy");
+                    }
+                    #[cfg(windows)]
                     Some(misc::Union::ToggleVirtualDisplay(t)) => {
                         if !self.view_camera {
                             self.toggle_virtual_display(t).await;
                         }
                     }
-                    Some(misc::Union::TogglePrivacyMode(t)) => {
-                        if !self.view_camera {
-                            self.toggle_privacy_mode(t).await;
-                        }
+                    Some(misc::Union::TogglePrivacyMode(_t)) => {
+                        log::debug!("Privacy mode request ignored by managed policy");
                     }
-                    Some(misc::Union::ChatMessage(c)) => {
+                    Some(misc::Union::ChatMessage(c)) if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() => {
                         self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
                         self.chat_unanswered = true;
                         self.update_auto_disconnect_timer();
@@ -3986,7 +4597,8 @@ impl Connection {
                         }
                         _ => {}
                     },
-                    Some(misc::Union::AudioFormat(format)) => {
+                    // Managed builds carry no audio between devices.
+                    Some(misc::Union::AudioFormat(format)) if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() => {
                         if !self.disable_audio {
                             // Drop the audio sender previously.
                             drop(std::mem::replace(&mut self.audio_sender, None));
@@ -4000,10 +4612,24 @@ impl Connection {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::SwitchSidesRequest(s)) => {
                         if let Ok(uuid) = uuid::Uuid::from_slice(&s.uuid.to_vec()[..]) {
+                            #[cfg(windows)]
+                            if self.managed_controller_is_gateway() {
+                                log::warn!(
+                                    "#{} Switch Sides request from the RustDWeb gateway {} ignored",
+                                    self.inner.id(),
+                                    self.lr.my_id
+                                );
+                                return true;
+                            }
+                            #[cfg(windows)]
+                            if self.managed_ask_switch_sides(uuid) {
+                                return true;
+                            }
                             if crate::server::insert_pending_switch_sides_uuid(
                                 self.lr.my_id.clone(),
                                 uuid.clone(),
-                            ) {
+                            ) && !managed_start_switch_sides_back(&self.lr.my_id, &uuid)
+                            {
                                 crate::run_me(vec![
                                     "--connect",
                                     &self.lr.my_id,
@@ -4032,12 +4658,12 @@ impl Connection {
                         .lock()
                         .unwrap()
                         .user_auto_adjust_fps(self.inner.id(), fps),
-                    Some(misc::Union::ClientRecordStatus(status)) => video_service::VIDEO_QOS
-                        .lock()
-                        .unwrap()
-                        .user_record(self.inner.id(), status),
+                    Some(misc::Union::ClientRecordStatus(_status)) => {
+                        log::debug!("Session recording status ignored by managed policy");
+                    },
+                    // Managed builds keep the server on the active session.
                     #[cfg(windows)]
-                    Some(misc::Union::SelectedSid(sid)) => {
+                    Some(misc::Union::SelectedSid(sid)) if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() => {
                         if let Some(current_process_sid) =
                             crate::platform::get_current_process_session_id()
                         {
@@ -4049,7 +4675,13 @@ impl Connection {
                                 && current_process_sid != sid
                                 && sessions.iter().any(|e| e.sid == sid)
                             {
+                                let handoff = self.session_switch_handoff_key();
                                 std::thread::spawn(move || {
+                                    if let Some(key) = handoff {
+                                        if let Err(err) = ipc::leave_session_switch_handoff(key) {
+                                            log::warn!("Failed to leave the session switch 2FA pass: {}", err);
+                                        }
+                                    }
                                     let _ = ipc::connect_to_user_session(Some(sid));
                                 });
                                 return false;
@@ -4087,7 +4719,7 @@ impl Connection {
                     }
                     _ => {}
                 },
-                Some(message::Union::AudioFrame(frame)) => {
+                Some(message::Union::AudioFrame(frame)) if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() => {
                     if !self.disable_audio {
                         if let Some(sender) = &self.audio_sender {
                             allow_err!(sender.send(MediaData::AudioFrame(Box::new(frame))));
@@ -4100,12 +4732,7 @@ impl Connection {
                 }
                 Some(message::Union::VoiceCallRequest(request)) => {
                     if request.is_connect {
-                        self.voice_call_request_timestamp = Some(
-                            NonZeroI64::new(request.req_timestamp)
-                                .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
-                        );
-                        // Notify the connection manager.
-                        self.send_to_cm(Data::VoiceCallIncoming);
+                        self.send(new_voice_call_response(request.req_timestamp, false)).await;
                     } else {
                         self.close_voice_call().await;
                     }
@@ -4113,7 +4740,8 @@ impl Connection {
                 Some(message::Union::VoiceCallResponse(_response)) => {
                     // TODO: Maybe we can do a voice call from cm directly.
                 }
-                Some(message::Union::ScreenshotRequest(request)) => {
+                // Managed builds never hand out screenshots.
+                Some(message::Union::ScreenshotRequest(request)) if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() => {
                     if let Some(tx) = self.inner.tx.clone() {
                         crate::video_service::set_take_screenshot(
                             self.video_source(),
@@ -4125,11 +4753,8 @@ impl Connection {
                     }
                 }
                 Some(message::Union::PortForwardChannel(ch)) => self.handle_port_forward_channel(ch),
-                Some(message::Union::TerminalAction(action)) => {
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    allow_err!(self.handle_terminal_action(action).await);
-                    #[cfg(any(target_os = "android", target_os = "ios"))]
-                    log::warn!("Terminal action received but not supported on this platform");
+                Some(message::Union::TerminalAction(_action)) => {
+                    log::debug!("Terminal action ignored by managed policy");
                 }
                 _ => {}
             }
@@ -4822,6 +5447,94 @@ impl Connection {
         }
     }
 
+    // Managed builds: a peer's Switch Sides request waits for the local user to accept it in the
+    // connection manager, unless it follows this side's own switch-back request.
+    #[cfg(all(feature = "flutter", windows))]
+    fn managed_ask_switch_sides(&mut self, uuid: uuid::Uuid) -> bool {
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+            return false;
+        }
+        if self
+            .switch_back_requested_at
+            .take()
+            .map_or(false, |at| at.elapsed() < MANAGED_SWITCH_SIDES_ANSWER_TIMEOUT)
+        {
+            return false;
+        }
+        if self.managed_switch_sides_pending.is_none() {
+            self.managed_switch_sides_pending = Some((uuid, Instant::now()));
+            self.send_to_cm(ipc::Data::SwitchSidesPrompt);
+        }
+        true
+    }
+
+    // False when the session ends because the switch goes ahead.
+    #[cfg(all(feature = "flutter", windows))]
+    async fn managed_switch_sides_answer(&mut self, accept: bool) -> bool {
+        let Some((uuid, asked_at)) = self.managed_switch_sides_pending.take() else {
+            return true;
+        };
+        if asked_at.elapsed() >= MANAGED_SWITCH_SIDES_ANSWER_TIMEOUT {
+            self.send_switch_sides_msgbox(
+                "custom-nook-nocancel-hasclose",
+                "The other side did not answer the Switch Sides request.",
+            )
+            .await;
+            return true;
+        }
+        if !accept {
+            self.send_switch_sides_msgbox(
+                "custom-nook-nocancel-hasclose",
+                "The other side declined Switch Sides.",
+            )
+            .await;
+            return true;
+        }
+        // Tells the requester to close this session itself rather than report it as dropped.
+        self.send_switch_sides_msgbox("switch-sides-accepted", "").await;
+        if crate::server::insert_pending_switch_sides_uuid(self.lr.my_id.clone(), uuid)
+            && !managed_start_switch_sides_back(&self.lr.my_id, &uuid)
+        {
+            crate::run_me(vec![
+                "--connect",
+                &self.lr.my_id,
+                "--switch_uuid",
+                uuid.to_string().as_ref(),
+            ])
+            .ok();
+        }
+        self.on_close("switch sides", false).await;
+        false
+    }
+
+    #[cfg(all(feature = "flutter", windows))]
+    async fn managed_switch_sides_check_timeout(&mut self) {
+        if self
+            .managed_switch_sides_pending
+            .map_or(false, |(_, at)| at.elapsed() >= MANAGED_SWITCH_SIDES_ANSWER_TIMEOUT)
+        {
+            self.managed_switch_sides_pending = None;
+            self.send_switch_sides_msgbox(
+                "custom-nook-nocancel-hasclose",
+                "The other side did not answer the Switch Sides request.",
+            )
+            .await;
+        }
+    }
+
+    #[cfg(all(feature = "flutter", windows))]
+    async fn send_switch_sides_msgbox(&mut self, msgtype: &str, text: &str) {
+        let mut msg_out = Message::new();
+        msg_out.set_message_box(MessageBox {
+            msgtype: msgtype.to_owned(),
+            title: "Switch Sides".to_owned(),
+            text: text.to_owned(),
+            link: "".to_owned(),
+            ..Default::default()
+        });
+        self.send(msg_out).await;
+    }
+
     async fn toggle_privacy_mode(&mut self, t: TogglePrivacyMode) {
         if t.on {
             self.turn_on_privacy(t.impl_key).await;
@@ -4962,7 +5675,11 @@ impl Connection {
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Ok(q) = o.show_remote_cursor.enum_value() {
-            if q != BoolOption::NotSet {
+            // Managed builds keep mutual cursor visibility once it is enforced.
+            let managed_keep = q == BoolOption::No
+                && self.show_remote_cursor
+                && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some();
+            if q != BoolOption::NotSet && !managed_keep {
                 self.show_remote_cursor = q == BoolOption::Yes;
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
@@ -5310,6 +6027,9 @@ impl Connection {
             return;
         }
         self.closed = true;
+        // Dropping the guard signals the telemetry worker to send an ended
+        // heartbeat. Connection::drop is the fallback for abrupt teardown.
+        self.managed_session_telemetry.take();
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -5321,6 +6041,29 @@ impl Connection {
         // But it's not necessary now and we have to consider two audio services(client, server).
         crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
+        // Ended on purpose (the local user, policy, the service or the controller itself): its
+        // reconnect pass goes too, so the controller has to log in again. Network drops keep it.
+        #[cfg(windows)]
+        if self.reconnect_pass_kept.is_some()
+            && matches!(
+                reason,
+                "connection manager"
+                    | "connection manager window closed"
+                    | "web console"
+                    | "stop service"
+                    | "auto disconnect"
+                    | "switch sides"
+                    | "Session scope violation"
+                    | "Peer close"
+            )
+        {
+            crate::managed_reconnect::revoke(
+                &self.lr.my_id,
+                self.lr.session_id,
+                &Self::reconnect_pass_scope(&self.lr),
+                self.reconnect_pass_since.unwrap_or_else(std::time::Instant::now),
+            );
+        }
         if lock
             && self.lock_after_session_end
             && self.keyboard
@@ -6356,6 +7099,19 @@ impl Connection {
     }
 }
 
+#[cfg(all(feature = "flutter", windows))]
+fn managed_start_switch_sides_back(id: &str, uuid: &uuid::Uuid) -> bool {
+    crate::platform::windows::managed_start_switch_sides_back(id, &uuid.to_string())
+}
+
+#[cfg(all(
+    feature = "flutter",
+    not(any(windows, target_os = "android", target_os = "ios"))
+))]
+fn managed_start_switch_sides_back(_id: &str, _uuid: &uuid::Uuid) -> bool {
+    false
+}
+
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn insert_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
@@ -7215,6 +7971,18 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+// A space around an entry ("203.0.113.1, 203.0.113.2") is ignored: `IpCidr` rejects
+// " 203.0.113.2", so that address was blocked. Entries that are empty after the trim are
+// dropped, so a whitespace-only value turns the list off, as in `check_id_whitelist` and the
+// dialogs.
+fn ip_whitelist_entries(option: &str) -> Vec<String> {
+    option
+        .split(',')
+        .map(|x| x.trim().to_owned())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     #[allow(unused)]
@@ -7226,6 +7994,24 @@ mod test {
 
     fn unauthorized_count() -> usize {
         UNAUTHORIZED_CONNS.lock().unwrap().len()
+    }
+
+    #[test]
+    fn test_ip_whitelist_entries_ignore_spaces_around_them() {
+        let entries = ip_whitelist_entries("198.51.100.0/24, 203.0.113.1 ");
+        assert_eq!(entries, vec!["198.51.100.0/24", "203.0.113.1"]);
+        let ip: IpAddr = "203.0.113.1".parse().unwrap();
+        assert!(entries
+            .iter()
+            .any(|x| IpCidr::from_str(x).map_or(false, |y| y.contains(ip))));
+    }
+
+    #[test]
+    fn test_ip_whitelist_entries_whitespace_only_is_off() {
+        for option in ["", ",", " ", " , "] {
+            assert!(ip_whitelist_entries(option).is_empty(), "{option:?}");
+        }
+        assert_eq!(ip_whitelist_entries("203.0.113.1, "), vec!["203.0.113.1"]);
     }
 
     #[test]
@@ -7429,6 +8215,32 @@ mod test {
         };
         assert_ne!(scope(&first), scope(&terminal("")));
         assert_ne!(scope(&terminal("a")), scope(&terminal("b")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reconnect_pass_scope_is_the_session_kind() {
+        let request = |id: &str, file_transfer: Option<(&str, bool)>| {
+            let mut lr = LoginRequest::new();
+            lr.my_id = id.to_owned();
+            if let Some((dir, show_hidden)) = file_transfer {
+                lr.set_file_transfer(FileTransfer {
+                    dir: dir.to_owned(),
+                    show_hidden,
+                    ..Default::default()
+                });
+            }
+            lr
+        };
+        let scope = |lr: &LoginRequest| Connection::reconnect_pass_scope(lr);
+        let files = request("peer", Some(("C:\\Users", false)));
+        assert_eq!(scope(&files), scope(&request("peer", Some(("D:\\", true)))));
+        assert_ne!(scope(&files), scope(&request("peer", None)), "file transfer is not remote");
+        assert_ne!(scope(&files), scope(&request("other", Some(("C:\\Users", false)))));
+        assert_eq!(
+            scope(&request("peer", None)),
+            Connection::login_scope_digest(&request("peer", None))
+        );
     }
 
     #[test]

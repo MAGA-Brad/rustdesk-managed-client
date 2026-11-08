@@ -1,8 +1,9 @@
+use base::config::keys::OPTION_PRESET_DEVICE_NAME;
 use hbb_common::{
     anyhow::anyhow,
     bail,
     config::Config,
-    get_time,
+    get_time, log,
     password_security::{decrypt_vec_or_original, encrypt_vec_or_original},
     ResultType,
 };
@@ -14,8 +15,7 @@ lazy_static::lazy_static! {
     static ref CURRENT_2FA: Mutex<Option<(TOTPInfo, TOTP)>> = Mutex::new(None);
 }
 
-const ISSUER: &str = "RustDesk";
-const TAG_LOGIN: &str = "Connection";
+const ISSUER: &str = "RUST";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TOTPInfo {
@@ -33,7 +33,7 @@ impl TOTPInfo {
             1,
             30,
             self.secret.clone(),
-            Some(format!("{} {}", ISSUER, TAG_LOGIN)),
+            Some(ISSUER.to_owned()),
             self.name.clone(),
         )?;
         Ok(totp)
@@ -74,11 +74,23 @@ impl TOTPInfo {
 }
 
 pub fn generate2fa() -> String {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let id = crate::ipc::get_id();
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    let id = Config::get_id();
-    if let Ok(info) = TOTPInfo::gen_totp_info(id, 6) {
+    // Prefer the friendly computer name in the authenticator app entry - it's
+    // what the user actually recognizes the device by. Falls back to the
+    // numeric RustDesk ID only when no friendly name has been set yet.
+    let friendly_name = Config::get_option(OPTION_PRESET_DEVICE_NAME);
+    let name = if !friendly_name.trim().is_empty() {
+        friendly_name
+    } else {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            crate::ipc::get_id()
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            Config::get_id()
+        }
+    };
+    if let Ok(info) = TOTPInfo::gen_totp_info(name, 6) {
         if let Ok(totp) = info.new_totp() {
             let code = totp.get_url();
             *CURRENT_2FA.lock().unwrap() = Some((info, totp));
@@ -93,11 +105,29 @@ pub fn verify2fa(code: String) -> bool {
         if let Ok(res) = totp.check_current(&code) {
             if res {
                 if let Ok(v) = info.into_string() {
-                    if let Err(error) = crate::ui_interface::set_auth_option("2fa".to_owned(), v) {
-                        hbb_common::log::error!("2FA configuration update rejected: {error}");
-                        return false;
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        return match crate::ipc::set_2fa_with_ack(v) {
+                            Ok(true) => true,
+                            Ok(false) => {
+                                log::warn!(
+                                    "2FA verification succeeded but durable persistence was not confirmed"
+                                );
+                                false
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "2FA verification succeeded but durable persistence failed: {err}"
+                                );
+                                false
+                            }
+                        };
                     }
-                    return res;
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    {
+                        Config::set_option("2fa".to_owned(), v.clone());
+                        return Config::get_option("2fa") == v;
+                    }
                 }
             }
         }
@@ -105,10 +135,62 @@ pub fn verify2fa(code: String) -> bool {
     false
 }
 
+// Managed installer (install_page.dart): the secret is made and its code checked while the
+// installed instance still runs, so cancelling leaves that instance untouched. It is saved only
+// after the instance is stopped, when this process owns the local IPC pipe the save goes through.
+// The QR is labelled with the friendly name typed into the installer.
+#[cfg(windows)]
+pub fn generate2fa_for_install(name: String) -> String {
+    if let Ok(info) = TOTPInfo::gen_totp_info(name, 6) {
+        if let Ok(totp) = info.new_totp() {
+            let code = totp.get_url();
+            *CURRENT_2FA.lock().unwrap() = Some((info, totp));
+            return code;
+        }
+    }
+    "".to_owned()
+}
+
+#[cfg(windows)]
+pub fn check_install2fa(code: &str) -> bool {
+    CURRENT_2FA
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(false, |(_, totp)| totp.check_current(code).unwrap_or(false))
+}
+
+#[cfg(windows)]
+pub fn save_install2fa() -> bool {
+    let value = CURRENT_2FA
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|(info, _)| info.into_string().ok());
+    let Some(value) = value else {
+        return false;
+    };
+    match crate::ipc::set_2fa_with_ack(value) {
+        Ok(true) => true,
+        Ok(false) => {
+            log::warn!("Install-time 2FA was not confirmed saved");
+            false
+        }
+        Err(err) => {
+            log::warn!("Install-time 2FA save failed: {err}");
+            false
+        }
+    }
+}
+
 pub fn get_2fa(raw: Option<String>) -> Option<TOTP> {
     TOTPInfo::from_str(&raw.unwrap_or(Config::get_option("2fa")))
         .map(|x| Some(x))
         .unwrap_or_default()
+}
+
+fn managed_telegram_disabled() -> bool {
+    option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +213,9 @@ impl TelegramBot {
     }
 
     fn save(&self) -> ResultType<()> {
+        if managed_telegram_disabled() {
+            bail!("Telegram bot integration is disabled for managed clients");
+        }
         let s = self.into_string()?;
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         crate::ipc::set_option("bot", &s);
@@ -140,6 +225,9 @@ impl TelegramBot {
     }
 
     pub fn get() -> ResultType<Option<TelegramBot>> {
+        if managed_telegram_disabled() {
+            return Ok(None);
+        }
         let data = Config::get_option("bot");
         if data.is_empty() {
             return Ok(None);
@@ -156,6 +244,9 @@ impl TelegramBot {
 
 // https://gist.github.com/dideler/85de4d64f66c1966788c1b2304b9caf1
 pub async fn send_2fa_code_to_telegram(text: &str, bot: TelegramBot) -> ResultType<()> {
+    if managed_telegram_disabled() {
+        bail!("Telegram bot integration is disabled for managed clients");
+    }
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot.token_str);
     let params = serde_json::json!({"chat_id": bot.chat_id, "text": text});
     crate::post_request(url, params.to_string(), "").await?;
@@ -163,6 +254,9 @@ pub async fn send_2fa_code_to_telegram(text: &str, bot: TelegramBot) -> ResultTy
 }
 
 pub fn get_chatid_telegram(bot_token: &str) -> ResultType<Option<String>> {
+    if managed_telegram_disabled() {
+        bail!("Telegram bot integration is disabled for managed clients");
+    }
     let url = format!("https://api.telegram.org/bot{}/getUpdates", bot_token);
     // because caller is in tokio runtime, so we must call post_request_sync in new thread.
     let handle = std::thread::spawn(move || crate::post_request_sync(url, "".to_owned(), ""));

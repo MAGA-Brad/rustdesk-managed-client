@@ -45,11 +45,11 @@ class StateGlobal {
   RxDouble get resizeEdgeSize => _resizeEdgeSize;
   RxDouble get windowBorderWidth => _windowBorderWidth;
 
-  resetLastResolutionGroupValues(String peerId) {
+  void resetLastResolutionGroupValues(String peerId) {
     _lastResolutionGroupValues[peerId] = {};
   }
 
-  setLastResolutionGroupValue(
+  void setLastResolutionGroupValue(
       String peerId, int currentDisplay, String? value) {
     if (!_lastResolutionGroupValues.containsKey(peerId)) {
       _lastResolutionGroupValues[peerId] = {};
@@ -61,8 +61,8 @@ class StateGlobal {
     return _lastResolutionGroupValues[peerId]?[currentDisplay];
   }
 
-  setWindowId(int id) => _windowId = id;
-  setMaximized(bool v) {
+  int setWindowId(int id) => _windowId = id;
+  void setMaximized(bool v) {
     if (!_fullscreen.isTrue) {
       if (isMaximized.value != v) {
         isMaximized.value = v;
@@ -74,9 +74,9 @@ class StateGlobal {
     }
   }
 
-  setMinimized(bool v) => _isMinimized = v;
+  bool setMinimized(bool v) => _isMinimized = v;
 
-  setFullscreen(bool v, {bool procWnd = true}) {
+  void setFullscreen(bool v, {bool procWnd = true}) {
     if (_fullscreen.value != v) {
       _fullscreen.value = v;
       _showTabBar.value = !_fullscreen.value;
@@ -88,7 +88,7 @@ class StateGlobal {
     }
   }
 
-  procFullscreenWeb() {
+  void procFullscreenWeb() {
     final isFullscreen = ffiGetByName('fullscreen') == 'Y';
     String fullscreenValue = '';
     if (isFullscreen && _fullscreen.isFalse) {
@@ -101,7 +101,7 @@ class StateGlobal {
     }
   }
 
-  procFullscreenNative(bool procWnd) {
+  void procFullscreenNative(bool procWnd) {
     refreshResizeEdgeSize();
     print("fullscreen: $fullscreen, resizeEdgeSize: ${_resizeEdgeSize.value}");
     _windowBorderWidth.value = fullscreen.isTrue ? 0 : kWindowBorderWidth;
@@ -114,7 +114,7 @@ class StateGlobal {
     }
   }
 
-  refreshResizeEdgeSize() => _resizeEdgeSize.value = fullscreen.isTrue
+  dynamic refreshResizeEdgeSize() => _resizeEdgeSize.value = fullscreen.isTrue
       ? kFullScreenEdgeSize
       : isMaximized.isTrue
           ? kMaximizeEdgeSize
@@ -122,14 +122,15 @@ class StateGlobal {
 
   String getInputSource({bool force = false}) {
     if (force || _inputSource.isEmpty) {
-      _inputSource = bind.mainGetInputSource();
+      _inputSource = bind.crateFlutterFfiMainGetInputSource();
     }
     return _inputSource;
   }
 
-  setInputSource(SessionID sessionId, String v) async {
-    await bind.mainSetInputSource(sessionId: sessionId, value: v);
-    _inputSource = bind.mainGetInputSource();
+  Future<void> setInputSource(SessionID sessionId, String v) async {
+    await bind.crateFlutterFfiMainSetInputSource(
+        sessionId: sessionId, value: v);
+    _inputSource = bind.crateFlutterFfiMainGetInputSource();
   }
 
   StateGlobal._() {

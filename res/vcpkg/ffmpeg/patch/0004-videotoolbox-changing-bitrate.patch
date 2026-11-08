@@ -1,27 +1,23 @@
-From d74de94b49efcf7a0b25673ace6016938d1b9272 Mon Sep 17 00:00:00 2001
 From: 21pages <sunboeasy@gmail.com>
-Date: Tue, 10 Dec 2024 14:12:01 +0800
-Subject: [PATCH 3/5] videotoolbox changing bitrate
+Subject: [PATCH] videotoolbox changing bitrate
 
-Signed-off-by: 21pages <sunboeasy@gmail.com>
----
- libavcodec/videotoolboxenc.c | 40 ++++++++++++++++++++++++++++++++++++
- 1 file changed, 40 insertions(+)
+Ported to FFmpeg 9.0.2 for RDC: only the VTEncContext field context moved;
+code unchanged. macOS only, not compile-tested in this Windows experiment.
 
 diff --git a/libavcodec/videotoolboxenc.c b/libavcodec/videotoolboxenc.c
-index da7b291b03..3c866177f5 100644
+index de52923..68a2488 100644
 --- a/libavcodec/videotoolboxenc.c
 +++ b/libavcodec/videotoolboxenc.c
 @@ -279,6 +279,8 @@ typedef struct VTEncContext {
-     int max_slice_bytes;
-     int power_efficient;
-     int max_ref_frames;
+     double alpha_quality;
+     int prio_speed;
+ 
 +
 +    int last_bit_rate;
- } VTEncContext;
- 
- static void vtenc_free_buf_node(BufNode *info)
-@@ -1180,6 +1182,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
+     bool flushing;
+     int has_b_frames;
+     bool warned_color_range;
+@@ -1195,6 +1197,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
      int64_t      one_second_value = 0;
      void         *nums[2];
  
@@ -29,7 +25,7 @@ index da7b291b03..3c866177f5 100644
      int status = VTCompressionSessionCreate(kCFAllocatorDefault,
                                              avctx->width,
                                              avctx->height,
-@@ -2638,6 +2641,42 @@ out:
+@@ -2532,6 +2535,42 @@ out:
      return status;
  }
  
@@ -72,7 +68,7 @@ index da7b291b03..3c866177f5 100644
  static av_cold int vtenc_frame(
      AVCodecContext *avctx,
      AVPacket       *pkt,
-@@ -2650,6 +2689,7 @@ static av_cold int vtenc_frame(
+@@ -2544,6 +2583,7 @@ static av_cold int vtenc_frame(
      CMSampleBufferRef buf = NULL;
      ExtraSEI sei = {0};
  
@@ -80,6 +76,3 @@ index da7b291b03..3c866177f5 100644
      if (frame) {
          status = vtenc_send_frame(avctx, vtctx, frame);
  
--- 
-2.43.0.windows.1
-

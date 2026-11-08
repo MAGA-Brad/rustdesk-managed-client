@@ -1,38 +1,40 @@
-# FFmpeg 7.1.1 includes the HEVC WPP slice-thread deadlock fix:
-# https://github.com/FFmpeg/FFmpeg/commit/79c47dfd25f101b6842bbec8c6ffef8d5077c3ae
+# FFmpeg 9.0.2 experiment. vcpkg's own patches are taken from microsoft/vcpkg
+# master ports/ffmpeg (9.0.2#7) minus 0045-use-prebuilt-bin2c: with
+# --disable-everything no .spv/.ptx/.metallib/.css resource needs bin2c.
+# Upstream already contains the old 0015 hybrid-MP4 fix (movenc.c) and makes
+# the old 0008 AMF single-query hack unsafe (see patch notes), so both dropped.
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO ffmpeg/ffmpeg
     REF "n${VERSION}"
-    SHA512 6b9a5ee501be41d6abc7579a106263b31f787321cbc45dedee97abf992bf8236cdb2394571dd256a74154f4a20018d429ae7e7f0409611ddc4d6f529d924d175
+    SHA512 21bf3fbcdfd2f41ea6edeab40433fecfe362b09ecaa177a652471b54f9357011b4f74dab18245ab1c26f1a473b94205490baecb42289afd2effd603cd0b22b59
     HEAD_REF master
     PATCHES
-    0001-create-lib-libraries.patch
-    0002-fix-msvc-link.patch
     0003-fix-windowsinclude.patch
     0004-dependencies.patch
     0005-fix-nasm.patch
     0007-fix-lib-naming.patch
     0013-define-WINVER.patch
-    0020-fix-aarch64-libswscale.patch
     0024-fix-osx-host-c11.patch
     0040-ffmpeg-add-av_stream_get_first_dts-for-chromium.patch # Do not remove this patch. It is required by chromium
-    0041-add-const-for-opengl-definition.patch
-    0043-fix-miss-head.patch
+    0046-fix-msvc-detection.patch
+    0047-fix-msvc-utf8.patch
+    0049-fix-twolame-pkgconfig.patch
+    0050-fix-test-ld-absolute-lib-paths.patch
+    0051-fix-msvc-undef-flags.patch
+    0052-fix-disable-unstable-swscale-link.patch
     patch/0001-avcodec-amfenc-add-query_timeout-option-for-h264-hev.patch
     patch/0002-libavcodec-amfenc-reconfig-when-bitrate-change.patch
     patch/0004-videotoolbox-changing-bitrate.patch
     patch/0005-mediacodec-changing-bitrate.patch
     patch/0006-dlopen-libva.patch
     patch/0007-fix-linux-configure.patch
-    patch/0008-remove-amf-loop-query.patch
     patch/0009-fix-nvenc-reconfigure-blur.patch
     patch/0010.disable-loading-DLLs-from-app-dir.patch
     patch/0011-android-mediacodec-encode-align-64.patch
     patch/0012-fix-macos-big-sur-CVBufferCopyAttachments.patch
     patch/0013-fix-qsv-encode-timeouts.patch
     patch/0014-fix-qsv-encode-buffer.patch
-    patch/0015-fix-hybrid-mp4-finalization.patch
 )
 
 if(SOURCE_PATH MATCHES " ")
@@ -75,7 +77,6 @@ set(OPTIONS "\
 --disable-avfilter \
 --disable-swresample \
 --disable-swscale \
---disable-postproc \
 --enable-decoder=h264 \
 --enable-decoder=hevc \
 --enable-parser=h264 \
@@ -134,6 +135,7 @@ elseif(VCPKG_TARGET_IS_WINDOWS)
 --toolchain=msvc \
 --cc=cl \
 --enable-gpl \
+--disable-zlib \
 --enable-d3d11va \
 --enable-hwaccel=h264_d3d11va \
 --enable-hwaccel=hevc_d3d11va \
@@ -192,6 +194,7 @@ elseif(VCPKG_CMAKE_SYSTEM_NAME STREQUAL "Android")
 --target-os=android \
 --disable-asm \
 --disable-iconv \
+--disable-zlib \
 --enable-jni \
 --enable-mediacodec \
 --disable-hwaccels \
@@ -238,8 +241,28 @@ if(VCPKG_DETECTED_CMAKE_C_COMPILER)
     set(ENV{CC} "${CC_filename}")
     string(APPEND OPTIONS " --cc=${CC_filename}")
 
-    if(VCPKG_HOST_IS_WINDOWS)
+    # host_cc builds small helper tools that run on the build machine, not
+    # the target - only reuse the just-detected target compiler for that when
+    # host and target are actually the same OS (native Windows build). When
+    # cross-compiling (e.g. to Android), CC_filename is the NDK's clang,
+    # which defaults to an Android sysroot and can't find Windows headers
+    # ("ctype.h file not found") when asked to build a native host tool.
+    if(VCPKG_HOST_IS_WINDOWS AND VCPKG_TARGET_IS_WINDOWS)
         string(APPEND OPTIONS " --host_cc=${CC_filename}")
+    elseif(VCPKG_HOST_IS_WINDOWS)
+        # No native gcc is available in vcpkg's downloaded MSYS2 root here
+        # (configure's own host_cc fallback hits "gcc: command not found"),
+        # so point at a real native-Windows-targeting clang instead of the
+        # cross-target one. This is a real, standalone LLVM install, not the
+        # NDK's copy. Uses the 8.3 short path (PROGRA~1) because "Program
+        # Files" has a space, and this string gets tokenized on whitespace
+        # further down the chain (build.sh -> configure), which silently
+        # split the path and broke option parsing when quoted normally.
+        find_program(RUSTDESK_NATIVE_CLANG NAMES clang.exe
+            PATHS "C:/PROGRA~1/LLVM/bin" NO_DEFAULT_PATH)
+        if(RUSTDESK_NATIVE_CLANG)
+            string(APPEND OPTIONS " --host_cc=${RUSTDESK_NATIVE_CLANG}")
+        endif()
     endif()
 
     list(APPEND prog_env "${CC_path}")

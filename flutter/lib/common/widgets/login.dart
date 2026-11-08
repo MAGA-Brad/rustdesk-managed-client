@@ -62,11 +62,9 @@ class _IconOP extends StatelessWidget {
   final String? icon;
   final EdgeInsets margin;
   const _IconOP(
-      {Key? key,
-      required this.op,
+      {required this.op,
       required this.icon,
-      this.margin = const EdgeInsets.symmetric(horizontal: 4.0)})
-      : super(key: key);
+      this.margin = const EdgeInsets.symmetric(horizontal: 4.0)});
 
   @override
   Widget build(BuildContext context) {
@@ -97,7 +95,7 @@ class ButtonOP extends StatelessWidget {
   final bool Function() canStartAuth;
 
   const ButtonOP({
-    Key? key,
+    super.key,
     required this.op,
     required this.curOP,
     required this.icon,
@@ -105,7 +103,7 @@ class ButtonOP extends StatelessWidget {
     required this.height,
     required this.onTap,
     required this.canStartAuth,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -178,12 +176,12 @@ class _OidcAuthController {
         return;
       }
       try {
-        await bind.mainAccountAuthCancel();
+        await bind.crateFlutterFfiMainAccountAuthCancel();
         if (!_isCurrent(authAttempt, op)) {
           completer.complete(false);
           return;
         }
-        await bind.mainAccountAuth(op: op, rememberMe: true);
+        await bind.crateFlutterFfiMainAccountAuth(op: op, rememberMe: true);
         completer.complete(_isCurrent(authAttempt, op));
       } catch (error, stackTrace) {
         completer.completeError(error, stackTrace);
@@ -193,7 +191,7 @@ class _OidcAuthController {
   }
 
   Future<bool> _startWeb(int authAttempt, String op) async {
-    await bind.mainAccountAuth(op: op, rememberMe: true);
+    await bind.crateFlutterFfiMainAccountAuth(op: op, rememberMe: true);
     return _isCurrent(authAttempt, op);
   }
 
@@ -210,7 +208,7 @@ class _OidcAuthController {
     _cancelInProgress.value = true;
     _pendingOperation = _pendingOperation.then((_) async {
       try {
-        await bind.mainAccountAuthCancel();
+        await bind.crateFlutterFfiMainAccountAuthCancel();
         completer.complete(_isCurrent(authAttempt, op));
       } catch (error, stackTrace) {
         completer.completeError(error, stackTrace);
@@ -223,7 +221,7 @@ class _OidcAuthController {
 
   Future<void> _cancelBackend() async {
     try {
-      await bind.mainAccountAuthCancel();
+      await bind.crateFlutterFfiMainAccountAuthCancel();
     } catch (error, stackTrace) {
       debugPrint('Failed to cancel account authentication $error');
       debugPrintStack(stackTrace: stackTrace);
@@ -257,14 +255,14 @@ class WidgetOP extends StatefulWidget {
   final Future<bool> Function(String) cancelAuth;
   final bool Function() canStartAuth;
   const WidgetOP({
-    Key? key,
+    super.key,
     required this.config,
     required this.curOP,
     required this.cbLogin,
     required this.startAuth,
     required this.cancelAuth,
     required this.canStartAuth,
-  }) : super(key: key);
+  });
 
   @override
   State<StatefulWidget> createState() {
@@ -286,7 +284,7 @@ class _WidgetOPState extends State<WidgetOP> {
     _updateTimer?.cancel();
   }
 
-  _beginQueryState(int authAttempt) {
+  void _beginQueryState(int authAttempt) {
     _updateTimer?.cancel();
     unawaited(_runAuthStatusQuery(() => _updateState(authAttempt)));
     _updateTimer = Timer.periodic(Duration(seconds: 1), (timer) {
@@ -396,7 +394,7 @@ class _WidgetOPState extends State<WidgetOP> {
       _updateTimer?.cancel();
       return Future<void>.value();
     }
-    return bind.mainAccountAuthResult().then<void>((result) {
+    return bind.crateFlutterFfiMainAccountAuthResult().then<void>((result) {
       if (!mounted ||
           authAttempt != _authAttempt ||
           widget.curOP.value != widget.config.op ||
@@ -539,7 +537,7 @@ class _WidgetOPState extends State<WidgetOP> {
                       final bgColor = Theme.of(context)
                           .colorScheme
                           .errorContainer
-                          .withOpacity(0.3);
+                          .withValues(alpha: 0.3);
                       return Container(
                         padding: const EdgeInsets.symmetric(
                             horizontal: 8.0, vertical: 6.0),
@@ -586,14 +584,14 @@ class LoginWidgetOP extends StatelessWidget {
   final bool Function() canStartAuth;
 
   LoginWidgetOP({
-    Key? key,
+    super.key,
     required this.ops,
     required this.curOP,
     required this.cbLogin,
     required this.startAuth,
     required this.cancelAuth,
     required this.canStartAuth,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -638,7 +636,7 @@ class LoginWidgetUserPass extends StatelessWidget {
   final Function() onLogin;
   final FocusNode? userFocusNode;
   const LoginWidgetUserPass({
-    Key? key,
+    super.key,
     this.userFocusNode,
     required this.username,
     required this.pass,
@@ -647,7 +645,7 @@ class LoginWidgetUserPass extends StatelessWidget {
     required this.isInProgress,
     required this.curOP,
     required this.onLogin,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -776,9 +774,9 @@ Future<bool?> _openLoginDialog() async {
         case HttpType.kAuthResTypeToken:
           if (resp.access_token != null) {
             if (storeIfAccessToken) {
-              await bind.mainSetLocalOption(
+              await bind.crateFlutterFfiMainSetLocalOption(
                   key: 'access_token', value: resp.access_token!);
-              await bind.mainSetLocalOption(
+              await bind.crateFlutterFfiMainSetLocalOption(
                   key: 'user_info', value: jsonEncode(resp.user ?? {}));
             }
             if (close != null) {
@@ -842,8 +840,8 @@ Future<bool?> _openLoginDialog() async {
         final resp = await gFFI.userModel.login(LoginRequest(
             username: username.text,
             password: password.text,
-            id: await bind.mainGetMyId(),
-            uuid: await bind.mainGetUuid(),
+            id: await bind.crateFlutterFfiMainGetMyId(),
+            uuid: await bind.crateFlutterFfiMainGetUuid(),
             autoLogin: true,
             type: HttpType.kAuthReqTypeAccount));
         await handleLoginResponse(resp, true, close);
@@ -954,7 +952,7 @@ Future<bool?> _openLoginDialog() async {
                       .textTheme
                       .titleLarge
                       ?.color
-                      ?.withOpacity(0.55),
+                      ?.withValues(alpha: 0.55),
             ),
             onTap: onDialogCancel,
             hoverColor: Colors.red,
@@ -1018,15 +1016,15 @@ Future<bool?> verificationCodeDialog(
             tfaCode: isEmailVerification ? null : code.text,
             secret: secret,
             username: user?.name,
-            id: await bind.mainGetMyId(),
-            uuid: await bind.mainGetUuid(),
+            id: await bind.crateFlutterFfiMainGetMyId(),
+            uuid: await bind.crateFlutterFfiMainGetUuid(),
             autoLogin: autoLogin,
             type: HttpType.kAuthReqTypeEmailCode));
 
         switch (resp.type) {
           case HttpType.kAuthResTypeToken:
             if (resp.access_token != null) {
-              await bind.mainSetLocalOption(
+              await bind.crateFlutterFfiMainSetLocalOption(
                   key: 'access_token', value: resp.access_token!);
               close(true);
               return;

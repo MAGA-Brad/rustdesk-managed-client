@@ -5,13 +5,24 @@ use serde_json::{Map, Value};
 #[cfg(feature = "flutter")]
 pub mod account;
 pub mod downloader;
+pub mod directory_enrollment;
+mod debug_log;
 mod http_client;
+pub mod managed_chat;
+pub(crate) mod rds_refusal;
+#[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+pub mod managed_sync;
 pub mod record_upload;
 pub mod sync;
 pub use http_client::{
     create_http_client_async, create_http_client_async_with_url_strict,
     create_http_client_with_url, create_http_client_with_url_strict, get_url_for_tls,
 };
+#[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+pub(crate) use http_client::create_inspected_network_client_async;
+#[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+pub(crate) use http_client::create_managed_ipv4_client_async;
+pub(crate) use http_client::forbid_invalid_cert;
 
 #[derive(Debug)]
 pub enum HbbHttpResponse<T> {

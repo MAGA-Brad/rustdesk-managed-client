@@ -43,10 +43,108 @@ fn connection_meta(
     control_permissions: Option<ControlPermissions>,
     controlled_context: Option<ControlledContext>,
 ) -> ConnectionMeta {
+    // Neither RDS nor hbbs issues these to managed devices; the controller fills them, and they
+    // would override this device's own permission policy.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return ConnectionMeta::default();
+    }
     ConnectionMeta {
         control_permissions,
         controlled_context,
     }
+}
+
+/// How long a relay this side started waits for hbbs's ticket. hbbs answers at once, or closes the
+/// connection when it has none to give.
+const RELAY_TICKET_WAIT_MS: u64 = 3_000;
+
+/// Managed builds: for a relay this side started (it picked the uuid), hbbs sends the ticket hbbr
+/// asks this side for back on the connection the RelayResponse went out on.
+async fn relay_ticket_from_hbbs(socket: &mut Stream, uuid: &str) -> String {
+    let msg = crate::get_next_nonkeyexchange_msg(socket, Some(RELAY_TICKET_WAIT_MS)).await;
+    match msg.and_then(|msg| msg.union) {
+        Some(rendezvous_message::Union::RelayResponse(rr)) if rr.uuid == uuid => rr.relay_ticket,
+        _ => {
+            log::debug!("no relay ticket from the rendezvous server for {}", uuid);
+            String::new()
+        }
+    }
+}
+
+/// `crate::create_relay_connection` with hbbs's relay ticket in the request to hbbr.
+async fn create_ticketed_relay_connection(
+    server: ServerPtr,
+    relay_server: String,
+    uuid: String,
+    relay_ticket: String,
+    peer_addr: SocketAddr,
+    secure: bool,
+    ipv4: bool,
+    meta: ConnectionMeta,
+) {
+    let res = async {
+        let mut stream = crate::managed_ws_fallback::connect_relay(
+            &socket_client::ipv4_to_ipv6(crate::check_port(relay_server, config::RELAY_PORT), ipv4),
+            CONNECT_TIMEOUT,
+        )
+        .await?;
+        let mut msg_out = Message::new();
+        msg_out.set_request_relay(RequestRelay {
+            licence_key: crate::get_key(true).await,
+            uuid: uuid.clone(),
+            relay_ticket,
+            ..Default::default()
+        });
+        stream.send(&msg_out).await?;
+        crate::server::create_tcp_connection(server, stream, peer_addr, secure, meta).await
+    }
+    .await;
+    if let Err(err) = res {
+        // As in create_relay_connection: another route winning the race is not a fault.
+        if err.to_string() == "Failed to receive public key" {
+            log::info!(
+                "Relay {} for {} closed before the controller joined (another route won)",
+                uuid,
+                peer_addr
+            );
+            return;
+        }
+        log::error!(
+            "Failed to create relay connection for {} with uuid {}: {}",
+            peer_addr,
+            uuid,
+            err
+        );
+    }
+}
+
+// Relays this peer put in its punch replies, from its `relay-server` option or a rendezvous
+// server. A genuine RequestRelay echoes one back; this bounds where a request can send this peer,
+// it does not authenticate the request.
+static REPORTED_RELAYS: std::sync::Mutex<VecDeque<(String, Instant)>> =
+    std::sync::Mutex::new(VecDeque::new());
+const MAX_REPORTED_RELAYS: usize = 32;
+// Far longer than a controller's direct attempts before it asks for the relay, yet a relay
+// dropped from the configuration stops being accepted.
+const REPORTED_RELAY_TTL: Duration = Duration::from_secs(600);
+
+fn remember_reported_relay(relay_server: &str, now: Instant) {
+    let relay_server = check_port(relay_server, config::RELAY_PORT);
+    let mut relays = REPORTED_RELAYS.lock().unwrap();
+    relays.retain(|(r, at)| {
+        *r != relay_server && now.saturating_duration_since(*at) < REPORTED_RELAY_TTL
+    });
+    if relays.len() >= MAX_REPORTED_RELAYS {
+        relays.pop_front();
+    }
+    relays.push_back((relay_server, now));
+}
+
+fn is_reported_relay(relay_server: &str, now: Instant) -> bool {
+    let relay_server = check_port(relay_server, config::RELAY_PORT);
+    REPORTED_RELAYS.lock().unwrap().iter().any(|(r, at)| {
+        *r == relay_server && now.saturating_duration_since(*at) < REPORTED_RELAY_TTL
+    })
 }
 
 lazy_static::lazy_static! {
@@ -336,7 +434,8 @@ impl RendezvousMediator {
                                 // An existing connection was forcibly closed by the remote host. (os error 10054): also happens for UDP
                                 *timeout.write().unwrap() = 3000;
                             }
-                            log::error!("{err}");
+                            // Without a network this repeats every few minutes until it's back.
+                            hbb_common::throttled_log!(crate::common::API_LOG_INTERVAL, error, "{err}");
                         }
                         // SHOULD_EXIT here is to ensure once one exits, the others also exit.
                         SHOULD_EXIT.store(true, Ordering::SeqCst);
@@ -377,7 +476,7 @@ impl RendezvousMediator {
 
     pub async fn start_udp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
-        log::info!("start udp: {host}");
+        hbb_common::throttled_log!(crate::common::API_LOG_INTERVAL, info, "start udp: {host}");
         let (mut socket, mut addr) = new_udp_for(&host, CONNECT_TIMEOUT).await?;
         let mut rz = Self {
             addr: addr.clone(),
@@ -525,6 +624,11 @@ impl RendezvousMediator {
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;
                     }
+                    Ok(register_pk_response::Result::TOO_FREQUENT) => {
+                        // hbbs throttles key registration after several quick attempts, as right
+                        // after a network change; the normal registration cycle retries.
+                        log::info!("the rendezvous server throttled key registration (too frequent); retrying on the next cycle");
+                    }
                     Ok(register_pk_response::Result::NOT_DEPLOYED) => {
                         if !NEEDS_DEPLOY.load(Ordering::SeqCst) {
                             log::warn!("Server requires deployment. Run `rustdesk --deploy --token <api_token>` on this device.");
@@ -539,7 +643,16 @@ impl RendezvousMediator {
                         notify_android_needs_deploy();
                     }
                     _ => {
-                        log::error!("unknown RegisterPkResponse");
+                        // Everything not handled above (a recognized-but-
+                        // unhandled Result variant like ID_EXISTS/
+                        // NOT_SUPPORT/etc, or a
+                        // genuinely out-of-schema value) lands here. Log
+                        // the raw wire value so this is diagnosable instead
+                        // of just "unknown".
+                        log::error!(
+                            "unhandled RegisterPkResponse result, raw value={:?}",
+                            rpr.result.value()
+                        );
                     }
                 }
                 if rpr.keep_alive > 0 {
@@ -656,7 +769,12 @@ impl RendezvousMediator {
     }
 
     pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
-        log::info!("start rendezvous mediator of {}", host);
+        hbb_common::throttled_log!(
+            crate::common::API_LOG_INTERVAL,
+            info,
+            "start rendezvous mediator of {}",
+            host
+        );
         //If the investment agent type is http or https, then tcp forwarding is enabled.
         if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
             || Config::is_proxy()
@@ -670,6 +788,10 @@ impl RendezvousMediator {
     }
 
     async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
+        if let Err(err) = self.check_relay_request(&rr, Instant::now()) {
+            hbb_common::throttled_log!(PUNCH_LOG_INTERVAL, warn, "Ignored relay request: {}", err);
+            return Ok(());
+        }
         let addr = AddrMangle::decode(&rr.socket_addr);
         let last = *LAST_RELAY_MSG.lock().await;
         *LAST_RELAY_MSG.lock().await = (addr, Instant::now());
@@ -692,6 +814,7 @@ impl RendezvousMediator {
             Default::default(),
             String::new(),
             meta,
+            rr.relay_ticket,
         )
         .await
     }
@@ -707,6 +830,7 @@ impl RendezvousMediator {
         socket_addr_v6: bytes::Bytes,
         webrtc_sdp_answer: String,
         meta: ConnectionMeta,
+        relay_ticket: String,
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&socket_addr);
         log::info!(
@@ -717,14 +841,21 @@ impl RendezvousMediator {
             secure,
         );
 
-        let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+        let mut socket = crate::managed_ws_fallback::connect_rendezvous(
+            &self.host,
+            &crate::get_key(true).await,
+            CONNECT_TIMEOUT,
+        )
+        .await?;
         // A relay response carrying an answer carries this machine's ICE candidates with it, so
         // that half goes out only on an encrypted channel. A server that does not complete the
         // exchange loses the answer, not the relay: the response goes without it, on a fresh
         // socket since the failed exchange may have consumed a message on this one, and the
         // controller falls back to its other transports.
         let mut webrtc_sdp_answer = webrtc_sdp_answer;
-        if !webrtc_sdp_answer.is_empty() {
+        if crate::rendezvous_encryption_required() {
+            crate::secure_tcp_required(&mut socket, &crate::get_key(true).await).await?;
+        } else if !webrtc_sdp_answer.is_empty() {
             let key = crate::get_key(true).await;
             if let Err(err) = crate::secure_tcp_required(&mut socket, &key).await {
                 log::warn!("relaying without the WebRTC answer, it cannot be encrypted: {err}");
@@ -748,6 +879,25 @@ impl RendezvousMediator {
         }
         msg_out.set_relay_response(rr);
         socket.send(&msg_out).await?;
+        let relay_ticket = if initiate && option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+            relay_ticket_from_hbbs(&mut socket, &uuid).await
+        } else {
+            relay_ticket
+        };
+        if !relay_ticket.is_empty() {
+            create_ticketed_relay_connection(
+                server,
+                relay_server,
+                uuid,
+                relay_ticket,
+                peer_addr,
+                secure,
+                is_ipv4(&self.addr),
+                meta,
+            )
+            .await;
+            return Ok(());
+        }
         crate::create_relay_connection(
             server,
             relay_server,
@@ -771,6 +921,7 @@ impl RendezvousMediator {
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
         let relay_server = self.get_relay_server(fla.relay_server.clone());
+        remember_reported_relay(&relay_server, Instant::now());
         let relay = use_ws() || Config::is_proxy();
         let mut socket_addr_v6 = Default::default();
         let meta = connection_meta(
@@ -814,6 +965,7 @@ impl RendezvousMediator {
             socket_addr_v6,
             String::new(),
             meta,
+            String::new(),
         )
         .await
     }
@@ -840,6 +992,9 @@ impl RendezvousMediator {
             bail!("no place among the punches in flight");
         };
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+        if crate::rendezvous_encryption_required() {
+            crate::secure_tcp_required(&mut socket, &crate::get_key(true).await).await?;
+        }
         let local_addr = socket.local_addr();
         // we saw invalid local_addr while using proxy, local_addr.ip() == "::1"
         let local_addr: SocketAddr =
@@ -873,6 +1028,7 @@ impl RendezvousMediator {
         server: ServerPtr,
         peer_addr: SocketAddr,
         meta: ConnectionMeta,
+        signal_key: Option<crate::managed_sealed_signal::SignalKey>,
     ) -> ResultType<String> {
         let Some(slot) = AnswererSlot::take() else {
             hbb_common::throttled_log!(
@@ -912,8 +1068,13 @@ impl RendezvousMediator {
             .insert(session_key.clone(), IceRoute::new(remote_ice_tx));
 
         let stream_for_remote_ice = stream.clone();
+        let signal_key_in = signal_key.clone();
         tokio::spawn(async move {
             while let Some(candidate) = remote_ice_rx.recv().await {
+                let candidate = crate::managed_sealed_signal::open_incoming(&signal_key_in, crate::managed_sealed_signal::TO_TARGET, candidate);
+                if candidate.is_empty() {
+                    continue;
+                }
                 if let Err(err) = stream_for_remote_ice.add_remote_ice_candidate(&candidate).await
                 {
                     if let Some(n) = REJECTED_REMOTE_ICE_LOG.due() {
@@ -946,14 +1107,20 @@ impl RendezvousMediator {
                     msg.set_ice_candidate(IceCandidate {
                         socket_addr: socket_addr.clone(),
                         session_key: session_key_for_ice.clone(),
-                        candidate,
+                        candidate: crate::managed_sealed_signal::seal_outgoing(&signal_key, crate::managed_sealed_signal::TO_CONTROLLER, candidate),
                         ..Default::default()
                     });
                     // One reconnect attempt per candidate: the first send after an hbbs
                     // restart or an idle-killed connection fails on the stale stream.
                     for _ in 0..2 {
                         if conn.is_none() {
-                            match connect_tcp(&*host, CONNECT_TIMEOUT).await {
+                            match crate::managed_ws_fallback::connect_rendezvous(
+                                &host,
+                                &key,
+                                CONNECT_TIMEOUT,
+                            )
+                            .await
+                            {
                                 Ok(mut s) => {
                                     // Candidates are every interface address of this machine:
                                     // sent only on a channel that is actually encrypted, else
@@ -1050,7 +1217,7 @@ impl RendezvousMediator {
         Ok(answer)
     }
 
-    async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
+    async fn handle_punch_hole(&self, mut ph: PunchHole, server: ServerPtr) -> ResultType<()> {
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
         let last = *LAST_MSG.lock().await;
         *LAST_MSG.lock().await = (peer_addr, Instant::now());
@@ -1066,6 +1233,8 @@ impl RendezvousMediator {
             ph.control_permissions.clone().into_option(),
             ph.controlled_context.clone().into_option(),
         );
+        // Managed builds answer only an offer sealed to this device by an RDS-approved one.
+        let signal_key = crate::managed_sealed_signal::open_incoming_offer(&mut ph.webrtc_sdp_offer).await;
         // The controller's force_relay alone does not say whether ICE must be Relay-only; its
         // offer envelope does. `ice_policy: "all"` means the relay was forced by the transport
         // (ws), so answer with full ICE and let a direct pair form.
@@ -1085,6 +1254,7 @@ impl RendezvousMediator {
                 server.clone(),
                 peer_addr,
                 meta.clone(),
+                signal_key.clone(),
             )
             .await
             .unwrap_or_else(|err| {
@@ -1094,6 +1264,8 @@ impl RendezvousMediator {
         } else {
             String::new()
         };
+        let webrtc_sdp_answer =
+            crate::managed_sealed_signal::seal_outgoing(&signal_key, crate::managed_sealed_signal::TO_CONTROLLER, webrtc_sdp_answer);
         // Whether the v4 legs relay is known here, and decides whether a v4 place is taken at
         // all: the relay branch below runs the whole session, and a place held across it would
         // let ordinary relay traffic use the pool up. The v6 punch is not relayed with them - a
@@ -1119,6 +1291,7 @@ impl RendezvousMediator {
             .await;
         }
         let relay_server = self.get_relay_server(ph.relay_server);
+        remember_reported_relay(&relay_server, Instant::now());
         // for ensure, websocket go relay directly
         // A symmetric NAT relays the legacy transports but deliberately not WebRTC: the answer
         // built above rides along on the relay request, and ICE probes the candidate pairs rather
@@ -1138,6 +1311,7 @@ impl RendezvousMediator {
                     socket_addr_v6.clone(),
                     webrtc_sdp_answer.clone(),
                     meta,
+                    String::new(),
                 )
                 .await;
         }
@@ -1166,7 +1340,12 @@ impl RendezvousMediator {
             // is made — the controller keeps its request socket for trickled ICE.
             let mut msg_out = Message::new();
             msg_out.set_punch_hole_sent(msg_punch);
-            let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+            let mut socket = crate::managed_ws_fallback::connect_rendezvous(
+                &self.host,
+                &crate::get_key(true).await,
+                CONNECT_TIMEOUT,
+            )
+            .await?;
             // The answer goes out only on a channel that is actually encrypted; otherwise this
             // WebRTC attempt is abandoned and the controller falls back to its other transports.
             crate::secure_tcp_required(&mut socket, &crate::get_key(true).await).await?;
@@ -1184,6 +1363,9 @@ impl RendezvousMediator {
             allow_err!(socket_client::connect_tcp_local(peer_addr, Some(local_addr), 30).await);
             socket
         };
+        if crate::rendezvous_encryption_required() {
+            crate::secure_tcp_required(&mut socket, &crate::get_key(true).await).await?;
+        }
         let mut msg_out = Message::new();
         msg_out.set_punch_hole_sent(msg_punch);
         let bytes = msg_out.write_to_bytes()?;
@@ -1285,6 +1467,17 @@ impl RendezvousMediator {
     }
 
     async fn handle_uuid_mismatch(&mut self, socket: Sink<'_>) -> ResultType<()> {
+        // A check that panicked keeps the ID: a new one would orphan the directory record for good.
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && tokio::task::spawn_blocking(
+                crate::hbbs_http::directory_enrollment::rustdesk_id_bound_to_directory,
+            )
+            .await
+            .unwrap_or(true)
+        {
+            crate::hbbs_http::directory_enrollment::note_bound_id_uuid_mismatch(&self.host);
+            return Ok(());
+        }
         {
             let mut solving = SOLVING_PK_MISMATCH.lock().await;
             if solving.is_empty() || *solving == self.host {
@@ -1338,6 +1531,20 @@ impl RendezvousMediator {
             relay_server = crate::increase_port(&self.host, 1);
         }
         relay_server
+    }
+
+    fn check_relay_request(&self, rr: &RequestRelay, now: Instant) -> ResultType<()> {
+        crate::common::check_relay_uuid(&rr.uuid)?;
+        if !is_reported_relay(&rr.relay_server, now)
+            && check_port(&rr.relay_server, config::RELAY_PORT)
+                != check_port(self.get_relay_server(String::new()), config::RELAY_PORT)
+        {
+            bail!(
+                "relay server {:?} was not offered by this peer",
+                rr.relay_server
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1730,7 +1937,7 @@ impl Drop for CheckIfResendPk {
 #[cfg(test)]
 mod tests {
     use super::{
-        connection_meta, mpsc, tokio, wait_for_retry, AnswererSlot, Duration, IceRoute,
+        connection_meta, mpsc, tokio, wait_for_retry, AnswererSlot, Duration, IceRoute, Instant,
         IntoTargetAddr, Ordering, PunchHoleSent, RendezvousMediator, RendezvousMessage,
         CONNECT_TIMEOUT, MANUAL_RESTARTED, MANUAL_RESTART_NOTIFY, MAX_WEBRTC_ANSWERERS,
         SHOULD_EXIT, TCP_PUNCHES, UDP_PUNCHES,
@@ -1840,5 +2047,74 @@ mod tests {
         assert!(AnswererSlot::take().is_none());
         drop(held);
         assert!(AnswererSlot::take().is_some());
+    }
+
+    #[test]
+    fn relay_request_must_name_a_relay_this_peer_offered() {
+        let host: std::net::SocketAddr = "127.0.0.1:21116".parse().unwrap();
+        let mediator = RendezvousMediator {
+            addr: host.into_target_addr().unwrap(),
+            host: host.to_string(),
+            host_prefix: String::new(),
+            keep_alive: 0,
+        };
+        let now = Instant::now();
+        super::remember_reported_relay("reported-relay.example", now);
+        let request = |relay_server: &str, uuid: &str| super::RequestRelay {
+            relay_server: relay_server.to_owned(),
+            uuid: uuid.to_owned(),
+            ..Default::default()
+        };
+        let uuid = "e4c181d0-41c7-4ae6-8ef0-36581b6b2b12";
+        let reported = request("reported-relay.example:21117", uuid);
+        assert!(mediator.check_relay_request(&reported, now).is_ok());
+        let unknown = request("other-host.example:21117", uuid);
+        assert!(mediator.check_relay_request(&unknown, now).is_err());
+        let bad_uuid = request("reported-relay.example", "a\r\nb");
+        assert!(mediator.check_relay_request(&bad_uuid, now).is_err());
+        let fallback = request(&mediator.get_relay_server(String::new()), uuid);
+        assert!(mediator.check_relay_request(&fallback, now).is_ok());
+        let expired = now + super::REPORTED_RELAY_TTL;
+        assert!(mediator.check_relay_request(&reported, expired).is_err());
+        // Not at `expired`: an insert that late would purge what parallel tests just reported.
+        super::remember_reported_relay(
+            "reported-relay.example",
+            now + super::REPORTED_RELAY_TTL / 2,
+        );
+        assert!(mediator.check_relay_request(&reported, expired).is_ok());
+    }
+
+    #[test]
+    fn reported_relay_is_refused_once_it_expires() {
+        let reported_at = Instant::now();
+        super::remember_reported_relay("expiring-relay.example", reported_at);
+        let just_before = reported_at + super::REPORTED_RELAY_TTL - Duration::from_secs(1);
+        assert!(super::is_reported_relay(
+            "expiring-relay.example:21117",
+            just_before
+        ));
+        let expired = reported_at + super::REPORTED_RELAY_TTL;
+        assert!(!super::is_reported_relay(
+            "expiring-relay.example:21117",
+            expired
+        ));
+    }
+
+    #[test]
+    fn reporting_a_relay_again_restarts_its_expiry() {
+        let first = Instant::now();
+        let again = first + super::REPORTED_RELAY_TTL / 2;
+        super::remember_reported_relay("refreshed-relay.example", first);
+        super::remember_reported_relay("refreshed-relay.example", again);
+        let past_first = first + super::REPORTED_RELAY_TTL;
+        assert!(super::is_reported_relay(
+            "refreshed-relay.example",
+            past_first
+        ));
+        let past_again = again + super::REPORTED_RELAY_TTL;
+        assert!(!super::is_reported_relay(
+            "refreshed-relay.example",
+            past_again
+        ));
     }
 }

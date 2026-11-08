@@ -339,7 +339,7 @@ class UnreadChatCountState {
   static RxInt find(String id) => Get.find<RxInt>(tag: tag(id));
 }
 
-initSharedStates(String id) {
+void initSharedStates(String id) {
   PrivacyModeState.init(id);
   BlockInputState.init(id);
   CurrentDisplayState.init(id);
@@ -353,7 +353,7 @@ initSharedStates(String id) {
   if (isMobile) ConnectionTypeState.init(id); // desktop in other places
 }
 
-removeSharedStates(String id) {
+void removeSharedStates(String id) {
   PrivacyModeState.delete(id);
   BlockInputState.delete(id);
   CurrentDisplayState.delete(id);

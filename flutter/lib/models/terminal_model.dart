@@ -144,7 +144,7 @@ class TerminalModel with ChangeNotifier {
     if (_terminalOpened) {
       // Send user input to remote terminal
       try {
-        await bind.sessionSendTerminalInput(
+        await bind.crateFlutterFfiSessionSendTerminalInput(
           sessionId: parent.sessionId,
           terminalId: terminalId,
           data: data,
@@ -163,7 +163,7 @@ class TerminalModel with ChangeNotifier {
       maxLines: 10000,
       onClipboardWrite: writeTerminalClipboard,
       clipboardWritePermission: () => terminalClipboardWritePermission(
-        bind.mainGetLocalOption(key: kOptionAllowTerminalClipboardWrite),
+        bind.crateFlutterFfiMainGetLocalOption(key: kOptionAllowTerminalClipboardWrite),
         remoteClipboardEnabled:
             parent.ffiModel.permissions['clipboard'] != false,
         canRequestConsent: onClipboardWriteBlocked != null,
@@ -199,7 +199,7 @@ class TerminalModel with ChangeNotifier {
         if (_terminalOpened) {
           // Notify remote terminal of resize
           try {
-            await bind.sessionResizeTerminal(
+            await bind.crateFlutterFfiSessionResizeTerminal(
               sessionId: parent.sessionId,
               terminalId: terminalId,
               rows: h,
@@ -247,7 +247,7 @@ class TerminalModel with ChangeNotifier {
         '[TerminalModel] Opening terminal $terminalId, sessionId: ${parent.sessionId}, size: ${cols}x$rows');
     try {
       await bind
-          .sessionOpenTerminal(
+          .crateFlutterFfiSessionOpenTerminal(
         sessionId: parent.sessionId,
         terminalId: terminalId,
         rows: rows,
@@ -290,7 +290,7 @@ class TerminalModel with ChangeNotifier {
     if (_terminalOpened) {
       try {
         await bind
-            .sessionCloseTerminal(
+            .crateFlutterFfiSessionCloseTerminal(
           sessionId: parent.sessionId,
           terminalId: terminalId,
         )
@@ -474,7 +474,7 @@ class TerminalModel with ChangeNotifier {
 
     for (final data in buffer) {
       try {
-        await bind.sessionSendTerminalInput(
+        await bind.crateFlutterFfiSessionSendTerminalInput(
           sessionId: parent.sessionId,
           terminalId: terminalId,
           data: data,

@@ -30,8 +30,18 @@ use windows::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeClientProces
 
 #[cfg(windows)]
 #[inline]
-pub(crate) fn should_allow_everyone_create_on_windows(postfix: &str) -> bool {
+pub(crate) fn is_windows_main_or_service_ipc(postfix: &str) -> bool {
     postfix.is_empty() || hbb_common::config::is_service_ipc_postfix(postfix)
+}
+
+/// Listeners that get the main channel's restricted pipe ACL. "_managed_chat_push" is the
+/// GUI-hosted listener --server connects to (as a client) to relay an incoming chat message back
+/// for push_global_event. Its client is SYSTEM and its server the signed-in user, which the main
+/// channel's server check rejects, so --server checks it with is_own_pipe_server_in_session.
+#[cfg(windows)]
+#[inline]
+pub(crate) fn is_windows_restricted_listener_ipc(postfix: &str) -> bool {
+    is_windows_main_or_service_ipc(postfix) || postfix == "_managed_chat_push"
 }
 
 #[cfg(windows)]
@@ -133,6 +143,41 @@ fn windows_portable_service_ipc_allows_logon_helper_executable(
         };
         portable_service_helper_is_trusted(_peer_exe, &expected, &current_exe)
     }
+}
+
+// RustDrop ships as a separate executable installed alongside RustDesk (see
+// rustdrop_architecture doc section 08 - same folder, separate installer) and
+// asks --server for this device's identity over the main ("") IPC channel
+// (Data::GetDeviceCredentialRequest in ipc.rs). It's a different binary, so
+// the default peer == current_exe check below rejects it; this grants the
+// same "installed next to RustDesk.exe" trust as the macOS GUI/service pair
+// above, without a content-hash check since - unlike the portable-service
+// helper, which is a renamed copy of RustDesk.exe itself - there's no
+// single "expected" RustDrop binary to hash against. Path containment
+// (`C:\Program Files\RustDesk\`, Administrators-writable only) is the trust
+// boundary, matching the doc's "no new elevation, no new ACL work" call.
+#[cfg(target_os = "windows")]
+#[inline]
+fn windows_main_ipc_allows_rustdrop_executable(
+    peer_exe: &Path,
+    current_exe: &Path,
+    postfix: &str,
+) -> bool {
+    if !postfix.is_empty() {
+        return false;
+    }
+    let (Some(peer_dir), Some(current_dir)) = (peer_exe.parent(), current_exe.parent()) else {
+        return false;
+    };
+    if !executable_paths_match(peer_dir, current_dir) {
+        return false;
+    }
+    let Some(peer_name) = peer_exe.file_name() else {
+        return false;
+    };
+    let peer_name = peer_name.to_string_lossy();
+    peer_name.eq_ignore_ascii_case("RustDrop.exe")
+        || peer_name.eq_ignore_ascii_case("RustDrop-service.exe")
 }
 
 #[cfg(windows)]
@@ -483,6 +528,10 @@ fn ensure_peer_executable_matches_current_by_pid(peer_pid: u32, postfix: &str) -
     if windows_portable_service_ipc_allows_logon_helper_executable(&peer_exe, postfix) {
         return Ok(());
     }
+    #[cfg(target_os = "windows")]
+    if windows_main_ipc_allows_rustdrop_executable(&peer_exe, &current_exe, postfix) {
+        return Ok(());
+    }
     bail!(
         "Peer executable path mismatch on ipc channel '{}': peer_pid={}, peer_exe='{}', current_exe='{}'",
         postfix,
@@ -517,7 +566,9 @@ pub(crate) fn ensure_peer_executable_matches_current_by_fd(
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-const UNAUTHORIZED_IPC_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+// A tray in another session (RDP beside the console) retries every second for as long as both stay
+// signed in; at 5 s that was ~17,000 lines a day.
+const UNAUTHORIZED_IPC_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[inline]
@@ -640,6 +691,9 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
         return false;
     }
     if let Err(err) = ensure_peer_executable_matches_current_by_pid_opt(peer_pid, postfix) {
+        if end_stale_update_backup_peer(peer_pid) {
+            return false;
+        }
         log::warn!(
             "Rejected unauthorized connection on ipc channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
             postfix,
@@ -647,6 +701,112 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
             err
         );
         return false;
+    }
+    true
+}
+
+/// "_managed_chat_push" is served by the signed-in user's GUI, and --server (SYSTEM) is its only
+/// client. A non-elevated GUI cannot open a SYSTEM process at all (OpenProcess and
+/// ProcessIdToSessionId fail with access denied), so the main channel's SYSTEM, session and
+/// executable checks would reject --server here. The pipe records the client's session itself:
+/// only a process in this session, not another user's, may push events into the main window.
+#[cfg(windows)]
+pub(crate) fn authorize_windows_same_session_pipe_client(stream: &Connection, postfix: &str) -> bool {
+    use windows::Win32::System::Pipes::GetNamedPipeClientSessionId;
+    let pipe = stream.inner.get_ref().as_raw_handle();
+    let mut session = 0u32;
+    let known = !pipe.is_null()
+        && unsafe { GetNamedPipeClientSessionId(HANDLE(pipe), &mut session as *mut u32) }.is_ok();
+    let client_session = known.then_some(session);
+    let own_session = crate::platform::windows::get_current_process_session_id();
+    if client_session.is_some() && client_session == own_session {
+        return true;
+    }
+    log_rejected_windows_ipc_connection(
+        postfix,
+        stream.peer_pid(),
+        client_session,
+        own_session,
+        None,
+        None,
+    );
+    false
+}
+
+/// The --server side of the same channel: its pipe name is machine-wide, so before a decrypted
+/// chat event is sent, the pipe's server must be this app's own executable in this session (a
+/// pipe another user created first would otherwise receive it). SYSTEM can open any process.
+#[cfg(windows)]
+pub(crate) fn is_own_pipe_server_in_session(
+    stream: &ConnectionTmpl<parity_tokio_ipc::ConnectionClient>,
+    postfix: &str,
+) -> bool {
+    use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    let pipe = stream.inner.get_ref().as_raw_handle();
+    let mut pid = 0u32;
+    let known = !pipe.is_null()
+        && unsafe { GetNamedPipeServerProcessId(HANDLE(pipe), &mut pid as *mut u32) }.is_ok()
+        && pid != 0;
+    if !known {
+        log::warn!("ipc '{}': pipe server process unknown; not sending", postfix);
+        return false;
+    }
+    let server_session = crate::platform::windows::get_session_id_of_process(pid);
+    let own_session = crate::platform::windows::get_current_process_session_id();
+    if server_session.is_none() || server_session != own_session {
+        log::warn!(
+            "ipc '{}': pipe server pid {} is in session {:?}, not {:?}; not sending",
+            postfix,
+            pid,
+            server_session,
+            own_session
+        );
+        return false;
+    }
+    if let Err(err) = ensure_peer_executable_matches_current_by_pid(pid, postfix) {
+        log::warn!("ipc '{}': pipe server pid {} rejected: {}", postfix, pid, err);
+        return false;
+    }
+    true
+}
+
+/// A peer running `<our exe>.rdupdatebak` is this app's own pre-update binary that an update's
+/// taskkill missed: the update renamed it aside, so it can never pass the executable check and
+/// retries forever (seen: ~2,850 rejections an hour for a day) while the user's tray or window is
+/// that stale, disconnected copy. End it once, so the tray watchdog starts the current one.
+#[cfg(windows)]
+fn end_stale_update_backup_peer(peer_pid: Option<u32>) -> bool {
+    static TRIED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let Some(pid) = peer_pid else {
+        return false;
+    };
+    let (Ok(peer_exe), Ok(current_exe)) =
+        (peer_exe_canonical_path_by_pid(pid), current_exe_canonical_path())
+    else {
+        return false;
+    };
+    let mut backup = current_exe.into_os_string();
+    backup.push(".rdupdatebak");
+    if !executable_paths_match(&peer_exe, Path::new(&backup)) {
+        return false;
+    }
+    let mut tried = TRIED.lock().unwrap();
+    if tried.contains(&pid) {
+        return true;
+    }
+    tried.push(pid);
+    match crate::platform::windows::nt_terminate_process(pid) {
+        Ok(()) => log::warn!(
+            "ipc: ended pid {} still running the pre-update binary '{}'",
+            pid,
+            peer_exe.display()
+        ),
+        Err(err) => log::warn!(
+            "ipc: pid {} still running the pre-update binary '{}' could not be ended: {}",
+            pid,
+            peer_exe.display(),
+            err
+        ),
     }
     true
 }
@@ -926,6 +1086,17 @@ mod tests {
             Some(1),
             Some(1)
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_restricted_ipc_policy() {
+        assert!(super::is_windows_main_or_service_ipc(""));
+        assert!(super::is_windows_main_or_service_ipc("_service"));
+        assert!(!super::is_windows_main_or_service_ipc("_portable_service"));
+        assert!(!super::is_windows_main_or_service_ipc("_managed_chat_push"));
+        assert!(super::is_windows_restricted_listener_ipc("_managed_chat_push"));
+        assert!(!super::is_windows_restricted_listener_ipc("_cm"));
     }
 
     #[cfg(all(windows, not(feature = "flutter")))]

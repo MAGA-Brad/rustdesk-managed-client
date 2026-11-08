@@ -27,11 +27,10 @@ class _KBImage extends StatelessWidget {
   final double imageWidth;
   final RxString chosenType;
   const _KBImage({
-    Key? key,
     required this.kbLayoutType,
     required this.imageWidth,
     required this.chosenType,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -69,12 +68,11 @@ class _KBChooser extends StatelessWidget {
   final RxString chosenType;
   final KBChosenCallback cb;
   const _KBChooser({
-    Key? key,
     required this.kbLayoutType,
     required this.imageWidth,
     required this.chosenType,
     required this.cb,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -127,13 +125,13 @@ class KBLayoutTypeChooser extends StatelessWidget {
   final double dividerWidth;
   final KBChosenCallback cb;
   KBLayoutTypeChooser({
-    Key? key,
+    super.key,
     required this.chosenType,
     required this.width,
     required this.height,
     required this.dividerWidth,
     required this.cb,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -184,7 +182,7 @@ String getLocalPlatformForKBLayoutType(String peerPlatform) {
   return localPlatform;
 }
 
-showKBLayoutTypeChooserIfNeeded(
+Future<void> showKBLayoutTypeChooserIfNeeded(
   String peerPlatform,
   OverlayDialogManager dialogManager,
 ) async {
@@ -192,7 +190,7 @@ showKBLayoutTypeChooserIfNeeded(
   if (localPlatform == '') {
     return;
   }
-  KBLayoutType.value = bind.getLocalKbLayoutType();
+  KBLayoutType.value = bind.crateFlutterFfiGetLocalKbLayoutType();
   if (KBLayoutType.value == _kKBLayoutTypeISO ||
       KBLayoutType.value == _kKBLayoutTypeNotISO) {
     return;
@@ -200,7 +198,7 @@ showKBLayoutTypeChooserIfNeeded(
   showKBLayoutTypeChooser(localPlatform, dialogManager);
 }
 
-showKBLayoutTypeChooser(
+void showKBLayoutTypeChooser(
   String localPlatform,
   OverlayDialogManager dialogManager,
 ) {
@@ -214,8 +212,8 @@ showKBLayoutTypeChooser(
           height: 200,
           dividerWidth: 4.0,
           cb: (String v) async {
-            await bind.setLocalKbLayoutType(kbLayoutType: v);
-            KBLayoutType.value = bind.getLocalKbLayoutType();
+            await bind.crateFlutterFfiSetLocalKbLayoutType(kbLayoutType: v);
+            KBLayoutType.value = bind.crateFlutterFfiGetLocalKbLayoutType();
             return v == KBLayoutType.value;
           }),
       actions: [dialogButton('Close', onPressed: close)],

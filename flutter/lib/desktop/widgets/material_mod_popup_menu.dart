@@ -72,7 +72,7 @@ enum PopupMenuPosition {
 abstract class PopupMenuEntry<T> extends StatefulWidget {
   /// Abstract const constructor. This constructor enables subclasses to provide
   /// const constructors so that they can be used in const expressions.
-  const PopupMenuEntry({Key? key}) : super(key: key);
+  const PopupMenuEntry({super.key});
 
   /// The amount of vertical space occupied by this entry.
   ///
@@ -111,8 +111,7 @@ class PopupMenuDivider extends PopupMenuEntry<Never> {
   /// Creates a horizontal divider for a popup menu.
   ///
   /// By default, the divider has a height of 16 logical pixels.
-  const PopupMenuDivider({Key? key, this.height = _kMenuDividerHeight})
-      : super(key: key);
+  const PopupMenuDivider({super.key, this.height = _kMenuDividerHeight});
 
   /// The height of the divider entry.
   ///
@@ -138,10 +137,9 @@ class _PopupMenuDividerState extends State<PopupMenuDivider> {
 // item lines up with the center of its PopupMenuButton.
 class _MenuItem extends SingleChildRenderObjectWidget {
   const _MenuItem({
-    Key? key,
     required this.onLayout,
-    required Widget? child,
-  }) : super(key: key, child: child);
+    required super.child,
+  });
 
   final ValueChanged<Size> onLayout;
 
@@ -230,7 +228,7 @@ class PopupMenuItem<T> extends PopupMenuEntry<T> {
   ///
   /// The `enabled` and `height` arguments must not be null.
   const PopupMenuItem({
-    Key? key,
+    super.key,
     this.value,
     this.onTap,
     this.enabled = true,
@@ -239,7 +237,7 @@ class PopupMenuItem<T> extends PopupMenuEntry<T> {
     this.textStyle,
     this.mouseCursor,
     required this.child,
-  }) : super(key: key);
+  });
 
   /// The value that will be returned by [showMenu] if this entry is selected.
   final T? value;
@@ -280,15 +278,15 @@ class PopupMenuItem<T> extends PopupMenuEntry<T> {
   /// widget.
   ///
   /// If [mouseCursor] is a [MaterialStateProperty<MouseCursor>],
-  /// [MaterialStateProperty.resolve] is used for the following [MaterialState]s:
+  /// [WidgetStateProperty.resolve] is used for the following [WidgetState]s:
   ///
-  ///  * [MaterialState.hovered].
-  ///  * [MaterialState.focused].
-  ///  * [MaterialState.disabled].
+  ///  * [WidgetState.hovered].
+  ///  * [WidgetState.focused].
+  ///  * [WidgetState.disabled].
   /// {@endtemplate}
   ///
   /// If null, then the value of [PopupMenuThemeData.mouseCursor] is used. If
-  /// that is also null, then [MaterialStateMouseCursor.clickable] is used.
+  /// that is also null, then [WidgetStateMouseCursor.clickable] is used.
   final MouseCursor? mouseCursor;
 
   /// The widget below this widget in the tree.
@@ -466,21 +464,14 @@ class CheckedPopupMenuItem<T> extends PopupMenuItem<T> {
   ///
   /// The `checked` and `enabled` arguments must not be null.
   const CheckedPopupMenuItem({
-    Key? key,
-    T? value,
+    super.key,
+    super.value,
     this.checked = false,
-    bool enabled = true,
-    EdgeInsets? padding,
-    double height = kMinInteractiveDimension,
-    Widget? child,
-  }) : super(
-          key: key,
-          value: value,
-          enabled: enabled,
-          padding: padding,
-          height: height,
-          child: child,
-        );
+    super.enabled,
+    super.padding,
+    super.height,
+    super.child,
+  });
 
   /// Whether to display a checkmark next to the menu item.
   ///
@@ -548,11 +539,11 @@ class _CheckedPopupMenuItemState<T>
 
 class _PopupMenu<T> extends StatelessWidget {
   const _PopupMenu({
-    Key? key,
+    super.key,
     required this.route,
     required this.semanticLabel,
     this.constraints,
-  }) : super(key: key);
+  });
 
   final _PopupMenuRoute<T> route;
   final String? semanticLabel;
@@ -854,8 +845,8 @@ class _PopupMenuRoute<T> extends PopupRoute<T> {
       semanticLabel: semanticLabel,
       constraints: constraints,
     );
-    if (this.menuWrapper != null) {
-      menu = this.menuWrapper!(menu);
+    if (menuWrapper != null) {
+      menu = menuWrapper!(menu);
     }
     final MediaQueryData mediaQuery = MediaQuery.of(context);
     return MediaQuery.removePadding(
@@ -889,13 +880,12 @@ class _PopupMenuRoute<T> extends PopupRoute<T> {
 
 class PopupMenu<T> extends StatelessWidget {
   PopupMenu({
-    Key? key,
+    super.key,
     required this.items,
     this.initialValue,
     this.semanticLabel,
     this.constraints,
-  })  : itemSizes = List<Size?>.filled(items.length, null),
-        super(key: key);
+  }) : itemSizes = List<Size?>.filled(items.length, null);
 
   final List<PopupMenuEntry<T>> items;
   final List<Size?> itemSizes;
@@ -1134,7 +1124,7 @@ class PopupMenuButton<T> extends StatefulWidget {
   ///
   /// The [itemBuilder] argument must not be null.
   const PopupMenuButton({
-    Key? key,
+    super.key,
     required this.itemBuilder,
     this.menuWrapper,
     this.initialValue,
@@ -1155,11 +1145,10 @@ class PopupMenuButton<T> extends StatefulWidget {
     this.enableFeedback,
     this.constraints,
     this.position = PopupMenuPosition.over,
-  })  : assert(
+  }) : assert(
           !(child != null && icon != null),
           'You can only pass [child] or [icon], not both.',
-        ),
-        super(key: key);
+        );
 
   /// Called when the button is pressed to create the items to show in the menu.
   final PopupMenuItemBuilder<T> itemBuilder;
@@ -1415,18 +1404,17 @@ class PopupMenuButtonState<T> extends State<PopupMenuButton<T>> {
 // resolves the property against MaterialState.disabled, MaterialState.hovered,
 // MaterialState.focused.
 // ignore: unused_element
-class _EffectiveMouseCursor extends MaterialStateMouseCursor {
+class _EffectiveMouseCursor extends WidgetStateMouseCursor {
   const _EffectiveMouseCursor(this.widgetCursor, this.themeCursor);
 
   final MouseCursor? widgetCursor;
-  final MaterialStateProperty<MouseCursor?>? themeCursor;
+  final WidgetStateProperty<MouseCursor?>? themeCursor;
 
   @override
-  MouseCursor resolve(Set<MaterialState> states) {
-    return MaterialStateProperty.resolveAs<MouseCursor?>(
-            widgetCursor, states) ??
+  MouseCursor resolve(Set<WidgetState> states) {
+    return WidgetStateProperty.resolveAs<MouseCursor?>(widgetCursor, states) ??
         themeCursor?.resolve(states) ??
-        MaterialStateMouseCursor.clickable.resolve(states);
+        WidgetStateMouseCursor.clickable.resolve(states);
   }
 
   @override

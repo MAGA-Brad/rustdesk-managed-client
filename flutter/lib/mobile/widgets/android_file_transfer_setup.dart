@@ -13,7 +13,7 @@ const _folderChoiceSpacing = 4.0;
 enum _FolderChoice { workspace, other, skip }
 
 Future<bool> showAndroidFileTransferSetup(FFI ffi) async {
-  if (bind.getLocalFlutterOption(k: _setupOption) == 'Y' ||
+  if (bind.crateFlutterFfiGetLocalFlutterOption(k: _setupOption) == 'Y' ||
       !_canConfigureSharedFolder(ffi)) {
     return true;
   }
@@ -37,7 +37,7 @@ Future<bool> showAndroidFileTransferSetup(FFI ffi) async {
       case _FolderChoice.skip:
         break;
     }
-    await bind.setLocalFlutterOption(k: _setupOption, v: 'Y');
+    await bind.crateFlutterFfiSetLocalFlutterOption(k: _setupOption, v: 'Y');
     return true;
   } catch (error) {
     showToast(error.toString());
@@ -46,13 +46,13 @@ Future<bool> showAndroidFileTransferSetup(FFI ffi) async {
 }
 
 bool _canConfigureSharedFolder(FFI ffi) =>
-    !bind.isOutgoingOnly() &&
-    !bind.isDisableSettings() &&
-    bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) != 'Y' &&
+    !bind.crateFlutterFfiIsOutgoingOnly() &&
+    !bind.crateFlutterFfiIsDisableSettings() &&
+    bind.crateFlutterFfiMainGetBuildinOption(key: kOptionHideSecuritySetting) != 'Y' &&
     (!ffi.serverModel.clients.any((client) => !client.disconnected) ||
         option2bool(
             kOptionEnablePermChangeInAcceptWindow,
-            bind.mainGetBuildinOption(
+            bind.crateFlutterFfiMainGetBuildinOption(
                 key: kOptionEnablePermChangeInAcceptWindow)));
 
 CustomAlertDialog _setupDialog(void Function([dynamic]) close) {

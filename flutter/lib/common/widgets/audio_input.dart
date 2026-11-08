@@ -14,22 +14,23 @@ class AudioInput extends StatelessWidget {
   final bool isVoiceCall;
 
   const AudioInput(
-      {Key? key,
+      {super.key,
       required this.builder,
       required this.isCm,
-      required this.isVoiceCall})
-      : super(key: key);
+      required this.isVoiceCall});
 
   static String getDefault() {
-    if (bind.mainAudioSupportLoopback()) return translate(_kSystemSound);
+    if (bind.crateFlutterFfiMainAudioSupportLoopback()) {
+      return translate(_kSystemSound);
+    }
     return '';
   }
 
   static Future<String> getAudioInput(bool isCm, bool isVoiceCall) {
     if (isVoiceCall) {
-      return bind.getVoiceCallInputDevice(isCm: isCm);
+      return bind.crateFlutterFfiGetVoiceCallInputDevice(isCm: isCm);
     } else {
-      return bind.mainGetOption(key: 'audio-input');
+      return bind.crateFlutterFfiMainGetOption(key: 'audio-input');
     }
   }
 
@@ -46,16 +47,19 @@ class AudioInput extends StatelessWidget {
       String device, bool isCm, bool isVoiceCall) async {
     if (device == getDefault()) device = '';
     if (isVoiceCall) {
-      await bind.setVoiceCallInputDevice(isCm: isCm, device: device);
+      await bind.crateFlutterFfiSetVoiceCallInputDevice(
+          isCm: isCm, device: device);
     } else {
-      await bind.mainSetOption(key: 'audio-input', value: device);
+      await bind.crateFlutterFfiMainSetOption(
+          key: 'audio-input', value: device);
     }
   }
 
   static Future<Map<String, Object>> getDevicesInfo(
       bool isCm, bool isVoiceCall) async {
-    List<String> devices = (await bind.mainGetSoundInputs()).toList();
-    if (bind.mainAudioSupportLoopback()) {
+    List<String> devices =
+        (await bind.crateFlutterFfiMainGetSoundInputs()).toList();
+    if (bind.crateFlutterFfiMainAudioSupportLoopback()) {
       devices.insert(0, translate(_kSystemSound));
     }
     String current = await getValue(isCm, isVoiceCall);

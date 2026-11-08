@@ -12,6 +12,9 @@ rust-version = "1.75"
 name = "librustdesk"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(frb_expand)"] }
+
 [[bin]]
 name = "naming"
 path = "src/naming.rs"
@@ -20,6 +23,11 @@ path = "src/naming.rs"
 name = "service"
 path = "src/service.rs"
 
+[[bin]]
+name = "rdc-gateway"
+path = "src/rdc_gateway.rs"
+required-features = ["rdc_gateway"]
+
 [features]
 inline = []
 use_samplerate = ["samplerate", "libsamplerate-sys"]
@@ -27,6 +35,9 @@ use_rubato = ["rubato"]
 use_dasp = ["dasp"]
 flutter = ["flutter_rust_bridge"]
 default = ["use_dasp"]
+# RustDWeb gateway (Linux): the managed core in one headless process, like RDC for Android.
+# "flutter" because that is upstream's Linux client configuration (it leaves out the Sciter UI).
+rdc_gateway = ["flutter", "dep:rcgen", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:x25519-dalek", "dep:x509-parser", "dep:http"]
 hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
@@ -46,6 +57,7 @@ unix-file-copy-paste = [
     "clipboard/unix-file-copy-paste",
 ]
 screencapturekit = ["cpal/screencapturekit"]
+flutter_rust_bridge = ["dep:flutter_rust_bridge"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -61,6 +73,9 @@ serde_repr = "0.1"
 cfg-if = "1.0"
 lazy_static = "1.4"
 sha2 = "0.10"
+hkdf = "0.12"
+sodiumoxide = "0.2"
+futures = "0.3"
 repng = "0.2"
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -75,7 +90,7 @@ num_cpus = "1.15"
 bytes = { version = "1.4", features = ["serde"] }
 default-net = "0.14"
 wol-rs = "1.0"
-flutter_rust_bridge = { version = "=1.80", features = ["uuid"], optional = true}
+flutter_rust_bridge = { version = "=2.12.0", features = ["uuid"], optional = true }
 errno = "0.3"
 rdev = { git = "https://github.com/rustdesk-org/rdev" }
 url = { version = "2.3", features = ["serde"] }
@@ -88,7 +103,16 @@ shutdown_hooks = "0.1"
 totp-rs = { version = "5.4", default-features = false, features = ["gen_secret", "otpauth"] }
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys", branch = "rustdesk-patches" }
-reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd"], default-features=false }
+# "stream" (beyond upstream's own feature set) is needed for RustDrop's chunked
+# upload/download bodies (rustdrop_rds_client.rs).
+reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd", "stream"], default-features=false }
+# Not part of upstream's own direct dependencies (they get tungstenite transitively -
+# see the tungstenite patch note below); managed_chat.rs and the managed gateway use
+# tokio_tungstenite directly. Same fork and rev as hbb_common, so there is one copy and it is
+# the 0.29 the tungstenite patch below applies to (0.26 pulled an unpatched tungstenite 0.26).
+tokio-tungstenite = { git = "https://github.com/rustdesk-org/tokio-tungstenite", rev = "c241b11b03de4881faf1ecd2fe6e867c92f3013b", version = "0.29", features = ["native-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# Local, per-device managed-chat history store (bundled: no system sqlite3 dependency).
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
@@ -109,11 +133,26 @@ portable-pty = { git = "https://github.com/rustdesk-org/wezterm", branch = "rust
 
 system_shutdown = "4.0"
 qrcode-generator = "4.1"
+# RustDrop sends a folder as one stored (uncompressed) zip; its own zstd step compresses.
+zip = { version = "9.4", default-features = false, features = ["chrono"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Managed RDS TLS: public roots only + the device's edge client certificate (managed_edge_cert.rs),
+# and the sealed end-to-end envelope for RDS API calls (managed_sealed.rs).
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+ring = "0.17"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+x509-parser = "0.16"
+http = "1"
 winapi = { version = "0.3", features = [
     "winuser",
     "wincrypt",
+    "dpapi",
+    "sddl",
+    "minwinbase",
+    "fileapi",
     "shellscalingapi",
     "pdh",
     "synchapi",
@@ -141,6 +180,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
@@ -204,6 +244,14 @@ terminfo = "0.8"
 winit = "0.30"
 wayland-client = "0.31"
 xkbcommon-dl = { version = "0.4", features = ["x11"] }
+# --features rdc_gateway only (see [features]).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+ring = { version = "0.17", optional = true }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"], optional = true }
+x509-parser = { version = "0.16", optional = true }
+http = { version = "1", optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
@@ -211,6 +259,15 @@ openssl = { version = "0.10", features = ["vendored"] }
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13"
 jni = "0.21"
+# Managed builds: the sealed end-to-end envelope for RDS API calls (managed_sealed.rs) and the edge
+# client certificate (managed_edge_cert.rs), as on Windows.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+ring = "0.17"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+x509-parser = "0.16"
+http = "1"
 android-wakelock = { git = "https://github.com/rustdesk-org/android-wakelock" }
 
 [workspace]
@@ -219,14 +276,26 @@ exclude = ["vdi/host"]
 
 # Patch libxdo-sys to use a stub implementation that doesn't require libxdo
 # This allows building and running on systems without libxdo installed (e.g., Wayland-only)
+#
+# libsodium-sys: adds SODIUM_LIB_DIR_<TARGET> (checked before plain
+# SODIUM_LIB_DIR) so a real x64-host cross-compile to aarch64-pc-windows-msvc
+# can point the host-arch build (a build-dependency, always native) and the
+# target-arch build (the actual arm64 binary) at two different libsodium
+# libs - upstream's single global SODIUM_LIB_DIR can't distinguish them, and
+# aarch64 Windows has no libsodium prebuilt/from-source path otherwise, only
+# the vcpkg-built static lib. See libs/libsodium-sys-patched/build.rs.
 [patch.crates-io]
 libxdo-sys = { path = "libs/libxdo-sys-stub" }
+libsodium-sys = { path = "libs/libsodium-sys-patched" }
+
 # Upstream reserves a frame's whole declared length as soon as its header is in, so a header alone
 # buys an allocation the size it names, bounded only by max_frame_size. This fork grows the read
 # buffer one read_buffer_size chunk at a time as the bytes actually arrive. Patched rather than
 # depended on directly, so tokio-tungstenite's own tungstenite resolves to the same copy.
 tungstenite = { git = "https://github.com/rustdesk-org/tungstenite-rs", rev = "efce47e5364f00a63302cf07ab1fb13ded478914" }
-# One branch off upstream v0.13.0, the tag whose crate versions match this stack.
+# Vendored from crates.io 0.17.3 with the rustdesk-org/webrtc rustdesk-patches-0.13 commits
+# (49c89bd8) ported on top; the other webrtc crates come from crates.io unpatched. Upstream 0.17
+# already lowers sctp's INITIAL_MTU to 1191 (#807), so that part of the sctp fix is its own now.
 # webrtc-util: reads the Windows adapter list's IPv6 addresses as host-order u16 groups, so every
 # one comes out byte-swapped, fails to bind, and ICE gathers no IPv6 host candidate on Windows;
 # and names every Windows adapter "" with no mask, so ICE cannot tell one adapter's addresses
@@ -248,12 +317,22 @@ tungstenite = { git = "https://github.com/rustdesk-org/tungstenite-rs", rev = "e
 # whole backlog behind itself while a short lost tail still comes back at once. A DATA chunk
 # received again is listed in the SACK, which never happened - the sender widens its reordering
 # window on that - and the SACK keeps to the MTU too, the lowest gap blocks first.
-# Pinned by rev, not branch: a fork branch can be rewritten out from under the lockfile.
 # webrtc: SettingEngine cannot reach the ICE agent's max_binding_requests, which decides how
 # long the answerer keeps checking a pair that has not answered yet.
-webrtc = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
-webrtc-util = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
-webrtc-sctp = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+webrtc = { path = "libs/webrtc-patched/webrtc" }
+webrtc-util = { path = "libs/webrtc-patched/util" }
+webrtc-sctp = { path = "libs/webrtc-patched/sctp" }
+webrtc-ice = { path = "libs/webrtc-patched/ice" }
+
+# Vendored hwcodec 0.8.0 (pinned upstream commit ec38eba) with build fixes for
+# newer FFmpeg (post FF_API_FRAME_KEY / FF_PROFILE_* removal): key_frame now
+# read via AV_FRAME_FLAG_KEY, and AV_PROFILE_H264_HIGH/AV_PROFILE_HEVC_MAIN
+# replace the removed FF_PROFILE_* constants; the RAM decoder targets the real
+# GPU adapter explicitly; and its own [workspace]. Not yet upstreamed. Build it
+# against the repo's overlay FFmpeg (res/vcpkg, amf/nvcodec/qsv): 0.8 encodes
+# only through FFmpeg.
+[patch."https://github.com/rustdesk-org/hwcodec"]
+hwcodec = { path = "libs/hwcodec-patched" }
 
 [package.metadata.winres]
 LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."
@@ -273,7 +352,7 @@ os-version = "0.2"
 [dev-dependencies]
 hound = "3.5"
 docopt = "1.1"
-tokio = "1.44"
+tokio = { version = "1.44", features = ["test-util"] }
 
 [package.metadata.bundle]
 name = "RustDesk"
@@ -283,8 +362,11 @@ osx_minimum_system_version = "10.14"
 
 #https://github.com/johnthagen/min-sized-rust
 [profile.release]
-lto = true
-codegen-units = 1
+# Thin LTO with the default 16 codegen units: the final crate's codegen and
+# LTO run in parallel instead of on one core (fat LTO + 1 unit took ~13 min
+# on the x64 build VM for every change).
+lto = "thin"
+codegen-units = 16
 panic = 'abort'
 strip = true
 #opt-level = 'z' # only have smaller size after strip

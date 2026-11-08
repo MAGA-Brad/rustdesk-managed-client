@@ -9,9 +9,9 @@ import 'package:provider/provider.dart';
 class DesktopRemoteScreen extends StatelessWidget {
   final Map<String, dynamic> params;
 
-  DesktopRemoteScreen({Key? key, required this.params}) : super(key: key) {
-      bind.mainInitInputSource();
-      stateGlobal.getInputSource(force: true);
+  DesktopRemoteScreen({super.key, required this.params}) {
+    bind.crateFlutterFfiMainInitInputSource();
+    stateGlobal.getInputSource(force: true);
   }
 
   @override

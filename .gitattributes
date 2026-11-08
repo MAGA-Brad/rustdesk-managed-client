@@ -1,1 +1,8 @@
 * text=auto
+
+# Patch files are applied by POSIX `patch`/`git apply` against freshly-cloned
+# (LF) sources - `text=auto`'s platform-native normalization (CRLF on a
+# Windows checkout with core.autocrlf enabled) bakes CRLF into whatever line
+# each patch touches, producing a corrupted target file with one stray \r
+# line that trips shell parsers (e.g. ffmpeg's ./configure). Always LF.
+res/vcpkg/**/*.patch text eol=lf

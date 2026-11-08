@@ -77,7 +77,7 @@ class KeyboardShortcutsPageBodyState extends State<KeyboardShortcutsPageBody> {
   // ----- Persistence helpers -----
 
   Map<String, dynamic> _readJson() {
-    final raw = bind.mainGetLocalOption(key: kShortcutLocalConfigKey);
+    final raw = bind.crateFlutterFfiMainGetLocalOption(key: kShortcutLocalConfigKey);
     if (raw.isEmpty) return {'enabled': false, 'bindings': <dynamic>[]};
     try {
       final parsed = jsonDecode(raw) as Map<String, dynamic>;
@@ -90,12 +90,12 @@ class KeyboardShortcutsPageBodyState extends State<KeyboardShortcutsPageBody> {
   }
 
   Future<void> _writeJson(Map<String, dynamic> json) async {
-    await bind.mainSetLocalOption(
+    await bind.crateFlutterFfiMainSetLocalOption(
         key: kShortcutLocalConfigKey, value: jsonEncode(json));
     // Refresh the matcher cache so writes take effect immediately. On native
     // this hits the Rust matcher; on Web the bridge forwards to the JS-side
     // matcher in flutter/web/js/.
-    bind.mainReloadKeyboardShortcuts();
+    bind.crateFlutterFfiMainReloadKeyboardShortcuts();
     if (mounted) setState(() {});
   }
 
@@ -138,7 +138,7 @@ class KeyboardShortcutsPageBodyState extends State<KeyboardShortcutsPageBody> {
     // and the action-list filter below, so the three can never disagree on
     // which actions belong on this platform.
     json['bindings'] = filterDefaultBindingsForPlatform(
-      jsonDecode(bind.mainGetDefaultKeyboardShortcuts()) as List,
+      jsonDecode(bind.crateFlutterFfiMainGetDefaultKeyboardShortcuts()) as List,
       ShortcutModel.currentPlatformCapabilities(),
     );
     await _writeJson(json);

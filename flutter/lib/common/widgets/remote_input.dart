@@ -137,7 +137,7 @@ class _RawTouchGestureDetectorRegionState
             _lastTapDownPositionForMouseMode!.dy);
   }
 
-  onTapDown(TapDownDetails d) async {
+  Future<void> onTapDown(TapDownDetails d) async {
     lastDeviceKind = d.kind;
     _lastTapDownGlobalPosition = d.globalPosition;
     if (isNotTouchBasedDevice()) {
@@ -152,7 +152,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onTapUp(TapUpDetails d) async {
+  Future<void> onTapUp(TapUpDetails d) async {
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
     if (isNotTouchBasedDevice()) {
@@ -175,7 +175,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onTap() async {
+  Future<void> onTap() async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -195,7 +195,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onDoubleTapDown(TapDownDetails d) async {
+  Future<void> onDoubleTapDown(TapDownDetails d) async {
     lastDeviceKind = d.kind;
     if (isNotTouchBasedDevice()) {
       return;
@@ -208,7 +208,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onDoubleTap() async {
+  Future<void> onDoubleTap() async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -229,7 +229,7 @@ class _RawTouchGestureDetectorRegionState
     await inputModel.tap(MouseButtons.left);
   }
 
-  onLongPressDown(LongPressDownDetails d) async {
+  Future<void> onLongPressDown(LongPressDownDetails d) async {
     lastDeviceKind = d.kind;
     if (isNotTouchBasedDevice()) {
       return;
@@ -251,7 +251,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onLongPressUp() async {
+  Future<void> onLongPressUp() async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -261,7 +261,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   // for mobiles
-  onLongPress() async {
+  Future<void> onLongPress() async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -285,7 +285,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onLongPressMoveUpdate(LongPressMoveUpdateDetails d) async {
+  Future<void> onLongPressMoveUpdate(LongPressMoveUpdateDetails d) async {
     if (!ffiModel.isPeerMobile || isNotTouchBasedDevice()) {
       return;
     }
@@ -297,7 +297,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onDoubleFinerTapDown(TapDownDetails d) async {
+  Future<void> onDoubleFinerTapDown(TapDownDetails d) async {
     lastDeviceKind = d.kind;
     if (isNotTouchBasedDevice()) {
       return;
@@ -306,7 +306,7 @@ class _RawTouchGestureDetectorRegionState
     // ignore for desktop and mobile
   }
 
-  onDoubleFinerTap(TapDownDetails d) async {
+  Future<void> onDoubleFinerTap(TapDownDetails d) async {
     lastDeviceKind = d.kind;
     if (isNotTouchBasedDevice()) {
       return;
@@ -322,7 +322,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onHoldDragStart(DragStartDetails d) async {
+  Future<void> onHoldDragStart(DragStartDetails d) async {
     lastDeviceKind = d.kind;
     if (isNotTouchBasedDevice()) {
       return;
@@ -333,7 +333,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onHoldDragUpdate(DragUpdateDetails d) async {
+  Future<void> onHoldDragUpdate(DragUpdateDetails d) async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -343,7 +343,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onHoldDragEnd(DragEndDetails d) async {
+  Future<void> onHoldDragEnd(DragEndDetails d) async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -352,7 +352,8 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onOneFingerPanStart(BuildContext context, DragStartDetails d) async {
+  Future<void> onOneFingerPanStart(
+      BuildContext context, DragStartDetails d) async {
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
     lastDeviceKind = d.kind ?? lastDeviceKind;
@@ -404,7 +405,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onOneFingerPanUpdate(DragUpdateDetails d) async {
+  Future<void> onOneFingerPanUpdate(DragUpdateDetails d) async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -422,7 +423,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onOneFingerPanEnd(DragEndDetails d) async {
+  Future<void> onOneFingerPanEnd(DragEndDetails d) async {
     _touchModePanStarted = false;
     if (isNotTouchBasedDevice()) {
       return;
@@ -442,12 +443,12 @@ class _RawTouchGestureDetectorRegionState
   // or rejected by the gesture arena. Without this, the flag can remain
   // stuck in the "started" state and cause issues such as the Magic Mouse
   // double-click problem on iPad with magic mouse.
-  onOneFingerPanCancel() {
+  void onOneFingerPanCancel() {
     _touchModePanStarted = false;
   }
 
   // scale + pan event
-  onTwoFingerScaleStart(ScaleStartDetails d) {
+  void onTwoFingerScaleStart(ScaleStartDetails d) {
     _lastTapDownDetails = null;
     if (isNotTouchBasedDevice()) {
       return;
@@ -458,7 +459,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onTwoFingerScaleUpdate(ScaleUpdateDetails d) async {
+  Future<void> onTwoFingerScaleUpdate(ScaleUpdateDetails d) async {
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -480,7 +481,7 @@ class _RawTouchGestureDetectorRegionState
 
       if (scale != 0) {
         if (widget.isCamera) return;
-        await bind.sessionSendPointer(
+        await bind.crateFlutterFfiSessionSendPointer(
             sessionId: sessionId,
             msg: json.encode(
                 PointerEventToRust(kPointerEventKindTouch, 'scale', scale)
@@ -495,13 +496,13 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  onTwoFingerScaleEnd(ScaleEndDetails d) async {
+  Future<void> onTwoFingerScaleEnd(ScaleEndDetails d) async {
     if (isNotTouchBasedDevice()) {
       return;
     }
     if ((isDesktop || isWebDesktop)) {
       if (widget.isCamera) return;
-      await bind.sessionSendPointer(
+      await bind.crateFlutterFfiSessionSendPointer(
           sessionId: sessionId,
           msg: json.encode(
               PointerEventToRust(kPointerEventKindTouch, 'scale', 0).toJson()));
@@ -509,28 +510,30 @@ class _RawTouchGestureDetectorRegionState
       // mobile
       _scale = 1;
       // No idea why we need to set the view style to "" here.
-      // bind.sessionSetViewStyle(sessionId: sessionId, value: "");
+      // bind.crateFlutterFfiSessionSetViewStyle(sessionId: sessionId, value: "");
     }
     if (!isSpecialHoldDragActive) {
       await inputModel.sendMouse('up', MouseButtons.left);
     }
   }
 
-  get onHoldDragCancel => null;
-  get onThreeFingerVerticalDragUpdate => ffi.ffiModel.isPeerAndroid
-      ? null
-      : (d) {
-          _mouseScrollIntegral += d.delta.dy / 4;
-          if (_mouseScrollIntegral > 1) {
-            inputModel.scroll(1);
-            _mouseScrollIntegral = 0;
-          } else if (_mouseScrollIntegral < -1) {
-            inputModel.scroll(-1);
-            _mouseScrollIntegral = 0;
-          }
-        };
+  Null get onHoldDragCancel => null;
+  GestureDragUpdateCallback? get onThreeFingerVerticalDragUpdate =>
+      ffi.ffiModel.isPeerAndroid
+          ? null
+          : (d) {
+              _mouseScrollIntegral += d.delta.dy / 4;
+              if (_mouseScrollIntegral > 1) {
+                inputModel.scroll(1);
+                _mouseScrollIntegral = 0;
+              } else if (_mouseScrollIntegral < -1) {
+                inputModel.scroll(-1);
+                _mouseScrollIntegral = 0;
+              }
+            };
 
-  makeGestures(BuildContext context) {
+  Map<Type, GestureRecognizerFactory<GestureRecognizer>> makeGestures(
+      BuildContext context) {
     return <Type, GestureRecognizerFactory>{
       // Official
       TapGestureRecognizer:

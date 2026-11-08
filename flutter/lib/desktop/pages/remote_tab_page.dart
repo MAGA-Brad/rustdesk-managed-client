@@ -33,7 +33,7 @@ class _MenuTheme {
 class ConnectionTabPage extends StatefulWidget {
   final Map<String, dynamic> params;
 
-  const ConnectionTabPage({Key? key, required this.params}) : super(key: key);
+  const ConnectionTabPage({super.key, required this.params});
 
   @override
   State<ConnectionTabPage> createState() => _ConnectionTabPageState(params);
@@ -69,7 +69,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
         final remotePage = tabController.widget(id);
         if (remotePage is RemotePage) {
           final ffi = remotePage.ffi;
-          bind.setCurSessionId(sessionId: ffi.sessionId);
+          bind.crateFlutterFfiSetCurSessionId(sessionId: ffi.sessionId);
         }
         WindowController.fromWindowId(params['windowId'])
             .setTitle(getWindowNameWithId(id));
@@ -131,7 +131,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   @override
   Widget build(BuildContext context) {
     final child = Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.background,
+      backgroundColor: Theme.of(context).colorScheme.surface,
       body: DesktopTab(
         controller: tabController,
         onWindowCloseButton: handleWindowCloseButton,
@@ -187,6 +187,15 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
                     height: themeConf.iconSize,
                   ).paddingOnly(right: 5),
                 ),
+                // Managed builds: the route in front of the name ("Direct Office-PC" / "Relay Office-PC").
+                if (isManagedClientBuild())
+                  Text(
+                    direct ? 'Direct ' : 'Relay ',
+                    style: TextStyle(
+                        color: tabController.state.value.selectedTabInfo.key == key
+                            ? MyTheme.tabbar(context).selectedTextColor
+                            : MyTheme.tabbar(context).unSelectedTextColor),
+                  ),
                 label,
                 unreadMessageCountBuilder(UnreadChatCountState.find(key))
                     .marginOnly(left: 4),
@@ -304,8 +313,11 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     }
 
     if (perms['keyboard'] != false && !ffi.ffiModel.viewOnly) {
-      menu.add(RemoteMenuEntry.insertLock(sessionId, padding,
-          dismissFunc: cancelFunc));
+      // Managed builds never lock the remote computer.
+      if (!isManagedClientBuild()) {
+        menu.add(RemoteMenuEntry.insertLock(sessionId, padding,
+            dismissFunc: cancelFunc));
+      }
 
       if (pi.platform == kPeerPlatformLinux || pi.sasEnabled) {
         menu.add(RemoteMenuEntry.insertCtrlAltDel(sessionId, padding,
@@ -404,8 +416,10 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       return true;
     } else {
       final bool res;
-      if (!option2bool(kOptionEnableConfirmClosingTabs,
-          bind.mainGetLocalOption(key: kOptionEnableConfirmClosingTabs))) {
+      if (!option2bool(
+          kOptionEnableConfirmClosingTabs,
+          bind.crateFlutterFfiMainGetLocalOption(
+              key: kOptionEnableConfirmClosingTabs))) {
         res = true;
       } else {
         res = await closeConfirmDialog();
@@ -417,7 +431,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     }
   }
 
-  _update_remote_count() =>
+  int _update_remote_count() =>
       RemoteCountState.find().value = tabController.length;
 
   Future<dynamic> _remoteMethodHandler(call, fromWindowId) async {
@@ -564,8 +578,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
 class _RelativeMouseModeHint extends StatelessWidget {
   final DesktopTabController tabController;
 
-  const _RelativeMouseModeHint({Key? key, required this.tabController})
-      : super(key: key);
+  const _RelativeMouseModeHint({required this.tabController});
 
   @override
   Widget build(BuildContext context) {
@@ -597,9 +610,9 @@ class _RelativeMouseModeHint extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         margin: const EdgeInsets.only(right: 8),
         decoration: BoxDecoration(
-          color: Colors.orange.withOpacity(0.2),
+          color: Colors.orange.withValues(alpha: 0.2),
           borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: Colors.orange.withOpacity(0.5)),
+          border: Border.all(color: Colors.orange.withValues(alpha: 0.5)),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,

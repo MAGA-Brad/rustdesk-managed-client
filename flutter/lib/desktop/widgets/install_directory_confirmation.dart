@@ -25,8 +25,8 @@ Future<bool> confirmInstallDirectory(BuildContext context,
 }
 
 Future<bool> _needsDirectoryWarning(String directoryPath) async {
-  if (bind.mainIsInstalled() &&
-      path.equals(directoryPath, bind.installInstallPath())) {
+  if (bind.crateFlutterFfiMainIsInstalled() &&
+      path.equals(directoryPath, bind.crateFlutterFfiInstallInstallPath())) {
     return false;
   }
   final directory = Directory(directoryPath);

@@ -7,8 +7,7 @@ import 'package:provider/provider.dart';
 class DesktopPortForwardScreen extends StatelessWidget {
   final Map<String, dynamic> params;
 
-  const DesktopPortForwardScreen({Key? key, required this.params})
-      : super(key: key);
+  const DesktopPortForwardScreen({super.key, required this.params});
 
   @override
   Widget build(BuildContext context) {

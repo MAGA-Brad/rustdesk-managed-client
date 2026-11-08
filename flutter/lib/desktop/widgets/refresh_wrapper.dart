@@ -27,7 +27,7 @@ class RefreshWrapperState extends State<RefreshWrapper> {
     return widget.builder(context);
   }
 
-  rebuild() {
+  void rebuild() {
     debugPrint("=====Global State Rebuild (win-${kWindowId ?? 'main'})=====");
     if (Get.context != null) {
       (context as Element).visitChildren(_rebuildElement);

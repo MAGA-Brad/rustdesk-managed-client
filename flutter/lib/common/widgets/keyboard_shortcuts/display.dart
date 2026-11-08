@@ -24,7 +24,7 @@ class ShortcutDisplay {
   }
 
   static String? formatFor(String actionId, {bool requireEnabled = true}) {
-    final raw = bind.mainGetLocalOption(key: kShortcutLocalConfigKey);
+    final raw = bind.crateFlutterFfiMainGetLocalOption(key: kShortcutLocalConfigKey);
     if (raw.isEmpty) return null;
     Map<String, dynamic>? parsed;
     if (raw == _cachedRaw) {

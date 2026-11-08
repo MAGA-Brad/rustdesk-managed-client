@@ -24,8 +24,8 @@ class HttpService {
           mainGetLocalBoolOptionSync(kOptionEnableFlutterHttpOnRust);
       // Use flutter http if:
       // Not `enableFlutterHttpOnRust` and no proxy is set
-      useFlutterHttp =
-          !(enableFlutterHttpOnRust || await bind.mainGetProxyStatus());
+      useFlutterHttp = !(enableFlutterHttpOnRust ||
+          await bind.crateFlutterFfiMainGetProxyStatus());
     }
 
     if (useFlutterHttp) {
@@ -34,7 +34,7 @@ class HttpService {
 
     String headersJson = jsonEncode(headers);
     String methodName = method.toString().split('.').last;
-    await bind.mainHttpRequest(
+    await bind.crateFlutterFfiMainHttpRequest(
         url: url.toString(),
         method: methodName.toLowerCase(),
         body: body,
@@ -94,7 +94,7 @@ class HttpService {
   Future<String> _pollForResponse(String url) async {
     String? responseJson = " ";
     while (responseJson == " ") {
-      responseJson = await bind.mainGetHttpStatus(url: url);
+      responseJson = await bind.crateFlutterFfiMainGetHttpStatus(url: url);
       if (responseJson == null) {
         throw Exception('The HTTP request failed');
       }

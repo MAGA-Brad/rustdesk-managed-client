@@ -56,7 +56,8 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
   static const _scrollDown = 1;
 
   final _terminalViewKey = GlobalKey<TerminalViewState>();
-  late final _scrollController = TerminalScrollController(() => widget.terminal);
+  late final _scrollController =
+      TerminalScrollController(() => widget.terminal);
   final _mouseDrag = TerminalMouseDragReporter();
   late final WheelButtonFixMouseHandler _mouseHandler;
   TerminalMouseHandler? _previousMouseHandler;

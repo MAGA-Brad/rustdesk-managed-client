@@ -15,11 +15,10 @@ def java8KotlinJvmTargets = [
 
 def configureKotlinJvmTarget = { Project project, String kotlinJvmTarget ->
     project.plugins.withId('kotlin-android') {
-        project.tasks.configureEach { task ->
-            if (!task.hasProperty('kotlinOptions')) {
-                return
-            }
-            task.kotlinOptions.jvmTarget = kotlinJvmTarget
+        // The root build has no Kotlin plugin on its classpath, so reach JvmTarget through the task's own loader.
+        project.tasks.matching { it.name.startsWith('compile') && it.name.endsWith('Kotlin') }.configureEach { task ->
+            def jvmTargetClass = task.class.classLoader.loadClass('org.jetbrains.kotlin.gradle.dsl.JvmTarget')
+            task.compilerOptions.jvmTarget.set(jvmTargetClass.fromTarget(kotlinJvmTarget))
         }
     }
 }
@@ -27,14 +26,17 @@ def configureKotlinJvmTarget = { Project project, String kotlinJvmTarget ->
 allprojects {
     repositories {
         google()
-        jcenter()
-        maven { url 'https://jitpack.io' }
+        mavenCentral()
+        maven {
+            url 'https://jitpack.io'
+            content { includeGroup 'com.github.getActivity' }
+        }
     }
 }
 
-rootProject.buildDir = '../build'
+rootProject.layout.buildDirectory.set(rootProject.file('../build'))
 subprojects {
-    project.buildDir = "${rootProject.buildDir}/${project.name}"
+    project.layout.buildDirectory.set(rootProject.file("../build/${project.name}"))
     def legacyNamespace = legacyPluginNamespaces[project.name]
     if (legacyNamespace != null) {
         project.plugins.withId('com.android.library') {
@@ -45,11 +47,21 @@ subprojects {
     if (kotlinJvmTarget != null) {
         configureKotlinJvmTarget(project, kotlinJvmTarget)
     }
+    // Plugins compile against the app's SDK: sqflite_android 2.4.4 calls Android 16 (API 36) APIs
+    // but declares compileSdk 34. Registered before the plugin's own script runs, so this lands
+    // before the Android plugin finalizes its settings.
+    if (!project.state.executed) {
+        project.afterEvaluate {
+            if (project.plugins.hasPlugin('com.android.library')) {
+                project.android.compileSdk = 36
+            }
+        }
+    }
 }
 subprojects {
     project.evaluationDependsOn(':app')
 }
 
 tasks.register("clean", Delete) {
-    delete rootProject.buildDir
+    delete rootProject.layout.buildDirectory
 }

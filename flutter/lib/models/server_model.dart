@@ -34,6 +34,9 @@ class ServerModel with ChangeNotifier {
   bool _clipboardOk = false;
   bool _showElevation = false;
   bool hideCm = false;
+  bool _managedCmCollapsed = false;
+  // The Switch Sides prompt needs the full window; it stays expanded until it's answered.
+  bool _switchSidesPromptOpen = false;
   int _connectStatus = 0; // Rendezvous Server status
   String _verificationMethod = "";
   String _temporaryPasswordLength = "";
@@ -84,11 +87,12 @@ class ServerModel with ChangeNotifier {
 
   String get approveMode => _approveMode;
 
-  setVerificationMethod(String method) async {
-    await bind.mainSetOption(key: kOptionVerificationMethod, value: method);
+  Future<void> setVerificationMethod(String method) async {
+    await bind.crateFlutterFfiMainSetOption(
+        key: kOptionVerificationMethod, value: method);
     /*
     if (method != kUsePermanentPassword) {
-      await bind.mainSetOption(
+      await bind.crateFlutterFfiMainSetOption(
           key: 'allow-hide-cm', value: bool2option('allow-hide-cm', false));
     }
     */
@@ -102,22 +106,24 @@ class ServerModel with ChangeNotifier {
     return _temporaryPasswordLength;
   }
 
-  setTemporaryPasswordLength(String length) async {
-    await bind.mainSetOption(key: "temporary-password-length", value: length);
+  Future<void> setTemporaryPasswordLength(String length) async {
+    await bind.crateFlutterFfiMainSetOption(
+        key: "temporary-password-length", value: length);
   }
 
-  setApproveMode(String mode) async {
-    await bind.mainSetOption(key: kOptionApproveMode, value: mode);
+  Future<void> setApproveMode(String mode) async {
+    await bind.crateFlutterFfiMainSetOption(
+        key: kOptionApproveMode, value: mode);
     /*
     if (mode != 'password') {
-      await bind.mainSetOption(
+      await bind.crateFlutterFfiMainSetOption(
           key: 'allow-hide-cm', value: bool2option('allow-hide-cm', false));
     }
     */
   }
 
   bool get allowNumericOneTimePassword => _allowNumericOneTimePassword;
-  switchAllowNumericOneTimePassword() async {
+  Future<void> switchAllowNumericOneTimePassword() async {
     await mainSetBoolOption(
         kOptionAllowNumericOneTimePassword, !_allowNumericOneTimePassword);
   }
@@ -127,6 +133,167 @@ class ServerModel with ChangeNotifier {
   TextEditingController get serverPasswd => _serverPasswd;
 
   List<Client> get clients => _clients;
+
+  // The built-in option, not the service status: this is read per pointer move and per frame.
+  bool get isManagedDirectoryBuild => isWindows && isManagedClientBuild();
+
+  bool get managedCmCollapsed => _managedCmCollapsed;
+
+  String _managedFriendlyNameForPeer(String peerId) {
+    if (!isManagedDirectoryBuild || peerId.trim().isEmpty) return '';
+    try {
+      final decoded =
+          jsonDecode(bind.crateFlutterFfiMainGetManagedDirectoryStatus());
+      if (decoded is! Map<String, dynamic>) return '';
+      final devices = decoded['devices'];
+      if (devices is! List) return '';
+      for (final item in devices) {
+        if (item is! Map) continue;
+        if ((item['rustdesk_id'] ?? '').toString().trim() != peerId.trim()) {
+          continue;
+        }
+        return (item['display_name'] ?? '').toString().trim();
+      }
+    } catch (e) {
+      debugPrint('Managed friendly-name lookup failed for $peerId: $e');
+    }
+    return '';
+  }
+
+  void _applyManagedFriendlyName(Client client) {
+    final friendly = _managedFriendlyNameForPeer(client.peerId);
+    if (friendly.isNotEmpty) client.managedName = friendly;
+    // RustDWeb: the gateway (certificate-verified; RDS flags only its entry, by device id) connects
+    // as "<signed-in operator> (RDC Web)", so show who is actually connecting, not the gateway.
+    // Never key this on platform: every device reports its own.
+    if (client.name.trim().endsWith(' (RDC Web)') &&
+        _isManagedWebGateway(client.peerId)) {
+      client.managedName = client.name.trim();
+    }
+  }
+
+  bool _isManagedWebGateway(String peerId) {
+    if (!isManagedDirectoryBuild || peerId.trim().isEmpty) return false;
+    try {
+      final decoded =
+          jsonDecode(bind.crateFlutterFfiMainGetManagedDirectoryStatus());
+      final devices = decoded is Map ? decoded['devices'] : null;
+      if (devices is! List) return false;
+      return devices.any((item) =>
+          item is Map &&
+          (item['rustdesk_id'] ?? '').toString().trim() == peerId.trim() &&
+          item['rustdweb_gateway'] == true);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void scheduleManagedCmCollapse(
+      {Duration delay = const Duration(seconds: 4)}) {
+    if (!isManagedDirectoryBuild ||
+        _switchSidesPromptOpen ||
+        !isDesktop ||
+        desktopType != DesktopType.cm ||
+        hideCm ||
+        parent.target?.chatModel.isShowCMSidePage == true ||
+        !_clients.any((c) => c.authorized && !c.disconnected) ||
+        _clients.any((c) => !c.authorized && !c.disconnected)) {
+      return;
+    }
+    cmHiddenTimer?.cancel();
+    cmHiddenTimer = Timer(delay, () {
+      cmHiddenTimer = null;
+      unawaited(collapseManagedCmWindow());
+    });
+  }
+
+  void noteManagedCmInteraction() {
+    if (!isManagedDirectoryBuild || _managedCmCollapsed) return;
+    scheduleManagedCmCollapse(delay: const Duration(seconds: 10));
+  }
+
+  Future<void> collapseManagedCmWindow() async {
+    if (!isManagedDirectoryBuild ||
+        _switchSidesPromptOpen ||
+        !isDesktop ||
+        desktopType != DesktopType.cm ||
+        hideCm ||
+        parent.target?.chatModel.isShowCMSidePage == true ||
+        !_clients.any((c) => c.authorized && !c.disconnected) ||
+        // A pending request stays visible, not behind a pill naming another peer.
+        _clients.any((c) => !c.authorized && !c.disconnected)) {
+      return;
+    }
+    if (!_managedCmCollapsed) {
+      _managedCmCollapsed = true;
+      notifyListeners();
+    }
+    await windowManager.show();
+    // Resize only, don't re-anchor to a fixed corner - see the matching
+    // note in expandManagedCmWindow() below.
+    await windowManager.setSize(const Size(220, 72));
+  }
+
+  Future<void> expandManagedCmWindow({bool scheduleRecollapse = true}) async {
+    if (!isManagedDirectoryBuild ||
+        !isDesktop ||
+        desktopType != DesktopType.cm) {
+      return;
+    }
+    cmHiddenTimer?.cancel();
+    cmHiddenTimer = null;
+    if (_managedCmCollapsed) {
+      _managedCmCollapsed = false;
+      notifyListeners();
+    }
+    await windowManager.show();
+    // Resize only - this collapse/expand cycle repeats on every connection
+    // event, so re-anchoring to Alignment.topRight here was what made the
+    // window feel pinned in place no matter where the user dragged it.
+    final newSize = kConnectionManagerWindowSizeClosedChat;
+    await windowManager.setSize(newSize);
+    // The collapsed pill is small and often ends up dragged near a screen
+    // edge; expanding to the much larger card size while keeping the same
+    // top-left origin can then push most of the window off-screen (reported:
+    // window appeared almost entirely off the right edge of the display).
+    // Only nudge the position back on-screen when the new size no longer
+    // fits - don't touch it when it already fits, to preserve the
+    // don't-re-anchor behavior above.
+    await _keepWindowOnScreen(newSize);
+    await windowManager.focus();
+    await windowOnTop(null);
+    if (scheduleRecollapse) {
+      scheduleManagedCmCollapse(delay: const Duration(seconds: 10));
+    }
+  }
+
+  Future<void> _keepWindowOnScreen(Size size) async {
+    try {
+      final pos = await windowManager.getPosition();
+      final rect = Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height);
+      final screens = await getScreenRectList();
+      if (screens.isEmpty) return;
+      Rect? screen;
+      for (final s in screens) {
+        if (s.overlaps(rect)) {
+          screen = s;
+          break;
+        }
+      }
+      screen ??= screens.first;
+      double left = pos.dx;
+      double top = pos.dy;
+      if (rect.right > screen.right) left = screen.right - size.width;
+      if (rect.bottom > screen.bottom) top = screen.bottom - size.height;
+      if (left < screen.left) left = screen.left;
+      if (top < screen.top) top = screen.top;
+      if (left != pos.dx || top != pos.dy) {
+        await windowManager.setPosition(Offset(left, top));
+      }
+    } catch (e) {
+      debugPrint('Failed to keep managed CM window on screen: $e');
+    }
+  }
 
   final controller = ScrollController();
 
@@ -139,10 +306,10 @@ class ServerModel with ChangeNotifier {
     /*
     // initital _hideCm at startup
     final verificationMethod =
-        bind.mainGetOptionSync(key: kOptionVerificationMethod);
-    final approveMode = bind.mainGetOptionSync(key: kOptionApproveMode);
+        bind.crateFlutterFfiMainGetOptionSync(key: kOptionVerificationMethod);
+    final approveMode = bind.crateFlutterFfiMainGetOptionSync(key: kOptionApproveMode);
     _hideCm = option2bool(
-        'allow-hide-cm', bind.mainGetOptionSync(key: 'allow-hide-cm'));
+        'allow-hide-cm', bind.crateFlutterFfiMainGetOptionSync(key: 'allow-hide-cm'));
     if (!(approveMode == 'password' &&
         verificationMethod == kUsePermanentPassword)) {
       _hideCm = false;
@@ -151,7 +318,8 @@ class ServerModel with ChangeNotifier {
 
     timerCallback() async {
       final connectionStatus =
-          jsonDecode(await bind.mainGetConnectStatus()) as Map<String, dynamic>;
+          jsonDecode(await bind.crateFlutterFfiMainGetConnectStatus())
+              as Map<String, dynamic>;
       final statusNum = connectionStatus['status_num'] as int;
       if (statusNum != _connectStatus) {
         _connectStatus = statusNum;
@@ -159,7 +327,8 @@ class ServerModel with ChangeNotifier {
       }
 
       if (desktopType == DesktopType.cm) {
-        final res = await bind.cmCheckClientsLength(length: _clients.length);
+        final res = await bind.crateFlutterFfiCmCheckClientsLength(
+            length: _clients.length);
         if (res != null) {
           debugPrint("clients not match!");
           updateClientState(res);
@@ -182,7 +351,7 @@ class ServerModel with ChangeNotifier {
 
     if (!isTest) {
       Future.delayed(Duration.zero, () async {
-        if (await bind.optionSynced()) {
+        if (await bind.crateFlutterFfiOptionSynced()) {
           await timerCallback();
         }
       });
@@ -193,7 +362,7 @@ class ServerModel with ChangeNotifier {
 
     // Initial keyboard status is off on mobile
     if (isMobile) {
-      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+      bind.crateFlutterFfiMainSetOption(key: kOptionEnableKeyboard, value: 'N');
     }
   }
 
@@ -201,42 +370,46 @@ class ServerModel with ChangeNotifier {
   /// 2. check config
   /// audio true by default (if permission on) (false default < Android 10)
   /// file true by default (if permission on)
-  checkAndroidPermission() async {
+  Future<void> checkAndroidPermission() async {
     // audio
     if (androidVersion < 30 ||
         !await AndroidPermissionManager.check(kRecordAudio)) {
       _audioOk = false;
-      bind.mainSetOption(key: kOptionEnableAudio, value: "N");
+      bind.crateFlutterFfiMainSetOption(key: kOptionEnableAudio, value: "N");
     } else {
-      final audioOption = await bind.mainGetOption(key: kOptionEnableAudio);
+      final audioOption =
+          await bind.crateFlutterFfiMainGetOption(key: kOptionEnableAudio);
       _audioOk = audioOption != 'N';
     }
 
     // Android file transfer is confined to app-specific storage. Files enter
     // and leave the workspace through Android's system document picker.
-    final fileOption = await bind.mainGetOption(key: kOptionEnableFileTransfer);
+    final fileOption = await bind.crateFlutterFfiMainGetOption(key: kOptionEnableFileTransfer);
     _fileOk = fileOption != 'N';
 
     // clipboard
-    final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
+    final clipOption =
+        await bind.crateFlutterFfiMainGetOption(key: kOptionEnableClipboard);
     _clipboardOk = clipOption != 'N';
 
     notifyListeners();
   }
 
-  updatePasswordModel() async {
+  Future<void> updatePasswordModel() async {
     var update = false;
-    final temporaryPassword = await bind.mainGetTemporaryPassword();
+    final temporaryPassword =
+        await bind.crateFlutterFfiMainGetTemporaryPassword();
     final verificationMethod =
-        await bind.mainGetOption(key: kOptionVerificationMethod);
-    final temporaryPasswordLength =
-        await bind.mainGetOption(key: "temporary-password-length");
-    final approveMode = await bind.mainGetOption(key: kOptionApproveMode);
+        await bind.crateFlutterFfiMainGetOption(key: kOptionVerificationMethod);
+    final temporaryPasswordLength = await bind.crateFlutterFfiMainGetOption(
+        key: "temporary-password-length");
+    final approveMode =
+        await bind.crateFlutterFfiMainGetOption(key: kOptionApproveMode);
     final numericOneTimePassword =
         await mainGetBoolOption(kOptionAllowNumericOneTimePassword);
     /*
     var hideCm = option2bool(
-        'allow-hide-cm', await bind.mainGetOption(key: 'allow-hide-cm'));
+        'allow-hide-cm', await bind.crateFlutterFfiMainGetOption(key: 'allow-hide-cm'));
     if (!(approveMode == 'password' &&
         verificationMethod == kUsePermanentPassword)) {
       hideCm = false;
@@ -267,7 +440,7 @@ class ServerModel with ChangeNotifier {
     }
     if (_temporaryPasswordLength != temporaryPasswordLength) {
       if (_temporaryPasswordLength.isNotEmpty) {
-        bind.mainUpdateTemporaryPassword();
+        bind.crateFlutterFfiMainUpdateTemporaryPassword();
       }
       _temporaryPasswordLength = temporaryPasswordLength;
       update = true;
@@ -294,7 +467,7 @@ class ServerModel with ChangeNotifier {
     }
   }
 
-  toggleAudio() async {
+  Future<void> toggleAudio() async {
     if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
     }
@@ -307,37 +480,37 @@ class ServerModel with ChangeNotifier {
     }
 
     _audioOk = !_audioOk;
-    bind.mainSetOption(
+    bind.crateFlutterFfiMainSetOption(
         key: kOptionEnableAudio, value: _audioOk ? defaultOptionYes : 'N');
     notifyListeners();
   }
 
-  toggleFile() async {
+  Future<void> toggleFile() async {
     if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
     }
     _fileOk = !_fileOk;
-    bind.mainSetOption(
+    bind.crateFlutterFfiMainSetOption(
         key: kOptionEnableFileTransfer,
         value: _fileOk ? defaultOptionYes : 'N');
     notifyListeners();
   }
 
-  toggleClipboard() async {
+  Future<void> toggleClipboard() async {
     _clipboardOk = !clipboardOk;
-    bind.mainSetOption(
+    bind.crateFlutterFfiMainSetOption(
         key: kOptionEnableClipboard,
         value: clipboardOk ? defaultOptionYes : 'N');
     notifyListeners();
   }
 
-  toggleInput() async {
+  Future<void> toggleInput() async {
     if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
     }
     if (_inputOk) {
       parent.target?.invokeMethod("stop_input");
-      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+      bind.crateFlutterFfiMainSetOption(key: kOptionEnableKeyboard, value: 'N');
     } else {
       if (parent.target != null) {
         /// the result of toggle-on depends on user actions in the settings page.
@@ -376,7 +549,7 @@ class ServerModel with ChangeNotifier {
   }
 
   /// Toggle the screen sharing service.
-  toggleService() async {
+  Future<void> toggleService() async {
     if (_isStart) {
       final res = await parent.target?.dialogManager
           .show<bool>((setState, close, context) {
@@ -410,7 +583,9 @@ class ServerModel with ChangeNotifier {
         }
       }
       await checkRequestNotificationPermission();
-      if (bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) != 'Y') {
+      if (bind.crateFlutterFfiMainGetLocalOption(
+              key: kOptionDisableFloatingWindow) !=
+          'Y') {
         await checkFloatingWindowPermission();
       }
       final res = await parent.target?.dialogManager
@@ -445,7 +620,7 @@ class ServerModel with ChangeNotifier {
     parent.target?.ffiModel.updateEventListener(parent.target!.sessionId, "");
     await parent.target?.invokeMethod("init_service");
     // ugly is here, because for desktop, below is useless
-    await bind.mainStartService();
+    await bind.crateFlutterFfiMainStartService();
     updateClientState();
     if (isAndroid) {
       androidUpdatekeepScreenOn();
@@ -457,21 +632,21 @@ class ServerModel with ChangeNotifier {
     _isStart = false;
     closeAll();
     await parent.target?.invokeMethod("stop_service");
-    await bind.mainStopService();
+    await bind.crateFlutterFfiMainStopService();
     notifyListeners();
     // for androidUpdatekeepScreenOn only
     WakelockManager.disable(_wakelockKey);
   }
 
-  fetchID() async {
-    final id = await bind.mainGetMyId();
+  Future<void> fetchID() async {
+    final id = await bind.crateFlutterFfiMainGetMyId();
     if (id != _serverId.id) {
       _serverId.id = id;
       notifyListeners();
     }
   }
 
-  changeStatue(String name, bool value) {
+  void changeStatue(String name, bool value) {
     debugPrint("changeStatue value $value");
     switch (name) {
       case "media":
@@ -482,7 +657,7 @@ class ServerModel with ChangeNotifier {
         break;
       case "input":
         if (_inputOk != value) {
-          bind.mainSetOption(
+          bind.crateFlutterFfiMainSetOption(
               key: kOptionEnableKeyboard,
               value: value ? defaultOptionYes : 'N');
         }
@@ -495,9 +670,9 @@ class ServerModel with ChangeNotifier {
   }
 
   // force
-  updateClientState([String? json]) async {
+  Future<void> updateClientState([String? json]) async {
     if (isTest) return;
-    var res = await bind.cmGetClientsState();
+    var res = await bind.crateFlutterFfiCmGetClientsState();
     List<dynamic> clientsJson;
     try {
       clientsJson = jsonDecode(res);
@@ -513,6 +688,7 @@ class ServerModel with ChangeNotifier {
     for (var clientJson in clientsJson) {
       try {
         final client = Client.fromJson(clientJson);
+        _applyManagedFriendlyName(client);
         _clients.add(client);
         _addTab(client);
       } catch (e) {
@@ -532,9 +708,21 @@ class ServerModel with ChangeNotifier {
     }
   }
 
+  void _syncClientPermissionState(Client current, Client incoming) {
+    current.keyboard = incoming.keyboard;
+    current.clipboard = incoming.clipboard;
+    current.audio = incoming.audio;
+    current.file = incoming.file;
+    current.restart = incoming.restart;
+    current.recording = incoming.recording;
+    current.blockInput = incoming.blockInput;
+    current.privacyMode = incoming.privacyMode;
+  }
+
   void addConnection(Map<String, dynamic> evt) {
     try {
       final client = Client.fromJson(jsonDecode(evt["client"]));
+      _applyManagedFriendlyName(client);
       if (client.authorized) {
         parent.target?.dialogManager.dismissByTag(getLoginDialogTag(client.id));
         final index = _clients.indexWhere((c) => c.id == client.id);
@@ -542,21 +730,36 @@ class ServerModel with ChangeNotifier {
           _clients.add(client);
         } else {
           if (_clients[index].authorized) {
-            _clients[index].privacyMode = client.privacyMode;
+            _syncClientPermissionState(_clients[index], client);
+            if (client.managedName.isNotEmpty) {
+              _clients[index].managedName = client.managedName;
+            }
+            if (isManagedDirectoryBuild && _managedCmCollapsed) {
+              unawaited(expandManagedCmWindow());
+            }
             notifyListeners();
             return;
           }
           _clients[index].authorized = true;
-          _clients[index].privacyMode = client.privacyMode;
+          _clients[index].connectedAt ??= DateTime.now();
+          _syncClientPermissionState(_clients[index], client);
+          if (client.managedName.isNotEmpty) {
+            _clients[index].managedName = client.managedName;
+          }
         }
       } else {
         final index = _clients.indexWhere((c) => c.id == client.id);
         if (index >= 0) {
-          _clients[index].privacyMode = client.privacyMode;
+          _syncClientPermissionState(_clients[index], client);
           notifyListeners();
           return;
         }
         _clients.add(client);
+      }
+      if (isManagedDirectoryBuild &&
+          !client.authorized &&
+          _managedCmCollapsed) {
+        unawaited(expandManagedCmWindow(scheduleRecollapse: false));
       }
       _addTab(client);
       // remove disconnected
@@ -581,19 +784,25 @@ class ServerModel with ChangeNotifier {
   void _addTab(Client client) {
     tabController.add(TabInfo(
         key: client.id.toString(),
-        label: client.name,
+        label: client.displayName,
         closable: false,
         onTap: () {},
         page: desktop.buildConnectionCard(client)));
     Future.delayed(Duration.zero, () async {
       if (!hideCm) windowOnTop(null);
     });
-    // Only do the hidden task when on Desktop.
+    // Preserve upstream minimization for non-managed builds. Managed builds
+    // instead collapse to a small right-edge connection tab that remains
+    // visibly present and can be reopened with one click.
     if (client.authorized && isDesktop) {
-      cmHiddenTimer = Timer(const Duration(seconds: 3), () {
-        if (!hideCm) windowManager.minimize();
-        cmHiddenTimer = null;
-      });
+      if (isManagedDirectoryBuild) {
+        scheduleManagedCmCollapse();
+      } else {
+        cmHiddenTimer = Timer(const Duration(seconds: 3), () {
+          if (!hideCm) windowManager.minimize();
+          cmHiddenTimer = null;
+        });
+      }
     }
     parent.target?.chatModel
         .updateConnIdOfKey(MessageKey(client.peerId, client.id));
@@ -616,12 +825,13 @@ class ServerModel with ChangeNotifier {
     );
   }
 
-  handleVoiceCall(Client client, bool accept) {
+  void handleVoiceCall(Client client, bool accept) {
     parent.target?.invokeMethod("cancel_notification", client.id);
-    bind.cmHandleIncomingVoiceCall(id: client.id, accept: accept);
+    bind.crateFlutterFfiCmHandleIncomingVoiceCall(
+        id: client.id, accept: accept);
   }
 
-  showVoiceCallDialog(Client client) {
+  void showVoiceCallDialog(Client client) {
     showClientDialog(
       client,
       'Voice call',
@@ -632,7 +842,7 @@ class ServerModel with ChangeNotifier {
     );
   }
 
-  showClientDialog(Client client, String title, String contentTitle,
+  void showClientDialog(Client client, String title, String contentTitle,
       String content, VoidCallback onCancel, VoidCallback onSubmit) {
     parent.target?.dialogManager.show((setState, close, context) {
       cancel() {
@@ -675,7 +885,7 @@ class ServerModel with ChangeNotifier {
     }, tag: getLoginDialogTag(client.id));
   }
 
-  scrollToBottom() {
+  void scrollToBottom() {
     if (isDesktop) return;
     Future.delayed(Duration(milliseconds: 200), () {
       controller.animateTo(controller.position.maxScrollExtent,
@@ -686,19 +896,25 @@ class ServerModel with ChangeNotifier {
 
   void sendLoginResponse(Client client, bool res) async {
     if (res) {
-      bind.cmLoginRes(connId: client.id, res: res);
+      bind.crateFlutterFfiCmLoginRes(connId: client.id, res: res);
       if (!client.isFileTransfer && !client.isTerminal) {
         parent.target?.invokeMethod("start_capture");
       }
       parent.target?.invokeMethod("cancel_notification", client.id);
       client.authorized = true;
+      client.connectedAt ??= DateTime.now();
       notifyListeners();
+      if (isDesktop && isManagedDirectoryBuild) {
+        scheduleManagedCmCollapse();
+      }
     } else {
-      bind.cmLoginRes(connId: client.id, res: res);
+      bind.crateFlutterFfiCmLoginRes(connId: client.id, res: res);
       parent.target?.invokeMethod("cancel_notification", client.id);
       final index = _clients.indexOf(client);
       tabController.remove(index);
       _clients.remove(client);
+      // The collapse the pending request held off.
+      if (isDesktop && isManagedDirectoryBuild) scheduleManagedCmCollapse();
       if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
@@ -715,6 +931,9 @@ class ServerModel with ChangeNotifier {
             tabController.remove(index);
           } else {
             _clients[index].disconnected = true;
+            if (isManagedDirectoryBuild && _managedCmCollapsed) {
+              unawaited(expandManagedCmWindow(scheduleRecollapse: false));
+            }
           }
         }
         parent.target?.dialogManager.dismissByTag(getLoginDialogTag(id));
@@ -735,8 +954,8 @@ class ServerModel with ChangeNotifier {
   /// whether the peer is allowed to reconnect. See `ipc::Data::CmWindowClosed`.
   Future<void> closeAll({bool byOperator = true}) async {
     await Future.wait(_clients.map((client) => byOperator
-        ? bind.cmCloseConnection(connId: client.id)
-        : bind.cmCloseConnectionWindow(connId: client.id)));
+        ? bind.crateFlutterFfiCmCloseConnection(connId: client.id)
+        : bind.crateFlutterFfiCmCloseConnectionWindow(connId: client.id)));
     _clients.clear();
     tabController.state.value.tabs.clear();
     if (isAndroid) androidUpdatekeepScreenOn();
@@ -752,6 +971,50 @@ class ServerModel with ChangeNotifier {
       _showElevation = show;
       notifyListeners();
     }
+  }
+
+  // Managed builds: the controlling peer asked to switch sides. Nothing happens unless the user
+  // here accepts; no answer in 60 seconds counts as Deny.
+  void showSwitchSidesPrompt(int connId) {
+    final dialogManager = parent.target?.dialogManager;
+    final index = _clients.indexWhere((c) => c.id == connId);
+    if (dialogManager == null || index == -1) return;
+    final client = _clients[index];
+    final tag = 'switch-sides-prompt-$connId';
+    var answered = false;
+    Timer? timer;
+    answer(bool accept) {
+      if (answered) return;
+      answered = true;
+      timer?.cancel();
+      _switchSidesPromptOpen = false;
+      dialogManager.dismissByTag(tag);
+      bind.crateFlutterFfiCmSwitchSidesAnswer(connId: connId, accept: accept);
+      if (!accept) scheduleManagedCmCollapse();
+    }
+
+    timer = Timer(const Duration(seconds: 60), () => answer(false));
+    _switchSidesPromptOpen = true;
+    // The collapsed in-session pill is far too small to show the prompt.
+    unawaited(expandManagedCmWindow(scheduleRecollapse: false));
+    dialogManager.show((setState, close, context) {
+      return CustomAlertDialog(
+        title: Text(translate('Switch Sides')),
+        content: Text(
+            '${client.name} (${client.peerId}) ${translate('asks to switch sides. If you accept, you will control their computer and this connection ends.')}'),
+        // A click the controlling peer injected doesn't answer (desktop.checkClickTime).
+        actions: [
+          dialogButton('Deny',
+              onPressed: () =>
+                  desktop.checkClickTime(connId, () => answer(false)),
+              isOutline: true),
+          dialogButton('Accept',
+              onPressed: () =>
+                  desktop.checkClickTime(connId, () => answer(true))),
+        ],
+        onCancel: () => answer(false),
+      );
+    }, tag: tag);
   }
 
   void updateVoiceCallState(Map<String, dynamic> evt) {
@@ -780,13 +1043,14 @@ class ServerModel with ChangeNotifier {
 
   void androidUpdatekeepScreenOn() async {
     if (!isAndroid) return;
-    var floatingWindowDisabled =
-        bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
-            !await AndroidPermissionManager.check(kSystemAlertWindow);
+    var floatingWindowDisabled = bind.crateFlutterFfiMainGetLocalOption(
+                key: kOptionDisableFloatingWindow) ==
+            "Y" ||
+        !await AndroidPermissionManager.check(kSystemAlertWindow);
     final keepScreenOn = floatingWindowDisabled
         ? KeepScreenOn.never
         : optionToKeepScreenOn(
-            bind.mainGetLocalOption(key: kOptionKeepScreenOn));
+            bind.crateFlutterFfiMainGetLocalOption(key: kOptionKeepScreenOn));
     final on = ((keepScreenOn == KeepScreenOn.serviceOn) && _isStart) ||
         (keepScreenOn == KeepScreenOn.duringControlled &&
             _clients.map((e) => !e.disconnected).isNotEmpty);
@@ -814,6 +1078,8 @@ class Client {
   bool isTerminal = false;
   String portForward = "";
   String name = "";
+  String managedName = "";
+  DateTime? connectedAt;
   String avatar = "";
   String peerId = ""; // peer user's id,show at app
   bool keyboard = false;
@@ -828,6 +1094,9 @@ class Client {
   bool fromSwitch = false;
   bool inVoiceCall = false;
   bool incomingVoiceCall = false;
+
+  String get displayName =>
+      managedName.trim().isNotEmpty ? managedName.trim() : name.trim();
 
   RxInt unreadChatMessageCount = 0.obs;
 
@@ -857,6 +1126,7 @@ class Client {
     fromSwitch = json['from_switch'];
     inVoiceCall = json['in_voice_call'];
     incomingVoiceCall = json['incoming_voice_call'];
+    if (authorized) connectedAt = DateTime.now();
   }
 
   Map<String, dynamic> toJson() {
@@ -904,7 +1174,7 @@ String getLoginDialogTag(int id) {
   return kLoginDialogTag + id.toString();
 }
 
-showInputWarnAlert(FFI ffi) {
+void showInputWarnAlert(FFI ffi) {
   ffi.dialogManager.show((setState, close, context) {
     submit() {
       AndroidPermissionManager.startAction(kActionAccessibilitySettings);

@@ -1,18 +1,15 @@
-From bec8d49e75b37806e1cff39c75027860fde0bfa2 Mon Sep 17 00:00:00 2001
 From: 21pages <sunboeasy@gmail.com>
-Date: Fri, 27 Dec 2024 08:43:12 +0800
 Subject: [PATCH] fix nvenc reconfigure blur
 
-Signed-off-by: 21pages <sunboeasy@gmail.com>
----
- libavcodec/nvenc.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
+Ported to FFmpeg 9.0.2 for RDC: unchanged, regenerated for the new offset.
+FFmpeg 9 reconfig_encoder still resets the encoder and forces an IDR on a
+bitrate change, so the fix is still needed.
 
 diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
-index 2cce478be0..f4c559b7ce 100644
+index 9203fb6..69d5f06 100644
 --- a/libavcodec/nvenc.c
 +++ b/libavcodec/nvenc.c
-@@ -2741,8 +2741,8 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
+@@ -2850,8 +2850,8 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
          }
  
          if (reconfig_bitrate) {
@@ -23,6 +20,3 @@ index 2cce478be0..f4c559b7ce 100644
  
              needs_encode_config = 1;
              needs_reconfig = 1;
--- 
-2.43.0.windows.1
-

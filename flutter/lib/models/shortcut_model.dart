@@ -110,7 +110,7 @@ class ShortcutModel {
   /// Runtime matching requests [active] to exclude platform-hidden bindings
   /// while retaining the stored config for other platforms.
   static ShortcutConfig config({bool active = false}) {
-    final raw = bind.mainGetLocalOption(key: kShortcutLocalConfigKey);
+    final raw = bind.crateFlutterFfiMainGetLocalOption(key: kShortcutLocalConfigKey);
     if (raw != _configRaw) {
       _config = ShortcutConfig.parse(raw);
       _activeConfig = _config.forPlatform(currentPlatformCapabilities());
@@ -135,7 +135,7 @@ class ShortcutModel {
   /// suspended). Stored in the same JSON blob so a single reload refreshes
   /// both flags on every active matcher.
   static Future<void> setPassThrough(bool v) async {
-    final raw = bind.mainGetLocalOption(key: kShortcutLocalConfigKey);
+    final raw = bind.crateFlutterFfiMainGetLocalOption(key: kShortcutLocalConfigKey);
     Map<String, dynamic> json = {};
     if (raw.isNotEmpty) {
       try {
@@ -145,9 +145,9 @@ class ShortcutModel {
       }
     }
     json['pass_through'] = v;
-    await bind.mainSetLocalOption(
+    await bind.crateFlutterFfiMainSetLocalOption(
         key: kShortcutLocalConfigKey, value: jsonEncode(json));
-    bind.mainReloadKeyboardShortcuts();
+    bind.crateFlutterFfiMainReloadKeyboardShortcuts();
   }
 
   /// Flip the master `enabled` flag and persist. On the first enable we seed
@@ -156,7 +156,7 @@ class ShortcutModel {
   /// the change takes effect immediately (Rust on native, JS via the bridge
   /// on Web).
   static Future<void> setEnabled(bool v) async {
-    final raw = bind.mainGetLocalOption(key: kShortcutLocalConfigKey);
+    final raw = bind.crateFlutterFfiMainGetLocalOption(key: kShortcutLocalConfigKey);
     Map<String, dynamic> json = {};
     if (raw.isNotEmpty) {
       try {
@@ -168,15 +168,15 @@ class ShortcutModel {
     json['enabled'] = v;
     if (v && shouldSeedDefaultShortcutBindings(json)) {
       json['bindings'] = filterDefaultBindingsForPlatform(
-        jsonDecode(bind.mainGetDefaultKeyboardShortcuts()) as List,
+        jsonDecode(bind.crateFlutterFfiMainGetDefaultKeyboardShortcuts()) as List,
         currentPlatformCapabilities(),
       );
     } else if (json.containsKey('bindings')) {
       json['bindings'] = shortcutBindingMapsFrom(json['bindings']);
     }
-    await bind.mainSetLocalOption(
+    await bind.crateFlutterFfiMainSetLocalOption(
         key: kShortcutLocalConfigKey, value: jsonEncode(json));
-    bind.mainReloadKeyboardShortcuts();
+    bind.crateFlutterFfiMainReloadKeyboardShortcuts();
   }
 
   /// Single source of truth for the per-platform "is this shortcut applicable"
@@ -209,7 +209,7 @@ class ShortcutModel {
       includeFullscreenShortcut: desktopLayout,
       includeScreenshotShortcut: isDesktop,
       includeRelativeMouseModeShortcut:
-          isDesktop && !(isLinux && bind.mainCurrentIsWayland()),
+          isDesktop && !(isLinux && bind.crateFlutterFfiMainCurrentIsWayland()),
       includeTabShortcuts: isDesktop,
       includeToolbarShortcut: desktopLayout,
       includeCloseTabShortcut: isDesktop,
@@ -338,7 +338,7 @@ void registerSessionShortcutActions(
   void openDisplay(int display, PeerInfo pi, {bool updateCursorPos = true}) {
     if (isDesktop &&
         pi.isSupportMultiDisplay &&
-        bind.sessionGetDisplaysAsIndividualWindows(sessionId: sessionId) ==
+        bind.crateFlutterFfiSessionGetDisplaysAsIndividualWindows(sessionId: sessionId) ==
             'Y') {
       openMonitorInNewTabOrWindow(display, ffi.id, pi);
     } else {
@@ -466,9 +466,9 @@ void registerSessionShortcutActions(
       final status = ffi.chatModel.voiceCallStatus.value;
       if (status == VoiceCallStatus.connected ||
           status == VoiceCallStatus.waitingForResponse) {
-        bind.sessionCloseVoiceCall(sessionId: sessionId);
+        bind.crateFlutterFfiSessionCloseVoiceCall(sessionId: sessionId);
       } else {
-        bind.sessionRequestVoiceCall(sessionId: sessionId);
+        bind.crateFlutterFfiSessionRequestVoiceCall(sessionId: sessionId);
       }
     });
   }
@@ -495,16 +495,16 @@ void registerSessionShortcutActions(
   // toggle goes on, so the user can never control the remote with their own
   // cursor visible.
   ffi.shortcutModel.register(kShortcutActionToggleShowMyCursor, () async {
-    await bind.sessionToggleOption(
+    await bind.crateFlutterFfiSessionToggleOption(
         sessionId: sessionId, value: kOptionToggleShowMyCursor);
-    final showMyCursor = await bind.sessionGetToggleOption(
+    final showMyCursor = await bind.crateFlutterFfiSessionGetToggleOption(
             sessionId: sessionId, arg: kOptionToggleShowMyCursor) ??
         false;
     ffi.ffiModel.setShowMyCursor(showMyCursor);
     if (showMyCursor && !ffi.ffiModel.viewOnly) {
-      await bind.sessionToggleOption(
+      await bind.crateFlutterFfiSessionToggleOption(
           sessionId: sessionId, value: kOptionToggleViewOnly);
-      final viewOnly = await bind.sessionGetToggleOption(
+      final viewOnly = await bind.crateFlutterFfiSessionGetToggleOption(
               sessionId: sessionId, arg: kOptionToggleViewOnly) ??
           false;
       ffi.ffiModel.setViewOnly(ffi.id, viewOnly);
@@ -517,19 +517,19 @@ void registerSessionShortcutActions(
     ffi.shortcutModel.register(actionId, () async {
       if (!ffi.ffiModel.keyboard ||
           ffi.ffiModel.viewOnly ||
-          !bind.sessionIsKeyboardModeSupported(
+          !bind.crateFlutterFfiSessionIsKeyboardModeSupported(
               sessionId: sessionId, mode: mode) ||
           (ffi.ffiModel.pi.isWayland && mode != kKeyMapMode)) {
         return;
       }
       if (isInputSourceFlutter && isDesktop) {
-        final modeOnly = bind.sessionIsKeyboardModeSupported(
+        final modeOnly = bind.crateFlutterFfiSessionIsKeyboardModeSupported(
                 sessionId: sessionId, mode: kKeyMapMode)
             ? kKeyMapMode
             : kKeyLegacyMode;
         if (mode != modeOnly) return;
       }
-      await bind.sessionSetKeyboardMode(sessionId: sessionId, value: mode);
+      await bind.crateFlutterFfiSessionSetKeyboardMode(sessionId: sessionId, value: mode);
       await ffi.inputModel.updateKeyboardMode();
     });
   }
@@ -549,10 +549,10 @@ void registerSessionShortcutActions(
             ffi.ffiModel.pi.amyuniVirtualDisplayCount == 0)) {
       return;
     }
-    bind.sessionToggleVirtualDisplay(
+    bind.crateFlutterFfiSessionToggleVirtualDisplay(
       sessionId: sessionId,
       index: kAllVirtualDisplay,
-      on: false,
+      on_: false,
     );
   });
 
@@ -589,7 +589,7 @@ void registerSessionShortcutActions(
     if (ffiModel.permissions['privacy_mode'] == false) return false;
     if (allowDisplaySwitchInPrivacyMode(pi, implKey) ||
         (pi.currentDisplay == 0 &&
-            !bind.sessionIsMultiUiSession(sessionId: sessionId))) {
+            !bind.crateFlutterFfiSessionIsMultiUiSession(sessionId: sessionId))) {
       return true;
     }
     msgBox(sessionId, 'custom-nook-nocancel-hasclose', 'info',
@@ -608,26 +608,26 @@ void registerSessionShortcutActions(
         null) {
       // Older peers use the legacy option instead of a named implementation.
       if (!checkPrivacyModeAllowed(kPrivacyModeImplMag)) return;
-      bind.sessionToggleOption(sessionId: sessionId, value: 'privacy-mode');
+      bind.crateFlutterFfiSessionToggleOption(sessionId: sessionId, value: 'privacy-mode');
       return;
     }
     final implKey = findPrivacyImpl('privacy_mode_impl_mag_tip');
     if (implKey == null) return;
     if (!checkPrivacyModeAllowed(implKey)) return;
-    bind.sessionTogglePrivacyMode(
+    bind.crateFlutterFfiSessionTogglePrivacyMode(
       sessionId: sessionId,
       implKey: implKey,
-      on: PrivacyModeState.find(ffi.id).value != implKey,
+      on_: PrivacyModeState.find(ffi.id).value != implKey,
     );
   });
   ffi.shortcutModel.register(kShortcutActionPrivacyMode2, () {
     final implKey = findPrivacyImpl('privacy_mode_impl_virtual_display_tip');
     if (implKey == null) return;
     if (!checkPrivacyModeAllowed(implKey)) return;
-    bind.sessionTogglePrivacyMode(
+    bind.crateFlutterFfiSessionTogglePrivacyMode(
       sessionId: sessionId,
       implKey: implKey,
-      on: PrivacyModeState.find(ffi.id).value != implKey,
+      on_: PrivacyModeState.find(ffi.id).value != implKey,
     );
   });
 
@@ -636,13 +636,13 @@ void registerSessionShortcutActions(
   // Mirrors the desktop callback: toggle + sync FfiModel.viewOnly +
   // FfiModel.showMyCursor (the toolbar keeps these in step).
   ffi.shortcutModel.register(kShortcutActionToggleViewOnly, () async {
-    await bind.sessionToggleOption(
+    await bind.crateFlutterFfiSessionToggleOption(
         sessionId: sessionId, value: kOptionToggleViewOnly);
-    final viewOnly = await bind.sessionGetToggleOption(
+    final viewOnly = await bind.crateFlutterFfiSessionGetToggleOption(
             sessionId: sessionId, arg: kOptionToggleViewOnly) ??
         false;
     ffi.ffiModel.setViewOnly(ffi.id, viewOnly);
-    final showMyCursor = await bind.sessionGetToggleOption(
+    final showMyCursor = await bind.crateFlutterFfiSessionGetToggleOption(
             sessionId: sessionId, arg: kOptionToggleShowMyCursor) ??
         false;
     ffi.ffiModel.setShowMyCursor(showMyCursor);
@@ -652,12 +652,12 @@ void registerSessionShortcutActions(
   // default), flip, write back.
   ffi.shortcutModel.register(kShortcutActionToggleReverseMouseWheel, () async {
     if (!ffi.ffiModel.keyboard || ffi.ffiModel.viewOnly) return;
-    var cur = bind.sessionGetReverseMouseWheelSync(sessionId: sessionId) ?? '';
+    var cur = bind.crateFlutterFfiSessionGetReverseMouseWheelSync(sessionId: sessionId) ?? '';
     if (cur == '') {
-      cur = bind.mainGetUserDefaultOption(key: kKeyReverseMouseWheel);
+      cur = bind.crateFlutterFfiMainGetUserDefaultOption(key: kKeyReverseMouseWheel);
     }
     final next = cur == 'Y' ? 'N' : 'Y';
-    await bind.sessionSetReverseMouseWheel(sessionId: sessionId, value: next);
+    await bind.crateFlutterFfiSessionSetReverseMouseWheel(sessionId: sessionId, value: next);
   });
 
   // Toggle Relative mouse mode (gaming mode). Desktop only.

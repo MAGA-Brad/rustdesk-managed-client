@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -8,6 +9,9 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/models/input_model.dart';
+import 'package:flutter_hbb/models/managed_chat_model.dart';
+import 'package:flutter_hbb/models/platform_model.dart';
+import 'package:window_size/window_size.dart' as window_size;
 
 /// must keep the order
 // ignore: constant_identifier_names
@@ -18,6 +22,7 @@ enum WindowType {
   ViewCamera,
   PortForward,
   Terminal,
+  ManagedChat,
   Unknown
 }
 
@@ -36,6 +41,8 @@ extension Index on int {
         return WindowType.PortForward;
       case 5:
         return WindowType.Terminal;
+      case 6:
+        return WindowType.ManagedChat;
       default:
         return WindowType.Unknown;
     }
@@ -65,8 +72,17 @@ class RustDeskMultiWindowManager {
   final List<int> _viewCameraWindows = List.empty(growable: true);
   final List<int> _portForwardWindows = List.empty(growable: true);
   final List<int> _terminalWindows = List.empty(growable: true);
+  // Chat windows are keyed by conversation id, not tracked as a reusable
+  // session-slot list like the other window types above - there's exactly
+  // one window per conversation, and a closed one should be forgotten
+  // rather than kept around for reuse.
+  final Map<String, int> _managedChatWindows = {};
+  // Conversations whose chat window is still being created, and whether
+  // another push for it arrived meanwhile - a burst of pushes otherwise
+  // opens one window per push.
+  final Map<String, bool> _managedChatWindowsOpening = {};
 
-  moveTabToNewWindow(int windowId, String peerId, String sessionId,
+  Future<void> moveTabToNewWindow(int windowId, String peerId, String sessionId,
       WindowType windowType) async {
     var params = {
       'type': windowType.index,
@@ -97,8 +113,8 @@ class RustDeskMultiWindowManager {
 
   // This function must be called in the main window thread.
   // Because the _remoteDesktopWindows is managed in that thread.
-  openMonitorSession(int windowId, String peerId, int display, int displayCount,
-      Rect? screenRect, int windowType) async {
+  Future<void> openMonitorSession(int windowId, String peerId, int display,
+      int displayCount, Rect? screenRect, int windowType) async {
     final isCamera = windowType == WindowType.ViewCamera.index;
     final windowIDs = isCamera ? _viewCameraWindows : _remoteDesktopWindows;
     if (windowIDs.length > 1) {
@@ -383,6 +399,158 @@ class RustDeskMultiWindowManager {
     return MultiWindowCallResult(windowId, null);
   }
 
+  // Opens (or shows/focuses, or pushes a refresh to) the floating chat
+  // window for one conversation. Must be called from the main window
+  // thread, same as the other _*Windows lists above. A window that was
+  // closed by the user is only ever hidden (see
+  // DesktopManagedChatScreen.onWindowClose), never destroyed - matching
+  // every other window type in this file - so an existing map entry is
+  // always safe to show/focus/reuse rather than replace.
+  // A delivery confirmation for a message this device sent shouldn't pop
+  // a window open on its own - it's only useful to refresh a window the
+  // user already has open (so its "pending delivery" marker clears live),
+  // never to surface one that isn't. No-op if there's no window for this
+  // conversation right now, unlike openManagedChatWindow.
+  Future<void> refreshManagedChatWindowIfOpen(String conversationId) async {
+    final existingWindowId = _managedChatWindows[conversationId];
+    if (existingWindowId != null) {
+      await DesktopMultiWindow.invokeMethod(
+          existingWindowId, kWindowEventManagedChatMessage, conversationId);
+    }
+  }
+
+  // `activate` is false for an incoming message: any approved device can
+  // send one, and it must not be able to pull the keyboard into this window
+  // while the user types elsewhere (a password in a remote session) and
+  // receive what they type. Such a window is shown without activation and
+  // flashes; only the user's own click focuses it.
+  Future<void> openManagedChatWindow(String conversationId,
+      {bool activate = true}) async {
+    final existingWindowId = _managedChatWindows[conversationId];
+    if (existingWindowId != null && !activate) {
+      // The window refreshes itself; bringing it up never waits on that.
+      unawaited(DesktopMultiWindow.invokeMethod(
+              existingWindowId, kWindowEventManagedChatSurface, conversationId)
+          .catchError((_) {}));
+      if (!isWindows) await _surfaceManagedChatWindow(existingWindowId);
+      await registerActiveWindow(existingWindowId);
+      return;
+    }
+    if (existingWindowId != null) {
+      await DesktopMultiWindow.invokeMethod(
+          existingWindowId, kWindowEventManagedChatMessage, conversationId);
+      await WindowController.fromWindowId(existingWindowId).show();
+      await WindowController.fromWindowId(existingWindowId).focus();
+      await registerActiveWindow(existingWindowId);
+      await DesktopMultiWindow.invokeMethod(
+          existingWindowId, kWindowEventManagedChatActivate, conversationId);
+      return;
+    }
+    if (_managedChatWindowsOpening.containsKey(conversationId)) {
+      _managedChatWindowsOpening[conversationId] = true;
+      return;
+    }
+    _managedChatWindowsOpening[conversationId] = false;
+
+    try {
+      var params = {
+        'type': WindowType.ManagedChat.index,
+        'conversation_id': conversationId,
+        'activate': activate,
+      };
+      // On Windows setFrame is in physical pixels; scale the logical size by the
+      // display scaling so the window looks the same size at 100%, 150% and
+      // 200%. macOS/Linux already take logical units. Resolved before
+      // createWindow so the frame calls below still follow it immediately,
+      // ahead of the new window's own restoreWindowPosition (see main.dart).
+      final scale = isWindows ? await _managedChatWindowScale() : 1.0;
+      final title = await _managedChatWindowTitle(conversationId);
+      final windowController =
+          await DesktopMultiWindow.createWindow(jsonEncode(params));
+      if (isWindows) {
+        windowController.setInitBackgroundColor(Colors.black);
+      }
+      final windowId = windowController.windowId;
+      windowController
+        ..setFrame(Offset.zero & Size(420 * scale, 600 * scale))
+        ..center()
+        ..setTitle(title);
+      if (isMacOS) {
+        Future.microtask(() => windowController.show());
+      }
+      registerActiveWindow(windowId);
+      _managedChatWindows[conversationId] = windowId;
+    } finally {
+      final pushedMeanwhile =
+          _managedChatWindowsOpening.remove(conversationId) ?? false;
+      final windowId = _managedChatWindows[conversationId];
+      // The new window may have loaded the conversation before that push's
+      // message was stored.
+      if (pushedMeanwhile && windowId != null) {
+        try {
+          await DesktopMultiWindow.invokeMethod(
+              windowId, kWindowEventManagedChatMessage, conversationId);
+        } catch (e) {
+          debugPrint('managed chat: refreshing the new chat window failed: $e');
+        }
+      }
+    }
+  }
+
+  // Shows a chat window an incoming message brought up, where the platform has
+  // no native bring-up (on Windows, managed_chat.rs's surface_chat_window shows
+  // it without the keyboard and flashes it).
+  Future<void> _surfaceManagedChatWindow(int windowId) async {
+    final controller = WindowController.fromWindowId(windowId);
+    if (await controller.isHidden()) await controller.show();
+  }
+
+  // "Chat - " and the other device's name: unique per conversation, so the
+  // native side (managed_chat.rs's chat_window_titles) finds the window to bring
+  // up for a new message, and the taskbar says who is writing.
+  Future<String> _managedChatWindowTitle(String conversationId) async {
+    final model = gFFI.managedChatModel;
+    ManagedChatConversation? find() {
+      for (final conversation in model.conversations) {
+        if (conversation.id == conversationId) return conversation;
+      }
+      return null;
+    }
+
+    var conversation = find();
+    if (conversation == null) {
+      await model.loadLocalConversations();
+      conversation = find();
+    }
+    final participants = conversation?.participants ?? [];
+    if (participants.isEmpty) {
+      return getWindowName(overrideType: WindowType.ManagedChat);
+    }
+    final myId = await bind.crateFlutterFfiMainGetMyId();
+    final peer = participants.firstWhere((p) => p.rustdeskId != myId,
+        orElse: () => participants.first);
+    return 'Chat - ${peer.displayName}';
+  }
+
+  // The scaling of the monitor a new chat window opens on, which is not
+  // necessarily this (main) window's: with mixed scaling across monitors the
+  // main window's devicePixelRatio made the chat window too big or too small.
+  // A frame at the origin gets centered onto the primary monitor, the one
+  // whose top-left is (0, 0) on Windows.
+  Future<double> _managedChatWindowScale() async {
+    try {
+      for (final screen in await window_size.getScreenList()) {
+        if (screen.frame.contains(Offset.zero)) {
+          return screen.scaleFactor;
+        }
+      }
+    } catch (e) {
+      debugPrint('Failed to get screen list: $e');
+    }
+    final views = WidgetsBinding.instance.platformDispatcher.views;
+    return views.isEmpty ? 1.0 : views.first.devicePixelRatio;
+  }
+
   Future<MultiWindowCallResult> call(
       WindowType type, String methodName, dynamic args) async {
     final wnds = _findWindowsByType(type);
@@ -415,6 +583,8 @@ class RustDeskMultiWindowManager {
         return _portForwardWindows;
       case WindowType.Terminal:
         return _terminalWindows;
+      case WindowType.ManagedChat:
+        return _managedChatWindows.values.toList();
       case WindowType.Unknown:
         break;
     }
@@ -439,6 +609,10 @@ class RustDeskMultiWindowManager {
         break;
       case WindowType.Terminal:
         _terminalWindows.clear();
+        break;
+      case WindowType.ManagedChat:
+        _managedChatWindows.clear();
+        break;
       case WindowType.Unknown:
         break;
     }
@@ -472,7 +646,8 @@ class RustDeskMultiWindowManager {
     }
     for (int i = 0; i < windows.length; i++) {
       final wId = windows[i];
-      final shouldSavePos = type != WindowType.Terminal || i == windows.length - 1;
+      final shouldSavePos =
+          type != WindowType.Terminal || i == windows.length - 1;
       if (shouldSavePos) {
         debugPrint("closing multi window, type: ${type.toString()} id: $wId");
         try {
@@ -579,3 +754,9 @@ class RustDeskMultiWindowManager {
 }
 
 final rustDeskWinManager = RustDeskMultiWindowManager.instance;
+
+// To a chat window an incoming message brought up: it drops the keyboard
+// unless it is the focused window (see DesktopManagedChatScreen).
+const String kWindowEventManagedChatSurface = 'managed_chat_window_surface';
+// To a chat window the user opened themselves: it takes the keyboard.
+const String kWindowEventManagedChatActivate = 'managed_chat_window_activate';

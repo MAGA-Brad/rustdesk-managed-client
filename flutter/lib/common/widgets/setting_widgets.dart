@@ -6,7 +6,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
 
-customImageQualityWidget(
+Column customImageQualityWidget(
     {required double initQuality,
     required double initFps,
     required Function(double)? setQuality,
@@ -147,17 +147,17 @@ customImageQualityWidget(
   );
 }
 
-customImageQualitySetting() {
+dynamic customImageQualitySetting() {
   final qualityKey = 'custom_image_quality';
   final fpsKey = 'custom-fps';
 
-  final initQuality =
-      (double.tryParse(bind.mainGetUserDefaultOption(key: qualityKey)) ??
-          kDefaultQuality);
+  final initQuality = (double.tryParse(
+          bind.crateFlutterFfiMainGetUserDefaultOption(key: qualityKey)) ??
+      kDefaultQuality);
   final isQuanlityFixed = isOptionFixed(qualityKey);
-  final initFps =
-      (double.tryParse(bind.mainGetUserDefaultOption(key: fpsKey)) ??
-          kDefaultFps);
+  final initFps = (double.tryParse(
+          bind.crateFlutterFfiMainGetUserDefaultOption(key: fpsKey)) ??
+      kDefaultFps);
   final isFpsFixed = isOptionFixed(fpsKey);
 
   return customImageQualityWidget(
@@ -166,13 +166,14 @@ customImageQualitySetting() {
       setQuality: isQuanlityFixed
           ? null
           : (v) {
-              bind.mainSetUserDefaultOption(
+              bind.crateFlutterFfiMainSetUserDefaultOption(
                   key: qualityKey, value: v.toString());
             },
       setFps: isFpsFixed
           ? null
           : (v) {
-              bind.mainSetUserDefaultOption(key: fpsKey, value: v.toString());
+              bind.crateFlutterFfiMainSetUserDefaultOption(
+                  key: fpsKey, value: v.toString());
             },
       showFps: true,
       showMoreQuality: true);
@@ -255,26 +256,26 @@ List<(String, String)> otherDefaultSettings() {
 
 String getOtherDefaultSettingOption(String key) {
   if (key == kOptionAllowTerminalClipboardWrite) {
-    return bind.mainGetLocalOption(key: key);
+    return bind.crateFlutterFfiMainGetLocalOption(key: key);
   }
-  return bind.mainGetUserDefaultOption(key: key);
+  return bind.crateFlutterFfiMainGetUserDefaultOption(key: key);
 }
 
 Future<void> setOtherDefaultSettingOption(String key, String value) {
   if (key == kOptionAllowTerminalClipboardWrite) {
-    return bind.mainSetLocalOption(
+    return bind.crateFlutterFfiMainSetLocalOption(
       key: key,
       value: value == kTerminalClipboardWriteAllowed
           ? kTerminalClipboardWriteAllowed
           : kTerminalClipboardWriteDenied,
     );
   }
-  return bind.mainSetUserDefaultOption(key: key, value: value);
+  return bind.crateFlutterFfiMainSetUserDefaultOption(key: key, value: value);
 }
 
 bool isOtherDefaultSettingReadOnly(String key) =>
     isOptionFixed(key) ||
-    (key == kOptionAllowTerminalClipboardWrite && bind.isDisableSettings());
+    (key == kOptionAllowTerminalClipboardWrite && bind.crateFlutterFfiIsDisableSettings());
 
 class TrackpadSpeedWidget extends StatefulWidget {
   final SimpleWrapper<int> value;

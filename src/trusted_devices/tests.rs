@@ -48,8 +48,11 @@ fn configure() -> std::collections::HashMap<String, String> {
         created_at: 1,
     };
     assert!(config::set_password(PASSWORD).unwrap());
+    let secret = totp.into_string().unwrap();
+    // Our hbb_common keeps 2FA out of full-map option writes; it is set through its own key.
+    Config::set_option("2fa".into(), secret.clone());
     let mut options = Config::get_options();
-    options.insert("2fa".into(), totp.into_string().unwrap());
+    options.insert("2fa".into(), secret);
     options.insert(keys::OPTION_ENABLE_TRUSTED_DEVICES.into(), "Y".into());
     config::set_options(options.clone()).unwrap();
     options

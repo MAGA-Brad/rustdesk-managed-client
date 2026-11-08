@@ -6,13 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/dialog.dart';
-import 'package:flutter_hbb/common/widgets/login.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/shortcut_model.dart';
-import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -62,7 +60,7 @@ Widget waylandKeyboardScopeChip(BuildContext context, String text) {
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
     decoration: BoxDecoration(
       borderRadius: BorderRadius.circular(999),
-      border: Border.all(color: colorScheme.primary.withOpacity(0.35)),
+      border: Border.all(color: colorScheme.primary.withValues(alpha: 0.35)),
     ),
     child: Text(
       text,
@@ -254,27 +252,28 @@ List<TRadioMenu<T>> _registerRadioMenuShortcuts<T>(
   return menus;
 }
 
-handleOsPasswordEditIcon(
+void handleOsPasswordEditIcon(
     SessionID sessionId, OverlayDialogManager dialogManager) {
   isEditOsPassword = true;
   showSetOSPassword(
       sessionId, false, dialogManager, null, () => isEditOsPassword = false);
 }
 
-handleOsPasswordAction(
+Future<void> handleOsPasswordAction(
     SessionID sessionId, OverlayDialogManager dialogManager) async {
   if (isEditOsPassword) {
     isEditOsPassword = false;
     return;
   }
-  final password =
-      await bind.sessionGetOption(sessionId: sessionId, arg: 'os-password') ??
-          '';
+  final password = await bind.crateFlutterFfiSessionGetOption(
+          sessionId: sessionId, arg: 'os-password') ??
+      '';
   if (password.isEmpty) {
     showSetOSPassword(sessionId, true, dialogManager, password,
         () => isEditOsPassword = false);
   } else {
-    bind.sessionInputOsPassword(sessionId: sessionId, value: password);
+    bind.crateFlutterFfiSessionInputOsPassword(
+        sessionId: sessionId, value: password);
   }
 }
 
@@ -327,7 +326,7 @@ void showWaylandKeyboardInputWarningDialog(
       var rememberPersisted = true;
       if (remember) {
         try {
-          await bind.mainSetPeerOption(
+          await bind.crateFlutterFfiMainSetPeerOption(
               id: id,
               key: kPeerOptionAllowWaylandKeyboard,
               value: bool2option(kPeerOptionAllowWaylandKeyboard, true));
@@ -508,7 +507,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
           Future<void> sendClipboardKeystrokes() async {
             ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
             if (data != null && data.text != null) {
-              bind.sessionInputString(
+              bind.crateFlutterFfiSessionInputString(
                   sessionId: sessionId, value: data.text ?? "");
             }
           }
@@ -543,7 +542,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
         onPressed: () async {
           var persistedCleared = false;
           try {
-            await bind.mainSetPeerOption(
+            await bind.crateFlutterFfiMainSetPeerOption(
                 id: id,
                 key: kPeerOptionAllowWaylandKeyboard,
                 value: bool2option(kPeerOptionAllowWaylandKeyboard, false));
@@ -570,67 +569,6 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
         actionId: kShortcutActionResetCanvas));
   }
 
-  // https://github.com/rustdesk/rustdesk/pull/9731
-  // Does not work for connection established by "accept".
-  connectWithToken(
-      {bool isFileTransfer = false,
-      bool isViewCamera = false,
-      bool isTcpTunneling = false,
-      bool isTerminal = false}) {
-    final connToken = bind.sessionGetConnToken(sessionId: ffi.sessionId);
-    connect(context, id,
-        isFileTransfer: isFileTransfer,
-        isViewCamera: isViewCamera,
-        isTerminal: isTerminal,
-        isTcpTunneling: isTcpTunneling,
-        connToken: connToken);
-  }
-
-  if (isDefaultConn && isDesktop) {
-    v.add(
-      TTextMenu(
-          child: Text(translate('Transfer file')),
-          onPressed: () => connectWithToken(isFileTransfer: true)),
-    );
-    v.add(
-      TTextMenu(
-          child: Text(translate('View camera')),
-          onPressed: () => connectWithToken(isViewCamera: true)),
-    );
-    v.add(
-      TTextMenu(
-          child: Text('${translate('Terminal')} (beta)'),
-          onPressed: () => connectWithToken(isTerminal: true)),
-    );
-    v.add(
-      TTextMenu(
-          child: Text(translate('TCP tunneling')),
-          onPressed: () => connectWithToken(isTcpTunneling: true)),
-    );
-  }
-  // note
-  if (isDefaultConn && !bind.isDisableAccount()) {
-    v.add(
-      TTextMenu(
-          child: Text(translate('Note')),
-          onPressed: () async {
-            bool isLogin =
-                bind.mainGetLocalOption(key: 'access_token').isNotEmpty;
-            if (!isLogin) {
-              final res = await loginDialog();
-              if (res != true) return;
-              // Desktop: send message to main window to refresh login status
-              // Web: login is required before connection, so no need to refresh
-              // Mobile: same isolate, no need to send message
-              if (isDesktop) {
-                rustDeskWinManager.call(
-                    WindowType.Main, kWindowRefreshCurrentUser, "");
-              }
-            }
-            showAuditDialog(ffi);
-          }),
-    );
-  }
   // divider
   if (isDefaultConn && (isDesktop || isWebDesktop)) {
     v.add(TTextMenu(child: Offstage(), onPressed: () {}, divider: true));
@@ -642,8 +580,9 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       (pi.platform == kPeerPlatformLinux || pi.sasEnabled)) {
     v.add(
       TTextMenu(
-          child: Text('${translate("Insert Ctrl + Alt + Del")}'),
-          onPressed: () => bind.sessionCtrlAltDel(sessionId: sessionId),
+          child: Text(translate("Insert Ctrl + Alt + Del")),
+          onPressed: () =>
+              bind.crateFlutterFfiSessionCtrlAltDel(sessionId: sessionId),
           actionId: kShortcutActionSendCtrlAltDel),
     );
   }
@@ -661,32 +600,18 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
           actionId: kShortcutActionRestartRemote),
     );
   }
-  // insertLock
-  if (isDefaultConn && !ffiModel.viewOnly && ffi.ffiModel.keyboard) {
+  // insertLock (managed builds never lock the remote computer)
+  if (isDefaultConn &&
+      !ffiModel.viewOnly &&
+      ffi.ffiModel.keyboard &&
+      !isManagedClientBuild()) {
     v.add(
       TTextMenu(
           child: Text(translate('Insert Lock')),
-          onPressed: () => bind.sessionLockScreen(sessionId: sessionId),
+          onPressed: () =>
+              bind.crateFlutterFfiSessionLockScreen(sessionId: sessionId),
           actionId: kShortcutActionInsertLock),
     );
-  }
-  // blockUserInput
-  if (isDefaultConn &&
-      ffi.ffiModel.keyboard &&
-      ffi.ffiModel.permissions['block_input'] != false &&
-      pi.platform == kPeerPlatformWindows) // privacy-mode != true ??
-  {
-    v.add(TTextMenu(
-        child: Obx(() => Text(translate(
-            '${BlockInputState.find(id).value ? 'Unb' : 'B'}lock user input'))),
-        onPressed: () {
-          RxBool blockInput = BlockInputState.find(id);
-          bind.sessionToggleOption(
-              sessionId: sessionId,
-              value: '${blockInput.value ? 'un' : ''}block-input');
-          blockInput.value = !blockInput.value;
-        },
-        actionId: kShortcutActionToggleBlockInput));
   }
   // switchSides
   if (isDefaultConn &&
@@ -694,7 +619,9 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       ffiModel.keyboard &&
       pi.platform != kPeerPlatformAndroid &&
       versionCmp(pi.version, '1.2.0') >= 0 &&
-      bind.peerGetSessionsCount(id: id, connType: ffi.connType.index) == 1) {
+      bind.crateFlutterFfiPeerGetSessionsCount(
+              id: id, connType: ffi.connType.index) ==
+          1) {
     v.add(TTextMenu(
         child: Text(translate('Switch Sides')),
         onPressed: () =>
@@ -709,35 +636,11 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       actionId: kShortcutActionRefresh,
     ));
   }
-  // record
-  if (!(isDesktop || isWeb) &&
-      bind.mainGetLocalOption(key: kOptionHideRecordingButton) != 'Y' &&
-      (ffi.recordingModel.start || (perms["recording"] != false))) {
-    v.add(TTextMenu(
-        child: Row(
-          children: [
-            Text(translate(ffi.recordingModel.start
-                ? 'Stop session recording'
-                : 'Start session recording')),
-            Padding(
-              padding: EdgeInsets.only(left: 12),
-              child: Icon(
-                  ffi.recordingModel.start
-                      ? Icons.pause_circle_filled
-                      : Icons.videocam_outlined,
-                  color: MyTheme.accent),
-            )
-          ],
-        ),
-        onPressed: () => ffi.recordingModel.toggle(),
-        actionId: kShortcutActionToggleRecording));
-  }
-
   // to-do:
   // 1. Web desktop
   // 2. Mobile, copy the image to the clipboard
   if ((isDefaultConn || ffi.connType == ConnType.viewCamera) && isDesktop) {
-    final isScreenshotSupported = bind.sessionGetCommonSync(
+    final isScreenshotSupported = bind.crateFlutterFfiSessionGetCommonSync(
         sessionId: sessionId, key: 'is_screenshot_supported', param: '');
     if ('true' == isScreenshotSupported) {
       v.add(TTextMenu(
@@ -764,7 +667,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
                       '',
                       ffi.dialogManager);
                 } else {
-                  bind.sessionTakeScreenshot(
+                  bind.crateFlutterFfiSessionTakeScreenshot(
                       sessionId: sessionId, display: pi.currentDisplay);
                   ffi.ffiModel.timerScreenshot =
                       Timer(Duration(seconds: 30), () {
@@ -800,11 +703,13 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
 Future<List<TRadioMenu<String>>> toolbarViewStyle(
     BuildContext context, String id, FFI ffi) async {
   final groupValue =
-      await bind.sessionGetViewStyle(sessionId: ffi.sessionId) ?? '';
+      await bind.crateFlutterFfiSessionGetViewStyle(sessionId: ffi.sessionId) ??
+          '';
   void onChanged(String? value) async {
     if (value == null) return;
     bind
-        .sessionSetViewStyle(sessionId: ffi.sessionId, value: value)
+        .crateFlutterFfiSessionSetViewStyle(
+            sessionId: ffi.sessionId, value: value)
         .then((_) => ffi.canvasModel.updateViewStyle());
   }
 
@@ -832,11 +737,13 @@ Future<List<TRadioMenu<String>>> toolbarViewStyle(
 
 Future<List<TRadioMenu<String>>> toolbarImageQuality(
     BuildContext context, String id, FFI ffi) async {
-  final groupValue =
-      await bind.sessionGetImageQuality(sessionId: ffi.sessionId) ?? '';
+  final groupValue = await bind.crateFlutterFfiSessionGetImageQuality(
+          sessionId: ffi.sessionId) ??
+      '';
   onChanged(String? value) async {
     if (value == null) return;
-    await bind.sessionSetImageQuality(sessionId: ffi.sessionId, value: value);
+    await bind.crateFlutterFfiSessionSetImageQuality(
+        sessionId: ffi.sessionId, value: value);
   }
 
   return _registerRadioMenuShortcuts(ffi, [
@@ -874,8 +781,8 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
     BuildContext context, String id, FFI ffi) async {
   final sessionId = ffi.sessionId;
   final alternativeCodecs =
-      await bind.sessionAlternativeCodecs(sessionId: sessionId);
-  final groupValue = await bind.sessionGetOption(
+      await bind.crateFlutterFfiSessionAlternativeCodecs(sessionId: sessionId);
+  final groupValue = await bind.crateFlutterFfiSessionGetOption(
           sessionId: sessionId, arg: kOptionCodecPreference) ??
       '';
   final List<bool> codecs = [];
@@ -900,9 +807,9 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
   }
   onChanged(String? value) async {
     if (value == null) return;
-    await bind.sessionPeerOption(
+    await bind.crateFlutterFfiSessionPeerOption(
         sessionId: sessionId, name: kOptionCodecPreference, value: value);
-    bind.sessionChangePreferCodec(sessionId: sessionId);
+    bind.crateFlutterFfiSessionChangePreferCodec(sessionId: sessionId);
   }
 
   TRadioMenu<String> radio(
@@ -946,7 +853,7 @@ Future<List<TToggleMenu>> toolbarCursor(
     final enabled = !ffiModel.viewOnly;
     final option = 'show-remote-cursor';
     if (pi.currentDisplay == kAllDisplayValue ||
-        bind.sessionIsMultiUiSession(sessionId: sessionId)) {
+        bind.crateFlutterFfiSessionIsMultiUiSession(sessionId: sessionId)) {
       lockState.value = false;
     }
     v.add(TToggleMenu(
@@ -956,9 +863,9 @@ Future<List<TToggleMenu>> toolbarCursor(
         onChanged: enabled && !lockState.value
             ? (value) async {
                 if (value == null) return;
-                await bind.sessionToggleOption(
+                await bind.crateFlutterFfiSessionToggleOption(
                     sessionId: sessionId, value: option);
-                state.value = bind.sessionGetToggleOptionSync(
+                state.value = bind.crateFlutterFfiSessionGetToggleOptionSync(
                     sessionId: sessionId, arg: option);
               }
             : null));
@@ -970,20 +877,20 @@ Future<List<TToggleMenu>> toolbarCursor(
       versionCmp(pi.version, "1.2.4") >= 0 &&
       pi.displays.length > 1 &&
       pi.currentDisplay != kAllDisplayValue &&
-      !bind.sessionIsMultiUiSession(sessionId: sessionId)) {
+      !bind.crateFlutterFfiSessionIsMultiUiSession(sessionId: sessionId)) {
     final option = 'follow-remote-cursor';
-    final value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     final showCursorOption = 'show-remote-cursor';
     final showCursorState = ShowRemoteCursorState.find(id);
     final showCursorLockState = ShowRemoteCursorLockState.find(id);
-    final showCursorEnabled = bind.sessionGetToggleOptionSync(
+    final showCursorEnabled = bind.crateFlutterFfiSessionGetToggleOptionSync(
         sessionId: sessionId, arg: showCursorOption);
     showCursorLockState.value = value;
     if (value && !showCursorEnabled) {
-      await bind.sessionToggleOption(
+      await bind.crateFlutterFfiSessionToggleOption(
           sessionId: sessionId, value: showCursorOption);
-      showCursorState.value = bind.sessionGetToggleOptionSync(
+      showCursorState.value = bind.crateFlutterFfiSessionGetToggleOptionSync(
           sessionId: sessionId, arg: showCursorOption);
     }
     v.add(TToggleMenu(
@@ -992,15 +899,17 @@ Future<List<TToggleMenu>> toolbarCursor(
         actionId: kShortcutActionToggleFollowRemoteCursor,
         onChanged: (value) async {
           if (value == null) return;
-          await bind.sessionToggleOption(sessionId: sessionId, value: option);
-          value = bind.sessionGetToggleOptionSync(
+          await bind.crateFlutterFfiSessionToggleOption(
+              sessionId: sessionId, value: option);
+          value = bind.crateFlutterFfiSessionGetToggleOptionSync(
               sessionId: sessionId, arg: option);
           showCursorLockState.value = value;
           if (!showCursorEnabled) {
-            await bind.sessionToggleOption(
+            await bind.crateFlutterFfiSessionToggleOption(
                 sessionId: sessionId, value: showCursorOption);
-            showCursorState.value = bind.sessionGetToggleOptionSync(
-                sessionId: sessionId, arg: showCursorOption);
+            showCursorState.value =
+                bind.crateFlutterFfiSessionGetToggleOptionSync(
+                    sessionId: sessionId, arg: showCursorOption);
           }
         }));
   }
@@ -1011,23 +920,25 @@ Future<List<TToggleMenu>> toolbarCursor(
       versionCmp(pi.version, "1.2.4") >= 0 &&
       pi.displays.length > 1 &&
       pi.currentDisplay != kAllDisplayValue &&
-      !bind.sessionIsMultiUiSession(sessionId: sessionId)) {
+      !bind.crateFlutterFfiSessionIsMultiUiSession(sessionId: sessionId)) {
     final option = 'follow-remote-window';
-    final value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     v.add(TToggleMenu(
         child: Text(translate('Follow remote window focus')),
         value: value,
         actionId: kShortcutActionToggleFollowRemoteWindow,
         onChanged: (value) async {
           if (value == null) return;
-          await bind.sessionToggleOption(sessionId: sessionId, value: option);
-          value = bind.sessionGetToggleOptionSync(
+          await bind.crateFlutterFfiSessionToggleOption(
+              sessionId: sessionId, value: option);
+          value = bind.crateFlutterFfiSessionGetToggleOptionSync(
               sessionId: sessionId, arg: option);
         }));
   }
   // zoom cursor
-  final viewStyle = await bind.sessionGetViewStyle(sessionId: sessionId) ?? '';
+  final viewStyle =
+      await bind.crateFlutterFfiSessionGetViewStyle(sessionId: sessionId) ?? '';
   if (!isMobile &&
       pi.platform != kPeerPlatformAndroid &&
       viewStyle != kRemoteViewStyleOriginal) {
@@ -1039,9 +950,10 @@ Future<List<TToggleMenu>> toolbarCursor(
       actionId: kShortcutActionToggleZoomCursor,
       onChanged: (value) async {
         if (value == null) return;
-        await bind.sessionToggleOption(sessionId: sessionId, value: option);
-        peerState.value =
-            bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+        await bind.crateFlutterFfiSessionToggleOption(
+            sessionId: sessionId, value: option);
+        peerState.value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+            sessionId: sessionId, arg: option);
       },
     ));
   }
@@ -1061,25 +973,28 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
   // show quality monitor
   final option = 'show-quality-monitor';
   v.add(TToggleMenu(
-      value: bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option),
+      value: bind.crateFlutterFfiSessionGetToggleOptionSync(
+          sessionId: sessionId, arg: option),
       actionId: kShortcutActionToggleQualityMonitor,
       onChanged: (value) async {
         if (value == null) return;
-        await bind.sessionToggleOption(sessionId: sessionId, value: option);
+        await bind.crateFlutterFfiSessionToggleOption(
+            sessionId: sessionId, value: option);
         ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
       },
       child: Text(translate('Show quality monitor'))));
   // mute
   if (isDefaultConn && perms['audio'] != false) {
     final option = 'disable-audio';
-    final value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     v.add(TToggleMenu(
         value: value,
         actionId: kShortcutActionToggleMute,
         onChanged: (value) {
           if (value == null) return;
-          bind.sessionToggleOption(sessionId: sessionId, value: option);
+          bind.crateFlutterFfiSessionToggleOption(
+              sessionId: sessionId, value: option);
         },
         child: Text(translate('Mute'))));
   }
@@ -1090,14 +1005,14 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
       pi.platform == kPeerPlatformWindows;
   // If the version is 1.2.4 or later, file copy and paste is supported when kPlatformAdditionsHasFileClipboard is set.
   final isSupportIfPeer_1_2_4 = versionCmp(pi.version, '1.2.4') >= 0 &&
-      bind.mainHasFileClipboard() &&
+      bind.crateFlutterFfiMainHasFileClipboard() &&
       pi.platformAdditions.containsKey(kPlatformAdditionsHasFileClipboard);
   if (isDefaultConn &&
       ffiModel.keyboard &&
       perms['file'] != false &&
       (isSupportIfPeer_1_2_3 || isSupportIfPeer_1_2_4)) {
     final enabled = !ffiModel.viewOnly;
-    final value = bind.sessionGetToggleOptionSync(
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
         sessionId: sessionId, arg: kOptionEnableFileCopyPaste);
     v.add(TToggleMenu(
         value: value,
@@ -1105,7 +1020,7 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         onChanged: enabled
             ? (value) {
                 if (value == null) return;
-                bind.sessionToggleOption(
+                bind.crateFlutterFfiSessionToggleOption(
                     sessionId: sessionId, value: kOptionEnableFileCopyPaste);
               }
             : null,
@@ -1115,8 +1030,8 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
   if (isDefaultConn && ffiModel.keyboard && perms['clipboard'] != false) {
     final enabled = !ffiModel.viewOnly;
     final option = 'disable-clipboard';
-    var value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    var value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     if (ffiModel.viewOnly) value = true;
     v.add(TToggleMenu(
         value: value,
@@ -1124,24 +1039,29 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         onChanged: enabled
             ? (value) {
                 if (value == null) return;
-                bind.sessionToggleOption(sessionId: sessionId, value: option);
+                bind.crateFlutterFfiSessionToggleOption(
+                    sessionId: sessionId, value: option);
               }
             : null,
         child: Text(translate('Disable clipboard'))));
   }
-  // lock after session end
-  if (isDefaultConn && ffiModel.keyboard && !ffiModel.isPeerAndroid) {
+  // lock after session end (managed builds never lock the remote computer)
+  if (isDefaultConn &&
+      ffiModel.keyboard &&
+      !ffiModel.isPeerAndroid &&
+      !isManagedClientBuild()) {
     final enabled = !ffiModel.viewOnly;
     final option = 'lock-after-session-end';
-    final value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     v.add(TToggleMenu(
         value: value,
         actionId: kShortcutActionToggleLockAfterSessionEnd,
         onChanged: enabled
             ? (value) {
                 if (value == null) return;
-                bind.sessionToggleOption(sessionId: sessionId, value: option);
+                bind.crateFlutterFfiSessionToggleOption(
+                    sessionId: sessionId, value: option);
               }
             : null,
         child: Text(translate('Lock after session end'))));
@@ -1152,15 +1072,17 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
       (privacyModeState.isEmpty ||
           allowDisplaySwitchInPrivacyMode(pi, privacyModeState.value)) &&
       pi.displaysCount.value > 1 &&
-      bind.mainGetUserDefaultOption(key: kKeyShowMonitorsToolbar) == 'Y') {
-    final value =
-        bind.sessionGetDisplaysAsIndividualWindows(sessionId: ffi.sessionId) ==
-            'Y';
+      bind.crateFlutterFfiMainGetUserDefaultOption(
+              key: kKeyShowMonitorsToolbar) ==
+          'Y') {
+    final value = bind.crateFlutterFfiSessionGetDisplaysAsIndividualWindows(
+            sessionId: ffi.sessionId) ==
+        'Y';
     v.add(TToggleMenu(
         value: value,
         onChanged: (value) {
           if (value == null) return;
-          bind.sessionSetDisplaysAsIndividualWindows(
+          bind.crateFlutterFfiSessionSetDisplaysAsIndividualWindows(
               sessionId: sessionId, value: value ? 'Y' : 'N');
         },
         child: Text(translate('Show displays as individual windows'))));
@@ -1168,14 +1090,15 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
 
   final isMultiScreens = !isWeb && (await getScreenRectList()).length > 1;
   if (pi.isSupportMultiDisplay && isMultiScreens) {
-    final value = bind.sessionGetUseAllMyDisplaysForTheRemoteSession(
-            sessionId: ffi.sessionId) ==
-        'Y';
+    final value =
+        bind.crateFlutterFfiSessionGetUseAllMyDisplaysForTheRemoteSession(
+                sessionId: ffi.sessionId) ==
+            'Y';
     v.add(TToggleMenu(
         value: value,
         onChanged: (value) {
           if (value == null) return;
-          bind.sessionSetUseAllMyDisplaysForTheRemoteSession(
+          bind.crateFlutterFfiSessionSetUseAllMyDisplaysForTheRemoteSession(
               sessionId: sessionId, value: value ? 'Y' : 'N');
         },
         child: Text(translate('Use all my displays for the remote session'))));
@@ -1186,15 +1109,16 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
   if (versionCmp(pi.version, "1.2.4") >= 0 &&
       (codec_format == "AV1" || codec_format == "VP9")) {
     final option = 'i444';
-    final value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     v.add(TToggleMenu(
         value: value,
         actionId: kShortcutActionToggleTrueColor,
         onChanged: (value) async {
           if (value == null) return;
-          await bind.sessionToggleOption(sessionId: sessionId, value: option);
-          bind.sessionChangePreferCodec(sessionId: sessionId);
+          await bind.crateFlutterFfiSessionToggleOption(
+              sessionId: sessionId, value: option);
+          bind.crateFlutterFfiSessionChangePreferCodec(sessionId: sessionId);
         },
         child: Text(translate('True color (4:4:4)'))));
   }
@@ -1209,7 +1133,7 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         value: ffiModel.viewOnly,
         onChanged: (value) async {
           if (value == null) return;
-          await bind.sessionToggleOption(
+          await bind.crateFlutterFfiSessionToggleOption(
               sessionId: ffi.sessionId, value: kOptionToggleViewOnly);
           ffiModel.setViewOnly(id, value);
         },
@@ -1240,7 +1164,8 @@ List<TToggleMenu> toolbarPrivacyMode(
     if (!turnOn ||
         allowDisplaySwitchInPrivacyMode(pi, targetImplKey) ||
         (ffiModel.pi.currentDisplay == 0 &&
-            !bind.sessionIsMultiUiSession(sessionId: sessionId))) {
+            !bind.crateFlutterFfiSessionIsMultiUiSession(
+                sessionId: sessionId))) {
       return true;
     }
     msgBox(sessionId, 'custom-nook-nocancel-hasclose', 'info',
@@ -1273,7 +1198,7 @@ List<TToggleMenu> toolbarPrivacyMode(
   if (privacyModeImpls == null) {
     return [
       getDefaultMenu((sid, opt) async {
-        bind.sessionToggleOption(sessionId: sid, value: opt);
+        bind.crateFlutterFfiSessionToggleOption(sessionId: sid, value: opt);
         togglePrivacyModeTime = DateTime.now();
       }, kPrivacyModeImplMag)
     ];
@@ -1286,8 +1211,8 @@ List<TToggleMenu> toolbarPrivacyMode(
     final implKey = (privacyModeImpls[0] as List<dynamic>)[0] as String;
     return [
       getDefaultMenu((sid, opt) async {
-        bind.sessionTogglePrivacyMode(
-            sessionId: sid, implKey: implKey, on: privacyModeState.isEmpty);
+        bind.crateFlutterFfiSessionTogglePrivacyMode(
+            sessionId: sid, implKey: implKey, on_: privacyModeState.isEmpty);
         togglePrivacyModeTime = DateTime.now();
       }, implKey)
     ];
@@ -1314,8 +1239,8 @@ List<TToggleMenu> toolbarPrivacyMode(
                     return;
                   }
                   togglePrivacyModeTime = DateTime.now();
-                  bind.sessionTogglePrivacyMode(
-                      sessionId: sessionId, implKey: implKey, on: value);
+                  bind.crateFlutterFfiSessionTogglePrivacyMode(
+                      sessionId: sessionId, implKey: implKey, on_: value);
                 }
               : null);
     }).toList();
@@ -1334,11 +1259,12 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
       ((isMacOS && pi.platform != kPeerPlatformMacOS) ||
           (!isMacOS && pi.platform == kPeerPlatformMacOS))) {
     final option = 'allow_swap_key';
-    final value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     onChanged(bool? value) {
       if (value == null) return;
-      bind.sessionToggleOption(sessionId: sessionId, value: option);
+      bind.crateFlutterFfiSessionToggleOption(
+          sessionId: sessionId, value: option);
     }
 
     final enabled = !ffi.ffiModel.viewOnly;
@@ -1355,7 +1281,8 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
   // Web client is not supported yet due to Pointer Lock API integration complexity with Flutter's input system.
   // Wayland is not supported due to cursor warping limitations.
   // Mobile: This option is now in GestureHelp widget, shown only when joystick is visible.
-  final isWayland = isDesktop && isLinux && bind.mainCurrentIsWayland();
+  final isWayland =
+      isDesktop && isLinux && bind.crateFlutterFfiMainCurrentIsWayland();
   if (isDesktop &&
       isDefaultConn &&
       !isWeb &&
@@ -1379,14 +1306,16 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
 
   // reverse mouse wheel
   if (ffiModel.keyboard) {
-    var optionValue =
-        bind.sessionGetReverseMouseWheelSync(sessionId: sessionId) ?? '';
+    var optionValue = bind.crateFlutterFfiSessionGetReverseMouseWheelSync(
+            sessionId: sessionId) ??
+        '';
     if (optionValue == '') {
-      optionValue = bind.mainGetUserDefaultOption(key: kKeyReverseMouseWheel);
+      optionValue = bind.crateFlutterFfiMainGetUserDefaultOption(
+          key: kKeyReverseMouseWheel);
     }
     onChanged(bool? value) async {
       if (value == null) return;
-      await bind.sessionSetReverseMouseWheel(
+      await bind.crateFlutterFfiSessionSetReverseMouseWheel(
           sessionId: sessionId, value: value ? 'Y' : 'N');
     }
 
@@ -1400,11 +1329,12 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
   // swap left right mouse
   if (ffiModel.keyboard) {
     final option = 'swap-left-right-mouse';
-    final value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    final value = bind.crateFlutterFfiSessionGetToggleOptionSync(
+        sessionId: sessionId, arg: option);
     onChanged(bool? value) {
       if (value == null) return;
-      bind.sessionToggleOption(sessionId: sessionId, value: option);
+      bind.crateFlutterFfiSessionToggleOption(
+          sessionId: sessionId, value: option);
     }
 
     final enabled = !ffi.ffiModel.viewOnly;
@@ -1459,6 +1389,10 @@ void registerToolbarShortcuts(BuildContext context, String id, FFI ffi) {
 }
 
 bool showVirtualDisplayMenu(FFI ffi) {
+  // Managed builds ship no virtual display driver, so a peer still offering one can only fail.
+  if (isManagedClientBuild()) {
+    return false;
+  }
   if (ffi.ffiModel.pi.platform != kPeerPlatformWindows) {
     return false;
   }
@@ -1488,8 +1422,8 @@ List<Widget> getVirtualDisplayMenuChildren(
                 ? null
                 : (bool? value) async {
                     if (value != null) {
-                      bind.sessionToggleVirtualDisplay(
-                          sessionId: ffi.sessionId, index: i + 1, on: value);
+                      bind.crateFlutterFfiSessionToggleVirtualDisplay(
+                          sessionId: ffi.sessionId, index: i + 1, on_: value);
                       clickCallBack?.call();
                     }
                   },
@@ -1502,10 +1436,10 @@ List<Widget> getVirtualDisplayMenuChildren(
           onPressed: privacyModeState.isNotEmpty
               ? null
               : () {
-                  bind.sessionToggleVirtualDisplay(
+                  bind.crateFlutterFfiSessionToggleVirtualDisplay(
                       sessionId: ffi.sessionId,
                       index: kAllVirtualDisplay,
-                      on: false);
+                      on_: false);
                   clickCallBack?.call();
                 },
           ffi: ffi,
@@ -1522,8 +1456,8 @@ List<Widget> getVirtualDisplayMenuChildren(
                 onPressed: privacyModeState.isNotEmpty || count == 0
                     ? null
                     : () {
-                        bind.sessionToggleVirtualDisplay(
-                            sessionId: ffi.sessionId, index: 0, on: false);
+                        bind.crateFlutterFfiSessionToggleVirtualDisplay(
+                            sessionId: ffi.sessionId, index: 0, on_: false);
                         clickCallBack?.call();
                       },
                 child: Icon(Icons.remove),
@@ -1533,8 +1467,8 @@ List<Widget> getVirtualDisplayMenuChildren(
                 onPressed: privacyModeState.isNotEmpty || count == 4
                     ? null
                     : () {
-                        bind.sessionToggleVirtualDisplay(
-                            sessionId: ffi.sessionId, index: 0, on: true);
+                        bind.crateFlutterFfiSessionToggleVirtualDisplay(
+                            sessionId: ffi.sessionId, index: 0, on_: true);
                         clickCallBack?.call();
                       },
                 child: Icon(Icons.add),
@@ -1546,10 +1480,10 @@ List<Widget> getVirtualDisplayMenuChildren(
             onPressed: privacyModeState.isNotEmpty || count == 0
                 ? null
                 : () {
-                    bind.sessionToggleVirtualDisplay(
+                    bind.crateFlutterFfiSessionToggleVirtualDisplay(
                         sessionId: ffi.sessionId,
                         index: kAllVirtualDisplay,
-                        on: false);
+                        on_: false);
                     clickCallBack?.call();
                   },
             ffi: ffi,

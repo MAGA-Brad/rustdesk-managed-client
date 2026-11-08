@@ -29,10 +29,12 @@ abstract class CustomScaleControls<T extends StatefulWidget> extends State<T> {
   int mapPosToPercent(double p) => _mapPosToPercent(p);
 
   static const int minPercent = kScaleCustomMinPercent;
-  static const int pivotPercent = kScaleCustomPivotPercent; // 100% should be at 1/3 of track
+  static const int pivotPercent =
+      kScaleCustomPivotPercent; // 100% should be at 1/3 of track
   static const int maxPercent = kScaleCustomMaxPercent;
   static const double pivotPos = kScaleCustomPivotPos; // first 1/3 → up to 100%
-  static const double detentEpsilon = kScaleCustomDetentEpsilon; // snap range around pivot (~0.6%)
+  static const double detentEpsilon =
+      kScaleCustomDetentEpsilon; // snap range around pivot (~0.6%)
 
   // Clamp helper for local use
   int _clampScale(int v) => clampCustomScalePercent(v);
@@ -105,13 +107,12 @@ abstract class CustomScaleControls<T extends StatefulWidget> extends State<T> {
       _scaleValue = v;
     });
     try {
-      await bind.sessionSetFlutterOption(
-          sessionId: ffi.sessionId,
-          k: kCustomScalePercentKey,
-          v: v.toString());
-      final curStyle = await bind.sessionGetViewStyle(sessionId: ffi.sessionId);
+      await bind.crateFlutterFfiSessionSetFlutterOption(
+          sessionId: ffi.sessionId, k: kCustomScalePercentKey, v: v.toString());
+      final curStyle = await bind.crateFlutterFfiSessionGetViewStyle(
+          sessionId: ffi.sessionId);
       if (curStyle != kRemoteViewStyleCustom) {
-        await bind.sessionSetViewStyle(
+        await bind.crateFlutterFfiSessionSetViewStyle(
             sessionId: ffi.sessionId, value: kRemoteViewStyleCustom);
       }
       await ffi.canvasModel.updateViewStyle();

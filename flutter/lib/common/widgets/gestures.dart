@@ -12,12 +12,9 @@ enum GestureState {
 
 class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
   CustomTouchGestureRecognizer({
-    Object? debugOwner,
-    Set<PointerDeviceKind>? supportedDevices,
-  }) : super(
-          debugOwner: debugOwner,
-          supportedDevices: supportedDevices,
-        ) {
+    super.debugOwner,
+    super.supportedDevices,
+  }) {
     _init();
   }
 
@@ -195,12 +192,9 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
 
 class HoldTapMoveGestureRecognizer extends GestureRecognizer {
   HoldTapMoveGestureRecognizer({
-    Object? debugOwner,
-    Set<PointerDeviceKind>? supportedDevices,
-  }) : super(
-          debugOwner: debugOwner,
-          supportedDevices: supportedDevices,
-        );
+    super.debugOwner,
+    super.supportedDevices,
+  });
 
   GestureDragStartCallback? onHoldDragStart;
   GestureDragUpdateCallback? onHoldDragUpdate;
@@ -463,12 +457,9 @@ class HoldTapMoveGestureRecognizer extends GestureRecognizer {
 
 class DoubleFinerTapGestureRecognizer extends GestureRecognizer {
   DoubleFinerTapGestureRecognizer({
-    Object? debugOwner,
-    Set<PointerDeviceKind>? supportedDevices,
-  }) : super(
-          debugOwner: debugOwner,
-          supportedDevices: supportedDevices,
-        );
+    super.debugOwner,
+    super.supportedDevices,
+  });
 
   GestureTapDownCallback? onDoubleFinerTapDown;
   GestureTapDownCallback? onDoubleFinerTap;

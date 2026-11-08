@@ -161,8 +161,9 @@ pub fn new() -> ServerPtr {
             server.add_service(Box::new(input_service::new_window_focus()));
         }
     }
+    // Managed builds have no remote printer.
     #[cfg(all(target_os = "windows", feature = "flutter"))]
-    {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
         match printer_service::init(&crate::get_app_name()) {
             Ok(()) => {
                 log::info!("printer service initialized");
@@ -233,6 +234,11 @@ pub async fn create_tcp_connection(
         _ = unauthorized.evicted() => {
             bail!("evicted to make room for a newer unauthenticated connection");
         }
+    }
+    // Managed builds never run a session in plaintext; the pk refresh above still happened, so a
+    // legitimate controller that lacked our verified key succeeds on its next attempt.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() && !stream.is_secured() {
+        bail!("refusing unencrypted connection from {}", addr);
     }
 
     #[cfg(target_os = "macos")]
@@ -386,6 +392,16 @@ pub async fn create_relay_connection(
     )
     .await
     {
+        // When another route (WebRTC, a direct connection) wins the race, the controller never
+        // joins this relay and hbbr closes it before the handshake: the design working, not a fault.
+        if err.to_string() == "Failed to receive public key" {
+            log::info!(
+                "Relay {} for {} closed before the controller joined (another route won)",
+                uuid,
+                peer_addr
+            );
+            return;
+        }
         log::error!(
             "Failed to create relay connection for {} with uuid {}: {}",
             peer_addr,
@@ -407,8 +423,8 @@ async fn create_relay_connection_(
     // The proxy's address family does not constrain the relay target.
     let relay_server = crate::check_port(relay_server, RELAY_PORT);
     let use_ws_proxy = Config::is_proxy() && is_ws_endpoint(&check_ws(&relay_server));
-    let mut stream = socket_client::connect_tcp(
-        socket_client::ipv4_to_ipv6(relay_server, ipv4 || use_ws_proxy),
+    let mut stream = crate::managed_ws_fallback::connect_relay(
+        &socket_client::ipv4_to_ipv6(relay_server, ipv4 || use_ws_proxy),
         CONNECT_TIMEOUT,
     )
     .await?;
@@ -676,17 +692,46 @@ pub async fn start_server(is_server: bool, no_server: bool) {
     });
 
     if is_server {
-        crate::common::set_server_running(true);
-        std::thread::spawn(move || {
-            if let Err(err) = crate::ipc::start("") {
-                log::error!("Failed to start ipc: {}", err);
-                if crate::is_server() {
-                    log::error!("ipc is occupied by another process, try kill it");
-                    std::thread::spawn(stop_main_window_process).join().ok();
-                }
-                std::process::exit(-1);
+        #[cfg(windows)]
+        if !crate::is_server() {
+            if let Err(err) = start_gui_ipc().await {
+                log::error!("Local hosting unavailable: failed to start GUI IPC listener: {err:#}");
+                return;
             }
-        });
+        }
+        crate::common::set_server_running(true);
+        if !cfg!(windows) || crate::is_server() {
+            std::thread::spawn(move || {
+                if let Err(err) = crate::ipc::start("") {
+                    log::error!("Failed to start ipc: {}", err);
+                    if crate::is_server() {
+                        log::error!("ipc is occupied by another process, try kill it");
+                        std::thread::spawn(stop_main_window_process).join().ok();
+                    }
+                    std::process::exit(-1);
+                }
+            });
+        }
+        // Lives here, not the GUI process's init() - see
+        // ipc::Data::ManagedChatIpcRequest's doc comment: this is the
+        // only process with permission to read the enrollment credential
+        // the websocket connection needs. Incoming messages get relayed
+        // back to the GUI process's push listener from inside this task.
+        #[cfg(all(windows, feature = "flutter"))]
+        {
+            log::info!("managed chat: spawning websocket task in --server");
+            crate::managed_chat_store::init();
+            crate::hbbs_http::managed_chat::spawn_chat_websocket_task();
+        }
+        // Same reasoning as managed chat above: current_identity() reads
+        // the ACL'd enrollment credential, so this has to live in
+        // `--server`, not the raw SYSTEM service or the plain GUI window.
+        #[cfg(all(windows, feature = "flutter"))]
+        {
+            log::info!("rustdrop: spawning register/poll task in --server");
+            crate::rustdrop_service::spawn_task();
+            crate::hbbs_http::managed_sync::spawn(crate::hbbs_http::managed_sync::Role::Session);
+        }
         // Warm the DRM availability cache before any client connects, so the first connection does
         // not race a cold `_drm` probe and ship an empty display list ("No displays" + retry).
         // X11 is skipped -- probing there makes the root service open DRM readers for a path this
@@ -766,6 +811,13 @@ pub async fn start_server(is_server: bool, no_server: bool) {
     }
 }
 
+#[cfg(windows)]
+async fn start_gui_ipc() -> ResultType<()> {
+    let incoming = crate::ipc::new_listener("").await?;
+    tokio::spawn(crate::ipc::start_with_listener("", incoming));
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::main(flavor = "current_thread")]
 pub async fn start_ipc_url_server() {
@@ -805,6 +857,120 @@ pub async fn start_ipc_url_server() {
             log::error!("{}", err);
         }
     }
+}
+
+// Mirrors start_ipc_url_server above, just for Windows and a different
+// sender: managed_chat's actual websocket connection has to run in
+// --server (see ManagedChatIpcRequest's doc comment for the ACL reason),
+// but push_global_event only reaches Dart from inside the GUI process,
+// which hosts the Flutter engine. This listener - started only in the
+// GUI process, see managed_chat_start_push_listener in flutter_ffi.rs -
+// is what --server connects out to, fire-and-forget, to relay an
+// incoming message back.
+#[cfg(all(windows, feature = "flutter"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn start_managed_chat_push_listener() {
+    log::info!("managed chat push listener: starting");
+    // Retries only cover the "Access is denied" a stale, not-yet-torn-down
+    // prior instance of this same pipe name causes - Windows pins a named
+    // pipe's security descriptor to its first instance, so a fresh
+    // CreateNamedPipe call can be denied by a leftover instance from a
+    // process that's already exiting but hasn't released the handle yet
+    // (seen in the field on several fleet machines). After a few quick
+    // tries it keeps trying every 10 s for as long as this process runs:
+    // a second copy of the app started alongside this one (two launches
+    // at once) holds the pipe, and when that copy exits this one has to
+    // take over, or --server, seeing a window, reaches no listener and no
+    // new message ever comes up.
+    let mut result = crate::ipc::new_listener("_managed_chat_push").await;
+    let mut attempt = 0u32;
+    while result.is_err() {
+        attempt += 1;
+        if attempt <= 3 || attempt % 60 == 0 {
+            log::warn!(
+                "managed chat push listener: start attempt {} failed, retrying: {:?}",
+                attempt,
+                result.as_ref().err()
+            );
+        }
+        hbb_common::sleep(if attempt < 3 { 1.0 } else { 10.0 }).await;
+        result = crate::ipc::new_listener("_managed_chat_push").await;
+    }
+    match result {
+        Ok(mut incoming) => {
+            log::info!("managed chat push listener: listening");
+            while let Some(Ok(conn)) = incoming.next().await {
+                log::info!("managed chat push listener: connection accepted");
+                let mut conn = crate::ipc::Connection::new(conn);
+                // The pipe is open to Everyone (SYSTEM must be able to connect): only a process
+                // in this session may push events into the main window.
+                if !crate::ipc::authorize_windows_same_session_pipe_client(&conn, "_managed_chat_push") {
+                    continue;
+                }
+                match conn.next_timeout(1000).await {
+                    Ok(Some(data)) => match data {
+                        Data::ManagedChatIncomingMessage(event) => {
+                            // Never the event itself: it carries the message body.
+                            log::info!(
+                                "managed chat push listener: relaying to Dart ({} bytes)",
+                                event.len()
+                            );
+                            let Some((event, new_message_in)) =
+                                managed_chat_push_event_for_gui(&event)
+                            else {
+                                log::warn!("managed chat push listener: dropped an unexpected event");
+                                continue;
+                            };
+                            match crate::flutter::push_global_event(
+                                crate::flutter::APP_TYPE_MAIN,
+                                event,
+                            ) {
+                                None => log::warn!("No main window app found!"),
+                                Some(..) => {}
+                            }
+                            if let Some(conversation_id) = new_message_in {
+                                crate::hbbs_http::managed_chat::surface_chat_window(conversation_id);
+                            }
+                        }
+                        _ => {
+                            log::warn!(
+                                "An unexpected data was sent to the managed chat push listener."
+                            )
+                        }
+                    },
+                    Err(err) => {
+                        log::error!("{}", err);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(err) => {
+            log::error!("{}", err);
+        }
+    }
+}
+
+// The main window only needs to know which conversation changed; it reloads the rest
+// itself, so nothing else a pusher sends reaches Dart. Also returns the conversation of a new
+// message, whose window is brought up.
+#[cfg(all(windows, feature = "flutter"))]
+fn managed_chat_push_event_for_gui(event: &str) -> Option<(String, Option<String>)> {
+    let value: serde_json::Value = serde_json::from_str(event).ok()?;
+    let name = value.get("name")?.as_str()?;
+    let conversation_id = value.get("conversation_id")?.as_str()?;
+    let mut forwarded = serde_json::json!({ "name": name, "conversation_id": conversation_id });
+    let new_message_in = match name {
+        "managed_chat_message" => Some(conversation_id.to_owned()),
+        "managed_chat_delivered" => {
+            if let Some(message_id) = value.get("message_id").and_then(|v| v.as_str()) {
+                forwarded["message_id"] = serde_json::Value::from(message_id);
+            }
+            None
+        }
+        _ => return None,
+    };
+    Some((forwarded.to_string(), new_message_in))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -972,5 +1138,64 @@ pub async fn stop_main_window_process() {
         if let Err(e) = crate::platform::try_kill_rustdesk_main_window_process() {
             log::error!("kill failed: {}", e);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_gui_startup_tests {
+    use super::*;
+    use parity_tokio_ipc::{Endpoint, SecurityAttributes};
+    use std::{os::windows::io::AsRawHandle, process::Command};
+    use windows::Win32::{
+        Foundation::{HANDLE, WAIT_OBJECT_0},
+        System::Threading::WaitForSingleObject,
+    };
+
+    const CHILD_TEST: &str = "RUSTDESK_TEST_GUI_IPC_CHILD";
+    const CHILD_TIMEOUT_MS: u32 = 10_000;
+    // An unmatched test filter exits with zero without running the child assertions.
+    const CHILD_SUCCESS_EXIT_CODE: i32 = 42;
+
+    #[test]
+    fn windows_gui_survives_ipc_bind_failure() {
+        if std::env::var_os(CHILD_TEST).is_some() {
+            *hbb_common::config::APP_NAME.write().unwrap() =
+                format!("RustDesk-ipc-test-{}", std::process::id());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _incoming = runtime.block_on(async {
+                let mut endpoint = Endpoint::new(Config::ipc_path(""));
+                endpoint
+                    .set_security_attributes(SecurityAttributes::allow_everyone_create().unwrap());
+                endpoint.incoming().unwrap()
+            });
+            start_server(true, false);
+            assert!(!crate::common::is_server_running());
+            std::process::exit(CHILD_SUCCESS_EXIT_CODE);
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "server::windows_gui_startup_tests::windows_gui_survives_ipc_bind_failure",
+                "--nocapture",
+            ])
+            .env(CHILD_TEST, "1")
+            .spawn()
+            .unwrap();
+        let result =
+            unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), CHILD_TIMEOUT_MS) };
+        if result != WAIT_OBJECT_0 {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("GUI IPC startup test timed out or failed to wait: {result:?}");
+        }
+        assert_eq!(
+            child.wait().unwrap().code(),
+            Some(CHILD_SUCCESS_EXIT_CODE),
+            "GUI subprocess did not complete the startup assertions"
+        );
     }
 }

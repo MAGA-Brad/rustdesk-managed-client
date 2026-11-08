@@ -97,12 +97,24 @@ use windows_service::{
 use winreg::{enums::*, RegKey};
 
 mod acl;
+pub(crate) mod font_smoothing;
+pub(crate) mod install_recovery;
 pub(crate) mod installer_files;
 mod installer_handoff;
 mod installer_shell;
+mod local_input_guard;
+mod protected_storage;
 mod verified_update;
 mod msi_registry;
-pub(crate) use acl::current_process_user_sid_string;
+mod security_info;
+pub(crate) use security_info::security_info;
+pub(crate) use acl::{
+    create_machine_secret_directory,
+    current_process_user_sid_string,
+    set_path_permission_for_machine_secret,
+};
+pub(crate) use protected_storage::{protect_machine_scope, unprotect_machine_scope};
+pub(crate) use local_input_guard::local_mouse_has_priority;
 pub use acl::{
     set_path_permission, set_path_permission_for_portable_service_shmem_dir,
     set_path_permission_for_portable_service_shmem_file,
@@ -111,13 +123,19 @@ pub use acl::{
 use installer_handoff::{run_cmds, InstallCommands};
 use installer_shell::{
     escape_nested_cmd_ampersands, shortcut_bytes, staged_shortcut_commands,
-    staged_tray_shortcut_commands, validate_install_value,
+    staged_tray_shortcut_commands, validate_install_value, INSTALL_COPY_FAILED_FLAG,
+    UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
 };
 pub use verified_update::{
     copy_and_verify_update_file_sha256, schedule_current_verified_update_file_cleanup,
     update_to_verified, VerifiedUpdateFile,
 };
 
+pub(crate) fn get_program_data_dir() -> ResultType<PathBuf> {
+    installer_shell::get_known_folder(
+        &windows::Win32::UI::Shell::FOLDERID_ProgramData,
+    )
+}
 pub const FLUTTER_RUNNER_WIN32_WINDOW_CLASS: &'static str = "FLUTTER_RUNNER_WIN32_WINDOW"; // main window, install window
 pub const EXPLORER_EXE: &'static str = "explorer.exe";
 pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
@@ -619,41 +637,12 @@ fn resolve_expected_active_session_id_for_service(session_id: u32) -> Option<u32
     }
 }
 
-#[inline]
-fn authorize_service_scoped_ipc_connection(
-    stream: &ipc::Connection,
-    expected_active_session_id: Option<u32>,
-) -> bool {
-    let (authorized, peer_pid, peer_session_id, peer_is_system) =
-        stream.service_authorization_status_for_session(expected_active_session_id);
-    if !authorized {
-        ipc::log_rejected_windows_ipc_connection(
-            crate::POSTFIX_SERVICE,
-            peer_pid,
-            peer_session_id,
-            expected_active_session_id,
-            peer_is_system,
-            None,
-        );
-        return false;
-    }
-    if let Err(err) =
-        ipc::ensure_peer_executable_matches_current_by_pid_opt(peer_pid, crate::POSTFIX_SERVICE)
-    {
-        log::warn!(
-                "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
-                crate::POSTFIX_SERVICE,
-                peer_pid,
-                err
-            );
-        return false;
-    }
-    true
-}
 
 extern "system" {
     fn BlockInput(v: BOOL) -> BOOL;
 }
+
+static DIRECTORY_REQUESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
@@ -691,17 +680,26 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     // Tell the system that the service is running now
     status_handle.set_service_status(next_status)?;
 
+    // Machine-scoped managed-directory state belongs to the Windows service.
+    crate::hbbs_http::directory_enrollment::start();
+
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
     let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
     let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut stored_usid = None;
+    let mut server_session_mismatch = None;
+    let mut session_switch_handoff: Option<(ipc::SessionSwitchKey, Instant)> = None;
     loop {
         let sids: Vec<_> = get_available_sessions(false)
             .iter()
             .map(|e| e.sid)
             .collect();
-        if !sids.contains(&session_id) || !is_share_rdp() {
+        // Managed builds keep the server on the active session (no picker can choose another).
+        if !sids.contains(&session_id)
+            || !is_share_rdp()
+            || option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+        {
             let current_active_session = unsafe { get_current_session(share_rdp()) };
             if session_id != current_active_session {
                 session_id = current_active_session;
@@ -722,11 +720,45 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                     // session_id after awaiting incoming.next().
                     let expected_active_session_id =
                         resolve_expected_active_session_id_for_service(session_id);
-                    if !authorize_service_scoped_ipc_connection(&stream, expected_active_session_id)
-                    {
+                    let (session_authorized, peer_pid, peer_session_id, peer_is_system) =
+                        stream.service_authorization_status_for_session(expected_active_session_id);
+                    if !session_authorized {
+                        ipc::log_rejected_windows_ipc_connection(
+                            crate::POSTFIX_SERVICE,
+                            peer_pid,
+                            peer_session_id,
+                            expected_active_session_id,
+                            peer_is_system,
+                            None,
+                        );
                         continue;
                     }
                     if let Ok(Some(data)) = stream.next_timeout(1000).await {
+                        // DirectoryStatusQuery and PendingManagedUpdateQuery are both
+                        // read-only status information the client UI already surfaces;
+                        // allow them on session-scope trust alone so a not-yet-installed
+                        // executable (e.g. checking readiness during a silent managed
+                        // upgrade, before its own exe path matches the installed one) can
+                        // still ask. Every other message on this channel keeps the
+                        // stricter peer-executable match.
+                        if !matches!(
+                            data,
+                            ipc::Data::DirectoryStatusQuery
+                                | ipc::Data::PendingManagedUpdateQuery
+                        ) {
+                            if let Err(err) = ipc::ensure_peer_executable_matches_current_by_pid_opt(
+                                peer_pid,
+                                crate::POSTFIX_SERVICE,
+                            ) {
+                                log::warn!(
+                                    "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
+                                    crate::POSTFIX_SERVICE,
+                                    peer_pid,
+                                    err
+                                );
+                                continue;
+                            }
+                        }
                         match data {
                             ipc::Data::Close => {
                                 log::info!("close received");
@@ -735,9 +767,191 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             ipc::Data::SAS => {
                                 send_sas();
                             }
+                            // The three RDS calls below run in their own task: one slow request
+                            // must not hold up status queries and the session checks of this loop.
+                            // They still run one at a time, as they did inside the loop.
+                            ipc::Data::DirectoryEnrollment {
+                                enrollment_password,
+                            } => {
+                                tokio::spawn(async move {
+                                    let _serial = DIRECTORY_REQUESTS.lock().await;
+                                    let (accepted, reason) =
+                                        match enrollment_password.as_str() {
+                                            Ok(password) => {
+                                                match crate::hbbs_http::directory_enrollment::enroll_once(
+                                                    password,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(()) => (true, None),
+                                                    Err(error) => {
+                                                        log::warn!(
+                                                            "Managed directory enrollment failed: {}",
+                                                            error
+                                                        );
+                                                        (false, Some(error.to_string()))
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                log::warn!(
+                                                    "Managed directory enrollment secret was invalid"
+                                                );
+                                                (false, Some("Enrollment password was invalid".to_owned()))
+                                            }
+                                        };
+
+                                    let _ = stream
+                                        .send(
+                                            &ipc::Data::DirectoryEnrollmentResult(
+                                                accepted,
+                                                reason,
+                                            ),
+                                        )
+                                        .await;
+                                });
+                            }
+                            ipc::Data::DirectoryReenrollmentRequest => {
+                                tokio::spawn(async move {
+                                    let _serial = DIRECTORY_REQUESTS.lock().await;
+                                    let accepted = match crate::hbbs_http::directory_enrollment::request_reenrollment_once().await {
+                                        Ok(()) => true,
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Managed re-enrollment request failed: {}",
+                                                error
+                                            );
+                                            false
+                                        }
+                                    };
+                                    let _ = stream
+                                        .send(&ipc::Data::DirectoryReenrollmentResult(accepted))
+                                        .await;
+                                });
+                            }
+                            ipc::Data::DirectoryFriendlyNameChanged(name) => {
+                                // This service process has its own Config
+                                // cache, separate from the GUI process that
+                                // sent this - refresh it so the next managed
+                                // heartbeat (built from this cache) carries
+                                // the new name.
+                                Config::set_option(
+                                    "preset-device-name".into(),
+                                    name,
+                                );
+                            }
+                            ipc::Data::DirectoryContactEmailUpdateRequest(email) => {
+                                tokio::spawn(async move {
+                                    let _serial = DIRECTORY_REQUESTS.lock().await;
+                                    let accepted = match crate::hbbs_http::directory_enrollment::update_contact_email_once(&email).await {
+                                        Ok(()) => {
+                                            Config::set_option(
+                                                "preset-device-email".into(),
+                                                email,
+                                            );
+                                            true
+                                        }
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Managed contact email update failed: {}",
+                                                error
+                                            );
+                                            false
+                                        }
+                                    };
+                                    let _ = stream
+                                        .send(&ipc::Data::DirectoryContactEmailUpdateResult(accepted))
+                                        .await;
+                                });
+                            }
+                            ipc::Data::DirectoryStatusQuery => {
+                                let state =
+                                    crate::hbbs_http::directory_enrollment::state_key()
+                                        .to_owned();
+
+                                let text =
+                                    crate::hbbs_http::directory_enrollment::status_text();
+                                let snapshot =
+                                    crate::hbbs_http::directory_enrollment::snapshot_json();
+
+                                let _ = stream
+                                    .send(
+                                        &ipc::Data::DirectoryStatusResult(
+                                            (state, text, snapshot),
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            ipc::Data::PendingManagedUpdateQuery => {
+                                let pending =
+                                    crate::hbbs_http::directory_enrollment::pending_managed_update();
+                                let _ = stream
+                                    .send(&ipc::Data::PendingManagedUpdateResult(pending))
+                                    .await;
+                            }
+                            ipc::Data::PendingManagedUpdateNotify(pending) => {
+                                // Relayed from the --server process where the
+                                // auto-update checker actually runs - see
+                                // notify_pending_managed_update_to_service.
+                                match pending {
+                                    Some((build_number, version)) => {
+                                        crate::hbbs_http::directory_enrollment::note_pending_managed_update(
+                                            build_number,
+                                            &version,
+                                        );
+                                    }
+                                    None => {
+                                        crate::hbbs_http::directory_enrollment::clear_pending_managed_update();
+                                    }
+                                }
+                            }
+                            ipc::Data::ManagedPeerAuthQuery(controller_id) => {
+                                let info =
+                                    crate::managed_peer_auth::directory_info(&controller_id);
+                                let _ = stream
+                                    .send(&ipc::Data::ManagedPeerAuthInfo(info))
+                                    .await;
+                            }
+                            ipc::Data::ManagedConnectionEvent(event_json) => {
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        crate::hbbs_http::directory_enrollment::post_connection_event_once(
+                                            event_json,
+                                        )
+                                        .await
+                                    {
+                                        log::debug!("connection event not sent: {}", error);
+                                    }
+                                });
+                            }
+                            // Only the --server processes (SYSTEM) may leave or claim the
+                            // one-time 2FA pass of a session switch; it is single-use and short-lived.
+                            ipc::Data::SessionSwitchHandoff(key) => {
+                                if peer_is_system == Some(true) {
+                                    session_switch_handoff = Some((key, Instant::now()));
+                                }
+                            }
+                            ipc::Data::SessionSwitchHandoffClaim(key) => {
+                                const SESSION_SWITCH_HANDOFF_TTL: Duration = Duration::from_secs(30);
+                                let claimed = peer_is_system == Some(true)
+                                    && matches!(
+                                        &session_switch_handoff,
+                                        Some((left, at))
+                                            if *left == key && at.elapsed() < SESSION_SWITCH_HANDOFF_TTL
+                                    );
+                                if claimed {
+                                    session_switch_handoff = None;
+                                }
+                                let _ = stream
+                                    .send(&ipc::Data::SessionSwitchHandoffClaimResult(claimed))
+                                    .await;
+                            }
                             ipc::Data::UserSid(usid) => {
                                 if let Some(usid) = usid {
-                                    if session_id != usid {
+                                    if session_id != usid
+                                        || running_server_session(h_process)
+                                            .map_or(false, |sid| sid != usid)
+                                    {
                                         log::info!(
                                             "session changed from {} to {}",
                                             session_id,
@@ -788,6 +1002,12 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             }
                         }
                     }
+                    h_process = reconcile_server_session(
+                        h_process,
+                        session_id,
+                        &mut server_session_mismatch,
+                    )
+                    .await;
                 }
             }
         }
@@ -823,6 +1043,102 @@ async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDL
     launch_privileged_process(session_id, &cmd)
 }
 
+/// Session of the launched --server process, while it is still running.
+fn running_server_session(h_process: HANDLE) -> Option<DWORD> {
+    use winapi::um::processthreadsapi::GetProcessId;
+    if h_process.is_null() {
+        return None;
+    }
+    let mut exit_code: DWORD = 0;
+    if unsafe { GetExitCodeProcess(h_process, &mut exit_code) } != TRUE
+        || exit_code != STILL_ACTIVE
+    {
+        return None;
+    }
+    match unsafe { GetProcessId(h_process) } {
+        0 => None,
+        pid => get_session_id_of_process(pid),
+    }
+}
+
+// The service relaunches --server only after the old one exits, and asks it to exit only once.
+// When that request is lost (seen when the session changed again while the new --server was
+// still starting), the server kept serving the old session indefinitely while the service
+// believed it had switched, so a later UserSid for the right session was ignored as well.
+async fn reconcile_server_session(
+    h_process: HANDLE,
+    session_id: DWORD,
+    mismatch: &mut Option<(Instant, Instant)>,
+) -> HANDLE {
+    use winapi::um::{processthreadsapi::TerminateProcess, synchapi::WaitForSingleObject};
+    // A normal switch closes the old server within a tick or two; only a lasting mismatch counts.
+    const CLOSE_RETRY: Duration = Duration::from_secs(2);
+    const REPLACE_AFTER: Duration = Duration::from_secs(10);
+    let Some(server_sid) = running_server_session(h_process) else {
+        *mismatch = None;
+        return h_process;
+    };
+    if server_sid == session_id {
+        *mismatch = None;
+        return h_process;
+    }
+    // Port-forward sessions keep the server where it is on purpose, see the session-change path.
+    if ipc::get_port_forward_session_count(1000).await.unwrap_or(0) != 0 {
+        *mismatch = None;
+        return h_process;
+    }
+    let now = Instant::now();
+    let (since, last_close) = *mismatch.get_or_insert((now, now));
+    if now.duration_since(since) >= REPLACE_AFTER {
+        log::warn!(
+            "--server stayed in session {} instead of {}, replacing it",
+            server_sid,
+            session_id
+        );
+        *mismatch = None;
+        unsafe {
+            TerminateProcess(h_process, 1);
+            WaitForSingleObject(h_process, 3000);
+            CloseHandle(h_process);
+        }
+        return match launch_server(session_id, false).await {
+            Ok(h) => h,
+            Err(err) => {
+                log::error!("Failed to launch server: {}", err);
+                NULL
+            }
+        };
+    }
+    if now.duration_since(last_close) >= CLOSE_RETRY {
+        log::warn!(
+            "--server is in session {} instead of {}, asking it to close again",
+            server_sid,
+            session_id
+        );
+        *mismatch = Some((since, now));
+        send_close_async("").await.ok();
+    }
+    h_process
+}
+
+thread_local! {
+    static PRIVILEGED_LAUNCH_OS_ERROR: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+}
+
+/// Whether Windows itself refused the last failed launch_privileged_process on this thread, so the
+/// process never started.
+pub fn last_privileged_launch_blocked_by_policy() -> bool {
+    PRIVILEGED_LAUNCH_OS_ERROR
+        .with(|error| error.get())
+        .is_some_and(is_windows_policy_block)
+}
+
+// ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION (App Control, including Smart App Control) and the
+// ERROR_SYSTEM_INTEGRITY_REPUTATION_* codes for its cloud verdicts.
+fn is_windows_policy_block(code: i32) -> bool {
+    matches!(code, 4551 | 4556..=4559 | 4580..=4582)
+}
+
 pub fn launch_privileged_process(session_id: DWORD, cmd: &str) -> ResultType<HANDLE> {
     use std::os::windows::ffi::OsStrExt;
     let wstr: Vec<u16> = std::ffi::OsStr::new(&cmd)
@@ -832,6 +1148,10 @@ pub fn launch_privileged_process(session_id: DWORD, cmd: &str) -> ResultType<HAN
     let wstr = wstr.as_ptr();
     let mut token_pid = 0;
     let h = unsafe { LaunchProcessWin(wstr, session_id, FALSE, FALSE, &mut token_pid) };
+    if h.is_null() {
+        PRIVILEGED_LAUNCH_OS_ERROR
+            .with(|error| error.set(io::Error::last_os_error().raw_os_error()));
+    }
     if h.is_null() {
         log::error!(
             "Failed to launch privileged process: {}",
@@ -864,6 +1184,100 @@ pub fn run_exe_direct(
         Ok(child) => Ok(Some(child)),
         Err(e) => bail!("Failed to start process: {}", e),
     }
+}
+
+/// Starts `exe args` as the signed-in user of this session with the shell's (explorer.exe)
+/// token. A process started straight from an elevated installer keeps the administrator token,
+/// and RDC's IPC refuses connections from a more privileged client. Returns `false` when there
+/// is no shell to borrow from (session 0, no desktop) or the start fails; callers fall back.
+/// `hide_window` is for console helpers such as `cmd /c timeout`; GUI apps keep their own show.
+pub(crate) fn run_exe_as_shell_user(exe: &str, args: &[&str], hide_window: bool) -> bool {
+    use base::platform::windows::RAIIHandle;
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::{
+        processthreadsapi::{OpenProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW},
+        securitybaseapi::DuplicateTokenEx,
+        winbase::{CreateProcessWithTokenW, STARTF_USESHOWWINDOW},
+        winnt::{
+            SecurityImpersonation, TokenPrimary, PROCESS_QUERY_LIMITED_INFORMATION,
+            TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+            TOKEN_QUERY,
+        },
+        winuser::{GetShellWindow, GetWindowThreadProcessId, SW_HIDE},
+    };
+    unsafe {
+        let shell = GetShellWindow();
+        if shell.is_null() {
+            return false;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(shell, &mut pid);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if pid == 0 || process.is_null() {
+            log::warn!("No shell process to start {exe} as the user: {}", io::Error::last_os_error());
+            return false;
+        }
+        let _process = RAIIHandle(process);
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_DUPLICATE, &mut token) == FALSE {
+            log::warn!("Shell token not readable: {}", io::Error::last_os_error());
+            return false;
+        }
+        let _token = RAIIHandle(token);
+        let mut primary = std::ptr::null_mut();
+        if DuplicateTokenEx(
+            token,
+            TOKEN_QUERY
+                | TOKEN_DUPLICATE
+                | TOKEN_ASSIGN_PRIMARY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            std::ptr::null_mut(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        ) == FALSE
+        {
+            log::warn!("Shell token not duplicated: {}", io::Error::last_os_error());
+            return false;
+        }
+        let _primary = RAIIHandle(primary);
+        let mut cmd: Vec<u16> = std::ffi::OsStr::new(&format!("\"{}\" {}", exe, args.join(" ")))
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as _;
+        if hide_window {
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE as _;
+        }
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        if CreateProcessWithTokenW(
+            primary,
+            0,
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &mut si,
+            &mut pi,
+        ) == FALSE
+        {
+            log::warn!("{exe} not started as the user: {}", io::Error::last_os_error());
+            return false;
+        }
+        let _thread = RAIIHandle(pi.hThread);
+        let _child = RAIIHandle(pi.hProcess);
+        true
+    }
+}
+
+/// Elevated (an administrator, not SYSTEM): a process this one starts would inherit the
+/// administrator token, so tray and window restarts go through `run_exe_as_shell_user`.
+pub(crate) fn is_elevated_admin() -> bool {
+    !is_root() && is_elevated(None).unwrap_or(false)
 }
 
 pub fn run_exe_in_cur_session(
@@ -1318,6 +1732,11 @@ fn is_session_locked_flag(session_id: u32) -> Option<bool> {
     }
 }
 
+/// An elevated process in session 0, e.g. the managed installer started over SSH.
+pub fn is_elevated_session0() -> bool {
+    get_current_process_session_id() == Some(0) && is_elevated(None).unwrap_or(false)
+}
+
 pub fn is_root() -> bool {
     // https://stackoverflow.com/questions/4023586/correct-way-to-find-out-if-a-service-is-running-as-the-system-user
     unsafe { is_local_system() == TRUE }
@@ -1373,19 +1792,58 @@ pub fn get_install_options() -> String {
     let subkey = format!(".{}", app_name.to_lowercase());
     let mut opts = HashMap::new();
 
-    let desktop_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_DESKTOPSHORTCUTS);
-    if let Some(desktop_shortcuts) = desktop_shortcuts {
-        opts.insert(REG_NAME_INSTALL_DESKTOPSHORTCUTS, desktop_shortcuts);
-    }
-    let start_menu_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_STARTMENUSHORTCUTS);
-    if let Some(start_menu_shortcuts) = start_menu_shortcuts {
-        opts.insert(REG_NAME_INSTALL_STARTMENUSHORTCUTS, start_menu_shortcuts);
+    // A managed client's very first install is a fully automated/silent
+    // deployment, not a user clicking through the wizard - so a "0" already
+    // sitting in the registry for these two never reflects an actual user
+    // choice to remember. Leaving them out of the map here makes the
+    // checkboxes (and the silent-upgrade flag conversion below) fall back
+    // to their sensible default of checked, instead of staying unchecked
+    // forever because of that first silent deployment.
+    let is_managed_client = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some();
+    if !is_managed_client {
+        let desktop_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_DESKTOPSHORTCUTS);
+        if let Some(desktop_shortcuts) = desktop_shortcuts {
+            opts.insert(REG_NAME_INSTALL_DESKTOPSHORTCUTS, desktop_shortcuts);
+        }
+        let start_menu_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_STARTMENUSHORTCUTS);
+        if let Some(start_menu_shortcuts) = start_menu_shortcuts {
+            opts.insert(REG_NAME_INSTALL_STARTMENUSHORTCUTS, start_menu_shortcuts);
+        }
     }
     let printer = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_PRINTER);
     if let Some(printer) = printer {
         opts.insert(REG_NAME_INSTALL_PRINTER, printer);
     }
     serde_json::to_string(&opts).unwrap_or("{}".to_owned())
+}
+
+// get_install_options() returns a JSON object of registry keys (for
+// populating the install-page checkboxes), but install_me()'s `options`
+// parameter is a completely different, unrelated format: a plain string
+// checked with `.contains("desktopicon")` / `.contains("startmenu")` /
+// `.contains("printer")` - the same flat word list the install-page UI
+// itself builds by hand before calling install_me. Passing the JSON string
+// straight through (as raw JSON keys like "DESKTOPSHORTCUTS" don't contain
+// the word "desktopicon") would make install_me silently skip every
+// checkbox it's supposed to honor. Mirrors install_page.dart's own
+// `!= '0'` (default-on) / `== '1'` (default-off) semantics exactly, so a
+// managed silent upgrade preserves the same defaults the visible install
+// page would show for the same registry state.
+pub fn install_options_json_to_flags(options_json: &str) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(options_json).unwrap_or(serde_json::Value::Null);
+    let value_of = |key: &str| parsed.get(key).and_then(|v| v.as_str());
+    let mut flags = Vec::new();
+    if value_of(REG_NAME_INSTALL_STARTMENUSHORTCUTS) != Some("0") {
+        flags.push("startmenu");
+    }
+    if value_of(REG_NAME_INSTALL_DESKTOPSHORTCUTS) != Some("0") {
+        flags.push("desktopicon");
+    }
+    if value_of(REG_NAME_INSTALL_PRINTER) == Some("1") {
+        flags.push("printer");
+    }
+    flags.join(" ")
 }
 
 pub fn get_silent_install_options(printer_override: Option<bool>) -> &'static str {
@@ -1506,15 +1964,85 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
     (subkey, path, start_menu, exe)
 }
 
+// `sc stop`/`taskkill /F` both return as soon as the stop/terminate signal
+// is sent, not once Windows has actually released the process's open file
+// handles - copying over the old exe/dll immediately after (as every caller
+// of this used to) can still race a handle that hasn't been freed yet. This
+// polls for up to ~10 seconds (bounded so a genuinely stuck process can't
+// hang an install/update/uninstall forever) using a goto-loop rather than a
+// FOR loop specifically because the wrapping script disables delayed
+// expansion (see prepare_install_commands) - a parenthesized FOR body would
+// have its %VARS% expanded once at parse time instead of per iteration,
+// silently reading stale values. A goto-loop re-expands each line as
+// execution reaches it, so plain %VAR% works correctly here without needing
+// to touch that expansion mode. Checking for `{app_name}.exe` alone (not a
+// separate `sc query` check) covers the service too - the service is the
+// same exe running with a `--service` flag, not a distinct binary. Left as
+// a wait-and-verify step; the errorlevel checks on the copy/move commands
+// below remain as a safety net for whatever this timeout doesn't catch
+// (e.g. a third-party process or antivirus holding its own lock).
+// `extra_filter` should be the exact same PID-exclusion filter (e.g.
+// ` /FI "PID ne 1234"`, or "" to exclude nothing) already passed to the
+// `taskkill` call this follows - `tasklist` accepts the identical `/FI`
+// syntax, and without it, a caller that deliberately spared its own PID
+// (kill_self=false, e.g. the running installer during a fresh install)
+// would see its own still-running self and wait out the full timeout on
+// every single run without ever actually checking anything meaningful.
+pub(super) fn wait_for_app_processes_gone_cmd(app_name: &str, extra_filter: &str) -> String {
+    format!(
+        "
+        set \"RUSTDESK_STOP_WAIT=0\"
+        :rustdesk_wait_for_stop
+        tasklist /FI \"IMAGENAME eq {app_name}.exe\"{extra_filter} 2>nul | findstr /I /C:\"{app_name}.exe\" >nul
+        if errorlevel 1 goto :rustdesk_stop_confirmed
+        set /a RUSTDESK_STOP_WAIT+=1
+        if %RUSTDESK_STOP_WAIT% GEQ 10 goto :rustdesk_stop_confirmed
+        ping -n 2 127.0.0.1 >nul
+        goto :rustdesk_wait_for_stop
+        :rustdesk_stop_confirmed
+        "
+    )
+}
+
 pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String> {
+    // /C continues past a locked/in-use file instead of stopping the whole
+    // copy - intentional, so one held-open file doesn't block every other
+    // file from updating - but that means a failure here is otherwise
+    // completely silent unless something checks errorlevel afterward.
+    //
+    // Killing every rustdesk process first (see stop_running_instance_before_install
+    // and update_me's own taskkill+wait) is not sufficient on its own: the
+    // `--server` process runs as SYSTEM in session 0 and is routinely
+    // invisible to (or unkillable by) a merely-elevated Administrator's
+    // tasklist/taskkill - see the comment above update_me's cmds ("4
+    // processes... but only 2 shown in tasklist"). So librustdesk.dll /
+    // RustDesk.exe can still be locked when XCOPY runs, and /C then
+    // silently skips them while still reporting success. Renaming a locked
+    // file aside always succeeds on Windows even while it's memory-mapped
+    // by a running process - the file's data stays alive via that process's
+    // existing handle, decoupled from the directory entry - so clear the
+    // target names out of the way first for the file types that actually
+    // get loaded into memory, before XCOPY tries to overwrite them in
+    // place. Confirmed in production: 2026-09-06, install_me repeatedly
+    // reported Ok while librustdesk.dll on disk never changed.
+    let clear_locked = format!(
+        "
+        del /F /Q \"{path}\\*.rdupdatebak\" >nul 2>&1
+        for %%F in (\"{path}\\*.exe\" \"{path}\\*.dll\") do if exist \"%%F\" move /Y \"%%F\" \"%%F.rdupdatebak\" >nul 2>&1
+        ",
+        path = _path,
+    );
     let main_raw = format!(
-        "XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z",
+        "{clear_locked}
+        XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z
+        if errorlevel 1 set \"{flag}=1\"",
         PathBuf::from(src_raw)
             .parent()
             .ok_or(anyhow!("Can't get parent directory of {src_raw}"))?
             .to_string_lossy()
             .to_string(),
-        _path
+        _path,
+        flag = INSTALL_COPY_FAILED_FLAG,
     );
     return Ok(main_raw);
 }
@@ -1525,10 +2053,146 @@ pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> 
         "
         {main_exe}
         copy /Y \"{ORIGIN_PROCESS_EXE}\" \"{path}\\{broker_exe}\"
+        if errorlevel 1 set \"{flag}=1\"
         ",
         ORIGIN_PROCESS_EXE = win_topmost_window::ORIGIN_PROCESS_EXE,
         broker_exe = win_topmost_window::INJECTED_PROCESS_EXE,
+        flag = INSTALL_COPY_FAILED_FLAG,
     ))
+}
+
+const UPDATE_BINARY_MISSING_FLAG: &str = "RUSTDESK_UPDATE_BINARY_MISSING";
+
+/// For update_me, after its copy and rename steps and before the service starts again. XCOPY /C
+/// reports success past files it could not write (disk full, a file quarantined by AV), so every
+/// top-level exe/dll the update ships is checked in the install directory by size. If any is
+/// missing or differs, the files copy_raw_cmd moved aside are moved back, so the service starts on
+/// the previous build rather than not at all, and the update fails. After a good copy the moved-aside
+/// files are removed.
+fn verify_update_copy_cmd(src_exe: &str, path: &str) -> ResultType<String> {
+    let src = PathBuf::from(src_exe);
+    let src_dir = src
+        .parent()
+        .ok_or(anyhow!("Can't get parent directory of {src_exe}"))?
+        .to_string_lossy()
+        .to_string();
+    let src_exe_filename = src
+        .file_name()
+        .ok_or(anyhow!("Can't get file name of {src_exe}"))?
+        .to_string_lossy()
+        .to_string();
+    let src_exe_size = std::fs::metadata(&src)?.len();
+    Ok(format!(
+        "
+        set \"{missing}=0\"
+        for %%F in (\"{src_dir}\\*.exe\" \"{src_dir}\\*.dll\") do if /I not \"%%~nxF\"==\"{src_exe_filename}\" if not exist \"{path}\\%%~nxF\" (set \"{missing}=1\") else for %%G in (\"{path}\\%%~nxF\") do if not \"%%~zG\"==\"%%~zF\" set \"{missing}=1\"
+        if not exist \"{path}\\{app_name}.exe\" (set \"{missing}=1\") else for %%G in (\"{path}\\{app_name}.exe\") do if not \"%%~zG\"==\"{src_exe_size}\" set \"{missing}=1\"
+        if \"%{missing}%\"==\"1\" (
+            set \"{flag}=1\"
+            for %%F in (\"{path}\\*.rdupdatebak\") do move /Y \"%%F\" \"%%~dpnF\" >nul 2>&1
+        ) else (
+            del /F /Q \"{path}\\*.rdupdatebak\" >nul 2>&1
+        )
+        ",
+        missing = UPDATE_BINARY_MISSING_FLAG,
+        flag = INSTALL_COPY_FAILED_FLAG,
+        app_name = crate::get_app_name(),
+    ))
+}
+
+/// Managed builds: the whole previous install tree is copied beside it before the update copies
+/// over it, and put back by managed_update_finish_cmd on any copy failure. verify_update_copy_cmd
+/// alone moves back only the top-level exe/dll files, leaving the new data\app.so beside the old
+/// librustdesk.dll, and that mismatch breaks the UI. A backup that cannot be made skips the copy.
+fn managed_update_backup_cmd(path: &str) -> String {
+    format!(
+        "
+        set \"RDC_UPDATE_KEEP_BACKUP=0\"
+        if exist \"{backup}\" rd /s /q \"{backup}\"
+        if exist \"{backup}\" goto :rdc_update_backup_failed
+        robocopy \"{path}\" \"{backup}\" /E /R:1 /W:1 /XF *.rdupdatebak >nul
+        if not errorlevel 8 goto :rdc_update_backed_up
+        :rdc_update_backup_failed
+        set \"{flag}=1\"
+        goto :rdc_update_failed
+        :rdc_update_backed_up
+        ",
+        backup = managed_update_backup_dir(path),
+        flag = INSTALL_COPY_FAILED_FLAG,
+    )
+}
+
+fn managed_update_backup_dir(path: &str) -> String {
+    format!("{path}.rdupdate-prev")
+}
+
+/// After verify_update_copy_cmd. The new version is registered only after a verified copy; a failed
+/// one restores the whole previous tree and copies the updater's attempt record (build and SHA-256)
+/// over its failed record, which keeps the same installer from being relaunched for a day. A tree
+/// that cannot be fully restored keeps its backup for manual recovery.
+fn managed_update_finish_cmd(
+    path: &str,
+    reg_cmd: &str,
+    attempt_records: Option<(PathBuf, PathBuf)>,
+) -> String {
+    let record_failure = match attempt_records {
+        Some((attempt, failed)) => format!(
+            "if exist \"{attempt}\" type \"{attempt}\" > \"{failed}\"",
+            attempt = attempt.display(),
+            failed = failed.display(),
+        ),
+        None => "".to_owned(),
+    };
+    format!(
+        "
+        if \"%{flag}%\"==\"0\" goto :rdc_update_copied
+        robocopy \"{backup}\" \"{path}\" /MIR /R:2 /W:1 /XF *.rdupdatebak >nul
+        if errorlevel 8 set \"RDC_UPDATE_KEEP_BACKUP=1\"
+        :rdc_update_failed
+        {record_failure}
+        goto :rdc_update_finished
+        :rdc_update_copied
+{reg_cmd}
+        :rdc_update_finished
+        if \"%RDC_UPDATE_KEEP_BACKUP%\"==\"0\" rd /s /q \"{backup}\" >nul 2>&1
+        ",
+        backup = managed_update_backup_dir(path),
+        flag = INSTALL_COPY_FAILED_FLAG,
+    )
+}
+
+/// The update needs room for the new files while the old ones are kept aside: refused before
+/// anything is stopped or moved rather than failing halfway through the copy.
+fn check_free_space_for_update(src_exe: &str, path: &str) -> ResultType<()> {
+    use hbb_common::sysinfo::Disks;
+
+    let src_dir = PathBuf::from(src_exe)
+        .parent()
+        .ok_or(anyhow!("Can't get parent directory of {src_exe}"))?
+        .to_string_lossy()
+        .to_string();
+    let needed = get_directory_size_kb(&src_dir)
+        .saturating_mul(1024)
+        .saturating_mul(3);
+    let target = path.to_lowercase();
+    let available = Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .filter(|disk| target.starts_with(&disk.mount_point().to_string_lossy().to_lowercase()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space());
+    match available {
+        Some(available) if available < needed => bail!(
+            "Not enough free space to update: {} MB needed, {} MB free",
+            needed >> 20,
+            available >> 20
+        ),
+        Some(_) => Ok(()),
+        None => {
+            log::warn!("Could not determine the free space for {path}; updating anyway");
+            Ok(())
+        }
+    }
 }
 
 #[inline]
@@ -1545,7 +2209,9 @@ pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
         Ok(format!(
             "
         move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{app_name}.exe\"
+        if errorlevel 1 set \"{flag}=1\"
         ",
+            flag = INSTALL_COPY_FAILED_FLAG,
         ))
     }
 }
@@ -1621,8 +2287,9 @@ fn get_after_install(
     netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=out action=allow program=\"{exe}\" enable=yes
     netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=in action=allow program=\"{exe}\" enable=yes
     {create_service}
+    {watchdog_setup}
     reg add HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /f /v SoftwareSASGeneration /t REG_DWORD /d 1
-    ", create_service=get_create_service(&exe))
+    ", create_service=get_create_service(&exe), watchdog_setup=get_watchdog_setup_cmd(&exe))
 }
 
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
@@ -1708,7 +2375,11 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
         );
         reg_value_start_menu_shortcuts = "1".to_owned();
     }
-    let install_printer = options.contains("printer") && is_win_10_or_greater();
+    let install_printer = if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        false
+    } else {
+        options.contains("printer") && is_win_10_or_greater()
+    };
     if install_printer {
         reg_value_printer = "1".to_owned();
     }
@@ -1777,6 +2448,7 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
         "
 {uninstall_str}
 chcp 65001
+set \"{copy_failed_flag}=0\"
 md \"{path}\"
 {copy_exe}
 reg add {subkey} /f
@@ -1801,6 +2473,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 {dels}
 {import_config}
 {after_install}
+if \"%{copy_failed_flag}%\"==\"1\" exit /b {copy_failure_exit_code}
 {sleep}
     ",
         display_icon = shortcut_icon_location.as_deref().unwrap_or(exe.as_str()),
@@ -1811,6 +2484,8 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         dels = if debug { "" } else { &dels },
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         import_config = get_import_config(&exe),
+        copy_failed_flag = INSTALL_COPY_FAILED_FLAG,
+        copy_failure_exit_code = UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
     );
     run_cmds(
         InstallCommands {
@@ -1853,11 +2528,13 @@ fn get_before_uninstall(kill_self: bool) -> ResultType<String> {
     {remove_service}
     taskkill /F /IM {broker_exe}
     taskkill /F /IM {app_name}.exe{filter}
+    {wait_for_stop}
     reg delete HKEY_CLASSES_ROOT\\.{ext} /f
     reg delete HKEY_CLASSES_ROOT\\{ext} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
     ",
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+        wait_for_stop = wait_for_app_processes_gone_cmd(&app_name, &filter),
     ))
 }
 
@@ -2076,6 +2753,11 @@ pub fn remove_custom_client_staging_dir(staging_dir: &Path) -> ResultType<bool> 
 //    (e.g., is a symlink or has invalid contents).
 // 3. Err if any unexpected error occurs during file operations.
 pub fn prepare_custom_client_update() -> ResultType<bool> {
+    // Managed builds never use custom clients; a staged custom.txt is not checked for who wrote
+    // it, so another local user could otherwise make every managed update fail.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return Ok(true);
+    }
     let custom_client_staging_dir = get_custom_client_staging_dir();
     let current_exe = std::env::current_exe()?;
     let current_exe_dir = current_exe
@@ -2842,6 +3524,156 @@ pub fn send_message_to_hnwd(
     return true;
 }
 
+/// Finds a window by class+title and brings it to the foreground, with no
+/// WM_COPYDATA send (unlike send_message_to_hnwd above) - there's no data to
+/// deliver here, just an existing window that needs to stop being invisible.
+/// Used by main_launch_rustdrop() for the "a --rustdrop window is already
+/// running" case: previously that branch just returned true and did nothing
+/// else, so a window that had lost focus, been minimized, or been pushed
+/// behind another window made every subsequent "Drop" click a silent no-op.
+pub fn bring_window_to_front(class_name: &str, window_name: &str) -> bool {
+    unsafe {
+        let class_name_utf16 = wide_string(class_name);
+        let window_name_utf16 = wide_string(window_name);
+        let window = FindWindowW(class_name_utf16.as_ptr(), window_name_utf16.as_ptr());
+        if window.is_null() {
+            log::warn!("bring_window_to_front: no such window {}:{}", class_name, window_name);
+            return false;
+        }
+        ShowWindow(window, SW_NORMAL);
+        SetForegroundWindow(window);
+    }
+    true
+}
+
+/// Managed builds: the remote side of Switch Sides is started by the SYSTEM `--server`. Its `run_me`
+/// child runs as SYSTEM too and, when no main window is open to take the link, opens the session
+/// window itself as SYSTEM on the user's desktop. Hand the link to the main window from here (SYSTEM
+/// reaches it even when it runs elevated), otherwise start `--connect` with the signed-in user's
+/// token. False when this isn't a managed build running as SYSTEM, so the caller keeps `run_me`.
+pub fn managed_start_switch_sides_back(peer_id: &str, uuid: &str) -> bool {
+    use winapi::um::winuser::WM_USER;
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() || !crate::platform::is_root() {
+        return false;
+    }
+    // run_exe_in_session joins its arguments unquoted.
+    if peer_id.is_empty()
+        || !peer_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        log::error!("switch sides: refused peer id {:?}", peer_id);
+        return true;
+    }
+    let link = format!(
+        "{}connect/{}?switch_uuid={}",
+        crate::get_uri_prefix(),
+        peer_id,
+        uuid
+    );
+    if send_message_to_hnwd(
+        FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
+        &crate::get_app_name(),
+        (WM_USER + 2) as _,
+        &link,
+        false,
+    ) {
+        return true;
+    }
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+    else {
+        log::error!("switch sides: no exe path");
+        return true;
+    };
+    let session_id =
+        get_current_process_session_id().unwrap_or_else(|| get_current_session_id(false));
+    if let Err(err) = run_exe_in_session(
+        &exe,
+        vec!["--connect", peer_id, "--switch_uuid", uuid],
+        session_id,
+        true,
+    ) {
+        log::error!("switch sides: launch in session {} failed: {}", session_id, err);
+    }
+    true
+}
+
+/// The first visible top-level window with this class and title. Flutter's sub-windows (chat,
+/// RustDrop) can leave hidden windows with the same title behind for reuse.
+fn find_visible_window(class_name: &str, window_name: &str) -> HWND {
+    let class_name_utf16 = wide_string(class_name);
+    let window_name_utf16 = wide_string(window_name);
+    let mut window: HWND = std::ptr::null_mut();
+    unsafe {
+        loop {
+            window = FindWindowExW(
+                std::ptr::null_mut(),
+                window,
+                class_name_utf16.as_ptr(),
+                window_name_utf16.as_ptr(),
+            );
+            if window.is_null() || IsWindowVisible(window) != FALSE {
+                return window;
+            }
+        }
+    }
+}
+
+pub fn is_window_visible(class_name: &str, window_name: &str) -> bool {
+    !find_visible_window(class_name, window_name).is_null()
+}
+
+/// Hidden windows included.
+pub fn window_exists(class_name: &str, window_name: &str) -> bool {
+    let class_name_utf16 = wide_string(class_name);
+    let window_name_utf16 = wide_string(window_name);
+    unsafe { !FindWindowW(class_name_utf16.as_ptr(), window_name_utf16.as_ptr()).is_null() }
+}
+
+/// raise_window() for a title several windows can share: raises the visible one.
+pub fn raise_visible_window(class_name: &str, window_name: &str) -> bool {
+    unsafe {
+        let window = find_visible_window(class_name, window_name);
+        if window.is_null() {
+            return false;
+        }
+        if IsIconic(window) != FALSE {
+            ShowWindow(window, SW_RESTORE);
+        }
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+        SetForegroundWindow(window);
+    }
+    true
+}
+
+/// Raises another process's window from a background process, where
+/// SetForegroundWindow alone is refused by the foreground lock (it only
+/// flashes the taskbar button): a topmost/not-topmost toggle still puts the
+/// window on top of the z-order. Returns false until the window exists and
+/// is visible, so callers can wait for a window that is still starting up.
+pub fn raise_window(class_name: &str, window_name: &str) -> bool {
+    unsafe {
+        let class_name_utf16 = wide_string(class_name);
+        let window_name_utf16 = wide_string(window_name);
+        let window = FindWindowW(class_name_utf16.as_ptr(), window_name_utf16.as_ptr());
+        if window.is_null() || IsWindowVisible(window) == FALSE {
+            return false;
+        }
+        if IsIconic(window) != FALSE {
+            ShowWindow(window, SW_RESTORE);
+        }
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+        SetForegroundWindow(window);
+    }
+    true
+}
+
 pub fn get_logon_user_token(user: &str, pwd: &str) -> ResultType<HANDLE> {
     let user_split = user.split("\\").collect::<Vec<&str>>();
     let wuser = wide_string(user_split.get(1).unwrap_or(&user));
@@ -3341,6 +4173,51 @@ pub fn try_lock_tray_single_instance() -> bool {
     }
 }
 
+// Same class of bug as try_lock_tray_single_instance above, hit for real
+// 2026-09-21: main_launch_rustdrop()'s check_process("--rustdrop", ..) scans
+// the process table and spawns if nothing's found - two calls close enough
+// together (e.g. two incoming-transfer notifications landing within a few
+// ms of each other, confirmed live under a 6-way concurrent-transfer stress
+// test) can both see nothing running and both spawn, leaving two RustDrop
+// windows open. A named mutex makes the kernel arbitrate atomically instead
+// of racing two independent process-table snapshots.
+//
+// Returns `false` if another RustDrop window is already running in this
+// session - the caller should exit immediately without showing a window.
+pub fn try_lock_rustdrop_single_instance() -> bool {
+    use winapi::um::{
+        errhandlingapi::{GetLastError, SetLastError},
+        synchapi::CreateMutexW,
+    };
+    let name = wide_string(&format!("Local\\{}_rustdrop", crate::get_app_name()));
+    unsafe {
+        SetLastError(0);
+        // The handle is deliberately kept open for the lifetime of the process.
+        let handle = CreateMutexW(null_mut(), FALSE, name.as_ptr());
+        let last_error = GetLastError();
+        if !handle.is_null() {
+            if last_error == ERROR_ALREADY_EXISTS {
+                CloseHandle(handle);
+                return false;
+            }
+            return true;
+        }
+        if last_error == ERROR_ACCESS_DENIED {
+            // Exists but owned by a RustDrop instance at a different
+            // integrity level - defer to it rather than opening a second
+            // window that can't be told apart from the first.
+            return false;
+        }
+        // Unexpected: let it open anyway - an occasional duplicate window is
+        // a smaller problem than RustDrop refusing to open at all.
+        log::warn!(
+            "Failed to create the rustdrop single instance mutex: {}",
+            io::Error::from_raw_os_error(last_error as _)
+        );
+        true
+    }
+}
+
 /// Returns `true` on failure or cancellation so the caller keeps running.
 /// Successful removal exits this process instead of returning.
 pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
@@ -3368,6 +4245,10 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
             return true;
         }
     };
+    // The watchdog tasks are deliberately left untouched here - see the
+    // comment on get_watchdog_setup_cmd. They stay alive and will simply
+    // no-op on their own (service_watchdog_check_and_fix reads this same
+    // option) rather than needing to be torn down and later recreated.
     Config::set_option("stop-service".into(), "Y".into());
     let cmds = format!(
         "
@@ -3415,9 +4296,11 @@ taskkill /F /IM {app_name}.exe{filter}
 copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
 {import_config}
 {create_service}
+{watchdog_setup}
     ",
         import_config = get_import_config(exe),
         create_service = service_control_command("create-service-with-rollback", exe, false)?,
+        watchdog_setup = get_watchdog_setup_cmd(exe),
     );
     Ok(InstallCommands {
         script,
@@ -3495,6 +4378,7 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     if !is_installed {
         bail!("{} is not installed.", &app_name);
     }
+    check_free_space_for_update(&src_exe, &path)?;
     let is_msi = is_msi_installed().ok();
     let reg_msi_key = get_reg_msi_key(&subkey, is_msi)?;
 
@@ -3601,6 +4485,20 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
         };
         format!("{}{}", reg_cmd_main, reg_cmd_msi)
     };
+    let (reg_cmd, managed_backup, managed_finish) =
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+            (
+                "".to_owned(),
+                managed_update_backup_cmd(&path),
+                managed_update_finish_cmd(
+                    &path,
+                    &reg_cmd,
+                    crate::hbbs_http::directory_enrollment::managed_update_attempt_paths(),
+                ),
+            )
+        } else {
+            (reg_cmd, "".to_owned(), "".to_owned())
+        };
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     let restore_service_cmd = if is_service_running {
@@ -3615,7 +4513,12 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let (uninstall_printer_cmd, install_printer_cmd) = if is_printer_installed {
         (
             format!("\"{}\" --uninstall-remote-printer", &src_exe),
-            format!("\"{}\" --install-remote-printer", &src_exe),
+            // Managed builds remove a previously installed printer and never reinstall it.
+            if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+                "".to_owned()
+            } else {
+                format!("\"{}\" --install-remote-printer", &src_exe)
+            },
         )
     } else {
         ("".to_owned(), "".to_owned())
@@ -3636,22 +4539,32 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let cmds = format!(
         "
 chcp 65001
+set \"{copy_failed_flag}=0\"
 sc stop {app_name}
 taskkill /F /IM {app_name}.exe{filter}
+{wait_for_stop}
 {reg_cmd}
+{managed_backup}
 {copy_exe}
 {rename_exe}
 {remove_meta_toml}
+{verify_copy}
+{managed_finish}
 {restore_service_cmd}
 {uninstall_printer_cmd}
 {install_printer_cmd}
+if \"%{copy_failed_flag}%\"==\"1\" exit /b {copy_failure_exit_code}
 {sleep}
     ",
         app_name = app_name,
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
+        verify_copy = verify_update_copy_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
         sleep = if debug { "timeout 300" } else { "" },
+        copy_failed_flag = INSTALL_COPY_FAILED_FLAG,
+        copy_failure_exit_code = UPDATE_FILE_COPY_FAILURE_EXIT_CODE,
+        wait_for_stop = wait_for_app_processes_gone_cmd(&app_name, &filter),
     );
 
     let _restore_session_guard = crate::common::SimpleCallOnReturn {
@@ -3681,7 +4594,11 @@ taskkill /F /IM {app_name}.exe{filter}
                             allow_err!(run_exe_in_session(&exe, vec!["--tray"], s, true));
                         } else if !spawned_non_root_tray {
                             // Only spawn once for non-root since run_exe_direct doesn't take session parameter
-                            allow_err!(run_exe_direct(&exe, vec!["--tray"], false));
+                            if !(is_elevated_admin()
+                                && run_exe_as_shell_user(&exe, &["--tray"], false))
+                            {
+                                allow_err!(run_exe_direct(&exe, vec!["--tray"], false));
+                            }
                             spawned_non_root_tray = true;
                         }
                     }
@@ -3701,7 +4618,9 @@ taskkill /F /IM {app_name}.exe{filter}
                             allow_err!(run_exe_in_session(&exe, vec![], s, true));
                         } else if !spawned_non_root_main {
                             // Only spawn once for non-root since run_exe_direct doesn't take session parameter
-                            allow_err!(run_exe_direct(&exe, vec![], false));
+                            if !(is_elevated_admin() && run_exe_as_shell_user(&exe, &[], false)) {
+                                allow_err!(run_exe_direct(&exe, vec![], false));
+                            }
                             spawned_non_root_main = true;
                         }
                     }
@@ -3881,6 +4800,96 @@ fn kill_process_by_pids(name: &str, pids: Vec<Pid>) -> ResultType<()> {
         }
     }
     Ok(())
+}
+
+// Reinstalling/upgrading over an already-installed, already-running instance
+// leaves its Windows service (and the "" main IPC pipe it owns) alive while
+// the installer is still deciding what to do - which blocks the installer's
+// own local IPC listener (used for install-time 2FA verification) from
+// binding at all, and even if it could reach the *existing* service's
+// listener instead, that service correctly refuses the connection since the
+// installer runs from a temp-extracted copy, a different executable path
+// than the already-installed one. Stopping the old service/processes first
+// removes the conflict at the source instead of working around it. Filters
+// out this process's own pid defensively - a bare double-click launch has no
+// real OS-level argv difference from the already-running main window's, so
+// the image-name+argv match below could otherwise catch the installer itself.
+pub fn stop_running_instance_before_install() {
+    // Must happen unconditionally, before the is_self_service_running gate
+    // below: the watchdog task fires on its own 5-minute schedule regardless
+    // of whether the service happens to be running at the exact moment this
+    // function is called, and it must not race the copy step further down
+    // by recreating/restarting the service mid-update.
+    let disable_watchdog = disable_watchdog_task_cmd();
+
+    // Gate on whether the service is actually running before doing anything
+    // else privileged: on a genuinely fresh machine (the common case - most
+    // installs are first-time) there's nothing to stop, and this function
+    // must not trigger an extra UAC prompt for no reason.
+    if !is_self_service_running() {
+        log::info!(
+            "stop_running_instance_before_install: service is not running, disabling watchdog only"
+        );
+        if let Err(err) = run_cmds(
+            format!("chcp 65001\n{disable_watchdog}"),
+            false,
+            "disable_watchdog",
+        ) {
+            log::warn!(
+                "stop_running_instance_before_install: failed to disable watchdog task: {}",
+                err
+            );
+        }
+        return;
+    }
+
+    // A direct, unelevated `sc stop`/process-kill from this process has no
+    // real rights against a SYSTEM-owned service or its `--service` process
+    // (confirmed empirically: `sc stop` itself returned ERROR_ACCESS_DENIED,
+    // and process enumeration couldn't even read that process's command
+    // line to find it) - this installer's main UI process is not elevated,
+    // matching how the real install step below also has to go through
+    // `run_cmds`'s UAC-elevated `runas` relaunch rather than a plain
+    // `std::process::Command`. Reuse that same established, working
+    // mechanism instead of trying to do this directly.
+    let app_name = crate::get_app_name();
+    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    // taskkill's /F terminates a process but returns as soon as the
+    // termination signal is issued - not once the process has actually
+    // exited and released its file/pipe handles. Without waiting for that,
+    // the copy step that runs right after this returns (see install_me's
+    // copy_exe_cmd / XCOPY /Y /E /H /C ...) can still find librustdesk.dll
+    // locked by a --server or GUI process that's a few hundred ms from
+    // exiting but hasn't yet - and XCOPY's /C flag then silently *skips*
+    // that one locked file and reports success anyway, leaving the old DLL
+    // in place under a "successful" install (confirmed in production:
+    // 2026-09-06, a real install left --server running fully stale code
+    // with no visible error). get_before_uninstall already solved this
+    // exact problem for the uninstall path with the same
+    // wait_for_app_processes_gone_cmd helper - reuse it here instead of
+    // inventing a second, weaker fix.
+    let cmds = format!(
+        "
+    chcp 65001
+    {disable_watchdog}
+    sc stop {app_name}
+    taskkill /F /IM {broker_exe}
+    taskkill /F /IM {app_name}.exe{filter}
+    {wait_for_stop}
+    ",
+        broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+        wait_for_stop = wait_for_app_processes_gone_cmd(&app_name, &filter),
+    );
+    if let Err(err) = run_cmds(cmds, false, "stop_running_instance") {
+        log::warn!(
+            "stop_running_instance_before_install: elevated stop failed or was declined: {}",
+            err
+        );
+    }
+
+    // Give the OS a moment to actually release the service's named pipe and
+    // any file handles before the installer tries to bind its own listener.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 pub fn handle_custom_client_staging_dir_before_update(
@@ -4090,17 +5099,187 @@ sc start {app_name}
     }
 }
 
+// Named after the app so a custom-branded client doesn't collide with a
+// stock RustDesk install's tasks on the same machine. Two separate tasks
+// (rather than one task with two triggers) because plain schtasks.exe
+// /Create only lets a single invocation define one schedule; giving a task
+// a second trigger from the CLI needs an XML task definition, which is a
+// bigger departure from this file's established plain-schtasks/sc pattern
+// than just registering a second task with the same action.
+fn watchdog_task_name() -> String {
+    format!("{} ServiceWatchdog", crate::get_app_name())
+}
+
+fn watchdog_logon_task_name() -> String {
+    format!("{} ServiceWatchdogLogon", crate::get_app_name())
+}
+
+// Recreating the tasks (rather than just re-enabling them) resets them to
+// the enabled state in one step, so install_me's call to this after a copy
+// is both "make sure they point at the current exe" and "turn them back
+// on" at once - no separate enable command needed.
+//
+// Deliberately unconditional - does NOT check stop-service and skip/delete
+// the tasks when it's "Y". An earlier version did that, but it made the
+// watchdog less resilient, not more: service_watchdog_check_and_fix()
+// already reads stop-service itself (via any_user_disabled_service()) and
+// correctly no-ops while it's set, so the periodic/logon tasks staying
+// alive costs nothing. Deleting them here meant that if stop-service ever
+// got cleared back to empty through anything other than the app's own
+// "Start" button (a direct config edit, some other tool), the watchdog
+// couldn't self-heal - it had been torn down along with the service, so
+// nothing was left running to notice the flag had changed. A watchdog that
+// stays alive and checks both directions every time it fires is simpler
+// and strictly more robust than one whose own existence is toggled by the
+// same preference it's supposed to be enforcing.
+fn get_watchdog_setup_cmd(exe: &str) -> String {
+    if config::is_outgoing_only() {
+        return "".to_string();
+    }
+    let task_name = watchdog_task_name();
+    let logon_task_name = watchdog_logon_task_name();
+    let nested_exe = escape_nested_cmd_ampersands(exe);
+    let action = format!("\\\"{nested_exe}\\\" --service-watchdog");
+    format!(
+        "schtasks /Create /F /RU SYSTEM /RL HIGHEST /SC MINUTE /MO 5 /TN \"{task_name}\" /TR \"{action}\"\nschtasks /Create /F /RU SYSTEM /RL HIGHEST /SC ONLOGON /TN \"{logon_task_name}\" /TR \"{action}\"\n"
+    )
+}
+
+// Disabling (not deleting) is deliberate: install_me's later
+// get_watchdog_setup_cmd recreates both tasks unconditionally on success,
+// so a disable here that's never followed by a recreate (install_me failed
+// or was declined) just leaves the watchdog off until the next successful
+// update - never leaves a stale task pointed at a half-replaced exe.
+fn disable_watchdog_task_cmd() -> String {
+    format!(
+        "schtasks /Change /TN \"{}\" /Disable\nschtasks /Change /TN \"{}\" /Disable\n",
+        watchdog_task_name(),
+        watchdog_logon_task_name()
+    )
+}
+
+// Invoked every 5 minutes by the scheduled task created above, already
+// running as SYSTEM - no elevation dance needed here, just plain
+// std::process::Command calls (which also sidesteps all the manual
+// cmd.exe quoting fragility that the batch-script cmds elsewhere need).
+//
+// Deliberately unconditional w.r.t. stop-service - a managed client should
+// never be able to opt itself out of remote management, whether that's via
+// an accidental Settings click, a config edit, or anything else. Brad's
+// explicit call (2026-09-07), after two earlier attempts that tried to
+// "respect" that flag from the watchdog: the flag is meaningless on a
+// managed fleet and the button that sets it is being hidden from the
+// managed-client UI entirely (desktop_setting_page.dart) as a companion
+// change, so there is no longer any legitimate way for a managed client to
+// reach this state on purpose in the first place.
+pub fn service_watchdog_check_and_fix() {
+    if config::is_outgoing_only() {
+        return;
+    }
+    let app_name = crate::get_app_name();
+    let query = std::process::Command::new("sc")
+        .args(["query", &app_name])
+        .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+        .output();
+    let (exists, running) = match &query {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).contains("RUNNING"),
+        ),
+        Err(_) => (false, false),
+    };
+    if !exists {
+        crate::server::input_service::diag_write(
+            "service_watchdog: service missing, recreating",
+        );
+        let (_, _, _, exe) = get_install_info();
+        let nested_exe = escape_nested_cmd_ampersands(&exe);
+        let bin_path = format!("\"{}\" --service", nested_exe);
+        let display_name = format!("{} Service", app_name);
+        let _ = std::process::Command::new("sc")
+            .args([
+                "create",
+                &app_name,
+                "binpath=",
+                &bin_path,
+                "start=",
+                "auto",
+                "DisplayName=",
+                &display_name,
+            ])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .output();
+        let _ = std::process::Command::new("sc")
+            .args(["start", &app_name])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .output();
+    } else if !running {
+        crate::server::input_service::diag_write("service_watchdog: service stopped, starting");
+        let _ = std::process::Command::new("sc")
+            .args(["start", &app_name])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .output();
+    }
+    ensure_tray_for_all_sessions();
+}
+
+// The Windows service starting/restarting (whether via this watchdog or
+// anything else) does not by itself put a --tray process into any
+// logged-in user's interactive session - that only happens today via a
+// Startup-folder shortcut (fires on the *next* logon, not immediately) or
+// a normal no-args launch's own is_self_service_running()-gated check in
+// core_main.rs. Confirmed in production 2026-09-07: after the watchdog
+// force-started the service, the interactive session had a working
+// service but no visible tray icon until the user manually relaunched the
+// app. Reuses the same session-crossing mechanism update_me()'s
+// _restore_session_guard already uses to restore tray sessions after an
+// update, so a managed client left with a service but no tray icon
+// self-heals within one watchdog cycle instead of needing a manual
+// relaunch.
+fn ensure_tray_for_all_sessions() {
+    let app_name = crate::get_app_name();
+    let app_exe_name = format!("{}.exe", app_name);
+    let tray_pids =
+        crate::platform::get_pids_of_process_with_args(&app_exe_name, &["--tray"]);
+    let tray_sessions: std::collections::HashSet<u32> = tray_pids
+        .iter()
+        .filter_map(|pid| get_session_id_of_process(pid.as_u32()))
+        .collect();
+    let (_, _, _, exe) = get_install_info();
+    for session in get_available_sessions(false) {
+        if session.sid == 0 || tray_sessions.contains(&session.sid) {
+            continue;
+        }
+        if is_session_locked_flag(session.sid) == Some(true) {
+            continue;
+        }
+        crate::server::input_service::diag_write(&format!(
+            "service_watchdog: no tray process in session {}, launching one",
+            session.sid
+        ));
+        let _ = run_exe_in_session(&exe, vec!["--tray"], session.sid, true);
+    }
+}
+
 fn run_after_run_cmds(silent: bool) {
     let (_, _, _, exe) = get_install_info();
+    let as_user = is_elevated_admin();
     if !silent {
         log::debug!("Spawn new window");
-        allow_err!(std::process::Command::new("cmd")
-            .args(&["/c", "timeout", "/t", "2", "&", &format!("{exe}")])
-            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
-            .spawn());
+        let quoted = format!("\"{exe}\"");
+        if !(as_user
+            && run_exe_as_shell_user("cmd", &["/c", "timeout", "/t", "2", "&", &quoted], true))
+        {
+            allow_err!(std::process::Command::new("cmd")
+                .args(&["/c", "timeout", "/t", "2", "&", &format!("{exe}")])
+                .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+                .spawn());
+        }
     }
     if Config::get_option("stop-service") != "Y" {
-        allow_err!(std::process::Command::new(&exe).arg("--tray").spawn());
+        if !(as_user && run_exe_as_shell_user(&exe, &["--tray"], false)) {
+            allow_err!(std::process::Command::new(&exe).arg("--tray").spawn());
+        }
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
 }
@@ -4368,7 +5547,7 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
     bail!("failed to find rustdesk main window process");
 }
 
-fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
+pub(crate) fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
     type NtTerminateProcess = unsafe extern "system" fn(HANDLE, DWORD) -> DWORD;
     unsafe {
         let h_module = if is_win_10_or_greater() {
@@ -4975,5 +6154,194 @@ ProcessId=10136
             arg,
         );
         assert_eq!(pids.len(), 0);
+    }
+
+    #[test]
+    fn wait_for_app_processes_gone_cmd_checks_and_bounds_the_loop() {
+        let cmd = wait_for_app_processes_gone_cmd("rustdesk", "");
+        assert!(cmd.contains("tasklist /FI \"IMAGENAME eq rustdesk.exe\""));
+        assert!(cmd.contains("findstr /I /C:\"rustdesk.exe\""));
+        // Must actually loop back, and must actually have a way out.
+        assert!(cmd.contains(":rustdesk_wait_for_stop"));
+        assert!(cmd.contains(":rustdesk_stop_confirmed"));
+        assert!(cmd.contains("GEQ 10"));
+    }
+
+    #[test]
+    fn wait_for_app_processes_gone_cmd_applies_the_pid_exclusion_filter() {
+        // Without this, a caller that deliberately spared its own PID from
+        // taskkill (kill_self=false - e.g. the running installer during a
+        // fresh install) would see its own still-running self in tasklist
+        // and burn the full timeout on every single run.
+        let filter = " /FI \"PID ne 4242\"";
+        let cmd = wait_for_app_processes_gone_cmd("rustdesk", filter);
+        assert!(cmd.contains(&format!(
+            "tasklist /FI \"IMAGENAME eq rustdesk.exe\"{filter}"
+        )));
+    }
+
+    // A locked/in-use file previously failed these copy/move steps silently:
+    // XCOPY's /C flag continues past the error, `copy`/`move` don't check
+    // %errorlevel% at all, and the wrapping install script always exits 0
+    // regardless - see the module-level comment on INSTALL_COPY_FAILED_FLAG.
+    // These just guard that each step still records a failure into the
+    // shared flag, since nothing else about a locked file changes here.
+    #[test]
+    fn copy_raw_cmd_flags_failure_on_errorlevel() {
+        let cmd = copy_raw_cmd("C:\\src\\rustdesk.exe", "", "C:\\dest").unwrap();
+        assert!(cmd.contains("XCOPY"));
+        assert!(cmd.contains(&format!("if errorlevel 1 set \"{INSTALL_COPY_FAILED_FLAG}=1\"")));
+    }
+
+    // A `--server` process running as SYSTEM in session 0 can keep
+    // librustdesk.dll/RustDesk.exe locked even after every visible rustdesk
+    // process has been killed and waited for (see the comment above
+    // update_me's cmds). XCOPY's /C then silently skips the locked file
+    // while still reporting success. Renaming it aside first must happen
+    // before the XCOPY line, since a rename succeeds on a locked-but-shared
+    // file even though an in-place overwrite doesn't.
+    #[test]
+    fn copy_raw_cmd_clears_locked_exe_and_dll_before_xcopy() {
+        let cmd = copy_raw_cmd("C:\\src\\rustdesk.exe", "", "C:\\dest").unwrap();
+        let clear_pos = cmd
+            .find("*.rdupdatebak")
+            .expect("must clear old rename-aside backups");
+        let move_pos = cmd
+            .find("move /Y")
+            .expect("must rename locked exe/dll aside");
+        let xcopy_pos = cmd.find("XCOPY").expect("must still XCOPY the rest");
+        assert!(clear_pos < move_pos && move_pos < xcopy_pos);
+        assert!(cmd.contains("\"C:\\dest\\*.exe\""));
+        assert!(cmd.contains("\"C:\\dest\\*.dll\""));
+    }
+
+    // XCOPY /C skips a file it cannot write (disk full, AV quarantine) and
+    // still reports success, and copy_raw_cmd has already moved the old
+    // exe/dll aside: the update must notice the missing binary itself and
+    // put the old ones back before the service is started again.
+    #[test]
+    fn verify_update_copy_cmd_restores_moved_aside_binaries_on_a_miss() {
+        let src_exe = std::env::current_exe().unwrap();
+        let size = std::fs::metadata(&src_exe).unwrap().len();
+        let src_exe = src_exe.to_string_lossy();
+        let cmd = verify_update_copy_cmd(&src_exe, "C:\\dest").unwrap();
+        assert!(cmd.contains(&format!("\"%%~zG\"==\"{size}\"")));
+        assert!(cmd.contains("if not \"%%~zG\"==\"%%~zF\""));
+        let check_pos = cmd
+            .find(&format!("if \"%{UPDATE_BINARY_MISSING_FLAG}%\"==\"1\""))
+            .expect("must branch on the verification result");
+        let flag_pos = cmd
+            .find(&format!("set \"{INSTALL_COPY_FAILED_FLAG}=1\""))
+            .expect("a miss must fail the update");
+        let restore_pos = cmd
+            .find("move /Y \"%%F\" \"%%~dpnF\"")
+            .expect("a miss must move the old binaries back");
+        let cleanup_pos = cmd
+            .find("del /F /Q \"C:\\dest\\*.rdupdatebak\"")
+            .expect("a good copy must remove the moved-aside binaries");
+        assert!(check_pos < flag_pos && flag_pos < restore_pos && restore_pos < cleanup_pos);
+        assert!(!cmd.contains("errorlevel"));
+    }
+
+    // AV quarantining librustdesk.dll after XCOPY /E has already replaced data\app.so: moving back
+    // only the top-level binaries left a new app.so beside the old DLL.
+    #[test]
+    fn managed_update_backs_up_the_whole_tree_and_skips_the_copy_without_it() {
+        let cmd = managed_update_backup_cmd("C:\\dest");
+        let copy_pos = cmd
+            .find("robocopy \"C:\\dest\" \"C:\\dest.rdupdate-prev\" /E")
+            .expect("must copy the whole install tree aside");
+        let check_pos = cmd
+            .find("if not errorlevel 8 goto :rdc_update_backed_up")
+            .expect("must check the backup");
+        let fail_pos = cmd
+            .find(&format!("set \"{INSTALL_COPY_FAILED_FLAG}=1\""))
+            .expect("a failed backup must fail the update");
+        let skip_pos = cmd
+            .find("goto :rdc_update_failed")
+            .expect("a failed backup must skip the copy");
+        assert!(copy_pos < check_pos && check_pos < fail_pos && fail_pos < skip_pos);
+    }
+
+    #[test]
+    fn managed_update_restores_the_whole_tree_and_registers_only_a_verified_copy() {
+        let reg_cmd = "reg add HKLM\\Uninstall\\RustDesk /f /v DisplayVersion /t REG_SZ /d \"9.9.9\"";
+        let records = Some((
+            PathBuf::from("C:\\ProgramData\\RustDeskManaged\\managed_update_attempt.json"),
+            PathBuf::from("C:\\ProgramData\\RustDeskManaged\\managed_update_failed.json"),
+        ));
+        let cmd = managed_update_finish_cmd("C:\\dest", reg_cmd, records);
+
+        let branch_pos = cmd
+            .find(&format!("if \"%{INSTALL_COPY_FAILED_FLAG}%\"==\"0\" goto :rdc_update_copied"))
+            .expect("must branch on the copy result");
+        let restore_pos = cmd
+            .find("robocopy \"C:\\dest.rdupdate-prev\" \"C:\\dest\" /MIR")
+            .expect("a failed copy must restore the whole previous tree");
+        let failed_label_pos = cmd.find(":rdc_update_failed").expect("backup failure lands here");
+        let record_pos = cmd
+            .find("type \"C:\\ProgramData\\RustDeskManaged\\managed_update_attempt.json\" > \"C:\\ProgramData\\RustDeskManaged\\managed_update_failed.json\"")
+            .expect("a failed copy must record the attempted build");
+        let copied_pos = cmd.rfind(":rdc_update_copied").expect("verified copies land here");
+        let reg_pos = cmd.find(reg_cmd).expect("a verified copy registers the version");
+        let cleanup_pos = cmd
+            .find("rd /s /q \"C:\\dest.rdupdate-prev\"")
+            .expect("the backup is removed afterwards");
+        assert!(branch_pos < restore_pos && restore_pos < failed_label_pos);
+        assert!(failed_label_pos < record_pos && record_pos < copied_pos);
+        assert!(copied_pos < reg_pos && reg_pos < cleanup_pos);
+        assert_eq!(cmd.matches("DisplayVersion").count(), 1);
+
+        let cmd = managed_update_finish_cmd("C:\\dest", reg_cmd, None);
+        assert!(!cmd.contains("type "));
+        assert!(cmd.contains(":rdc_update_failed"));
+    }
+
+    #[test]
+    fn windows_policy_blocks_are_told_apart_from_other_launch_failures() {
+        for code in [4551, 4556, 4557, 4558, 4559, 4580, 4581, 4582] {
+            assert!(is_windows_policy_block(code), "{code} is a policy block");
+        }
+        // Not found, access denied, elevation required, and the neighbouring integrity errors that
+        // are about the policy itself rather than this file.
+        for code in [0, 2, 5, 740, 4550, 4552, 4555, 4560, 4579, 4583] {
+            assert!(!is_windows_policy_block(code), "{code} is not a policy block");
+        }
+
+        let blocked_with = |code| {
+            PRIVILEGED_LAUNCH_OS_ERROR.with(|error| error.set(code));
+            last_privileged_launch_blocked_by_policy()
+        };
+        assert!(!blocked_with(None));
+        assert!(blocked_with(Some(4551)));
+        assert!(!blocked_with(Some(2)));
+    }
+
+    #[test]
+    fn copy_exe_cmd_flags_failure_on_errorlevel() {
+        let cmd = copy_exe_cmd("C:\\src\\rustdesk.exe", "C:\\dest\\rustdesk.exe", "C:\\dest")
+            .unwrap();
+        // Both the XCOPY (via copy_raw_cmd) and the broker-exe copy must each
+        // be checked - a failure on either one has to be caught.
+        let checks = cmd
+            .matches(&format!("if errorlevel 1 set \"{INSTALL_COPY_FAILED_FLAG}=1\""))
+            .count();
+        assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn rename_exe_cmd_flags_failure_on_errorlevel() {
+        let cmd = rename_exe_cmd("C:\\src\\rustdesk-tmp.exe", "C:\\dest").unwrap();
+        assert!(cmd.contains("move /Y"));
+        assert!(cmd.contains(&format!("if errorlevel 1 set \"{INSTALL_COPY_FAILED_FLAG}=1\"")));
+    }
+
+    #[test]
+    fn rename_exe_cmd_is_noop_when_already_named_correctly() {
+        // The already-correctly-named case has nothing to copy/move, so
+        // there's deliberately no failure check to add here.
+        let app_name = crate::get_app_name();
+        let cmd = rename_exe_cmd(&format!("C:\\src\\{app_name}.exe"), "C:\\dest").unwrap();
+        assert_eq!(cmd, "");
     }
 }

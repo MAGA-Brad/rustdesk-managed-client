@@ -3,6 +3,7 @@
 #include <tchar.h>
 #include <uni_links_desktop/uni_links_desktop_plugin.h>
 #include <windows.h>
+#include <shobjidl.h>
 
 #include <algorithm>
 #include <iostream>
@@ -17,9 +18,39 @@ typedef void (*FUNC_RUSTDESK_FREE_ARGS)( char**, int);
 typedef int (*FUNC_RUSTDESK_GET_APP_NAME)(wchar_t*, int);
 typedef int (*FUNC_RUSTDESK_IS_DISABLE_INSTALLATION)();
 /// Note: `--server`, `--service` are already handled in [core_main.rs].
-const std::vector<std::string> parameters_white_list = {"--install", "--cm"};
+const std::vector<std::string> parameters_white_list = {"--install", "--cm", "--rustdrop"};
 
 const wchar_t* getWindowClassName();
+
+// Two launches at once (a double-click on the taskbar button) both find no window below, as
+// neither copy has created one yet, and the second copy never gets managed chat pushes (one
+// listener per session). The first launch holds this per-session lock until it exits; a later
+// one waits up to 10 s for that copy's window, so the check below shows it instead, and takes
+// the lock over if that copy exits first (main.dart's window-timeout relaunch).
+static HWND WaitForStartingInstanceWindow(const std::wstring& app_name,
+                                          const std::vector<std::string>& arguments) {
+  for (auto& whitelist_param : parameters_white_list) {
+    if (std::find(arguments.begin(), arguments.end(), whitelist_param) != arguments.end()) {
+      return NULL;
+    }
+  }
+  std::wstring lock_name = L"Local\\" + app_name + L"-main-window-starting";
+  HANDLE lock = ::CreateMutexW(nullptr, TRUE, lock_name.c_str());
+  if (lock == NULL || ::GetLastError() != ERROR_ALREADY_EXISTS) {
+    return NULL;
+  }
+  for (int i = 0; i < 100; i++) {
+    HWND hwnd = ::FindWindowW(getWindowClassName(), app_name.c_str());
+    if (hwnd != NULL) {
+      return hwnd;
+    }
+    DWORD wait = ::WaitForSingleObject(lock, 100);
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+      return NULL;
+    }
+  }
+  return NULL;
+}
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command)
@@ -95,6 +126,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   // Uri links dispatch
   HWND hwnd = ::FindWindowW(getWindowClassName(), app_name.c_str());
+  if (hwnd == NULL) {
+    hwnd = WaitForStartingInstanceWindow(app_name, command_line_arguments);
+  }
   if (hwnd != NULL) {
     // Allow multiple flutter instances when being executed by parameters
     // contained in whitelists.
@@ -149,6 +183,17 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   bool is_install_page = false;
   if (!command_line_arguments.empty() && command_line_arguments.front().compare(0, installParam.size(), installParam.c_str()) == 0) {
     is_install_page = true;
+  }
+  // Without this, RustDrop's separate process falls back to Windows'
+  // default taskbar grouping heuristic, which groups windows by the
+  // launching executable's path - since RustDrop is the same rustdesk.exe
+  // just started with --rustdrop, it gets folded into the main window's
+  // taskbar icon instead of getting its own. Giving it a distinct app ID
+  // (and leaving the main app's ID untouched, so existing pinned-taskbar
+  // associations for RustDesk itself aren't disturbed) fixes that.
+  auto rustdropParam = std::string("--rustdrop");
+  if (!command_line_arguments.empty() && command_line_arguments.front().compare(0, rustdropParam.size(), rustdropParam.c_str()) == 0) {
+    ::SetCurrentProcessExplicitAppUserModelID(L"RustDesk.RustDrop");
   }
 
   command_line_arguments.insert(command_line_arguments.end(), rust_args.begin(), rust_args.end());

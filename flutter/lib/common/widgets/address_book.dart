@@ -26,7 +26,7 @@ final hideAbTagsPanel = false.obs;
 
 class AddressBook extends StatefulWidget {
   final EdgeInsets? menuPadding;
-  const AddressBook({Key? key, this.menuPadding}) : super(key: key);
+  const AddressBook({super.key, this.menuPadding});
 
   @override
   State<StatefulWidget> createState() {
@@ -80,8 +80,8 @@ class _AddressBookState extends State<AddressBook> {
             child: Container(
               decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(
-                      color: Theme.of(context).colorScheme.background)),
+                  border:
+                      Border.all(color: Theme.of(context).colorScheme.surface)),
               child: Container(
                 width: 200,
                 height: double.infinity,
@@ -118,8 +118,8 @@ class _AddressBookState extends State<AddressBook> {
             child: Container(
               decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(6),
-                  border: Border.all(
-                      color: Theme.of(context).colorScheme.background)),
+                  border:
+                      Border.all(color: Theme.of(context).colorScheme.surface)),
               child: Container(
                 padding:
                     const EdgeInsets.fromLTRB(padding, 0, padding, padding),
@@ -239,7 +239,8 @@ class _AddressBookState extends State<AddressBook> {
           : (value) {
               if (value != null) {
                 gFFI.abModel.setCurrentName(value);
-                bind.setLocalFlutterOption(k: kOptionCurrentAbName, v: value);
+                bind.crateFlutterFfiSetLocalFlutterOption(
+                    k: kOptionCurrentAbName, v: value);
               }
             },
       customButton: Obx(() => Container(
@@ -253,7 +254,7 @@ class _AddressBookState extends State<AddressBook> {
           )),
       underline: Container(
         height: 0.7,
-        color: Theme.of(context).dividerColor.withOpacity(0.1),
+        color: Theme.of(context).dividerColor.withValues(alpha: 0.1),
       ),
       menuItemStyleData: menuItemStyleData,
       items: items,
@@ -392,7 +393,7 @@ class _AddressBookState extends State<AddressBook> {
         return shouldSortTags();
       },
       setter: (bool v) async {
-        bind.mainSetLocalOption(
+        bind.crateFlutterFfiMainSetLocalOption(
             key: sortAbTagsOption, value: v ? 'Y' : defaultOptionNo);
         gFFI.abModel.sortTags.value = v;
       },
@@ -411,7 +412,7 @@ class _AddressBookState extends State<AddressBook> {
         return filterAbTagByIntersection();
       },
       setter: (bool v) async {
-        bind.mainSetLocalOption(
+        bind.crateFlutterFfiMainSetLocalOption(
             key: filterAbTagOption, value: v ? 'Y' : defaultOptionNo);
         gFFI.abModel.filterByIntersection.value = v;
       },
@@ -434,7 +435,7 @@ class _AddressBookState extends State<AddressBook> {
         MenuEntryDivider<String>(),
       if (!gFFI.abModel.legacyMode.value && canWrite)
         getEntry(translate("ab_web_console_tip"), () async {
-          final url = await bind.mainGetApiServer();
+          final url = await bind.crateFlutterFfiMainGetApiServer();
           if (await canLaunchUrlString(url)) {
             launchUrlString(url);
           }
@@ -756,12 +757,11 @@ class AddressBookTag extends StatelessWidget {
   final bool showActionMenu;
 
   const AddressBookTag(
-      {Key? key,
+      {super.key,
       required this.name,
       required this.tags,
       this.onTap,
-      this.showActionMenu = true})
-      : super(key: key);
+      this.showActionMenu = true});
 
   @override
   Widget build(BuildContext context) {
@@ -786,7 +786,7 @@ class AddressBookTag extends StatelessWidget {
             decoration: BoxDecoration(
                 color: tags.contains(name)
                     ? gFFI.abModel.getCurrentAbTagColor(name)
-                    : Theme.of(context).colorScheme.background,
+                    : Theme.of(context).colorScheme.surface,
                 borderRadius: BorderRadius.circular(4)),
             margin: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
             padding: const EdgeInsets.symmetric(vertical: 2.0, horizontal: 6.0),

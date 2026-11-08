@@ -5,7 +5,7 @@ import 'package:flutter_hbb/models/platform_model.dart';
 
 String _resolveApiServer({required String api, required String custom}) {
   final key = 'resolve-api-server:${jsonEncode([api, custom])}';
-  final response = jsonDecode(bind.mainGetCommonSync(key: key));
+  final response = jsonDecode(bind.crateFlutterFfiMainGetCommonSync(key: key));
   if (response['error'] != null) {
     throw FormatException('Failed to resolve API server: ${response['error']}');
   }

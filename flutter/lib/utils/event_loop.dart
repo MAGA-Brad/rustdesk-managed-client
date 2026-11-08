@@ -38,31 +38,34 @@ abstract class BaseEventLoop<EventType, Data> {
 
   /// An Event is about to be consumed.
   Future<void> onPreConsume(BaseEvent<EventType, Data> evt) async {}
+
   /// An Event was consumed.
   Future<void> onPostConsume(BaseEvent<EventType, Data> evt) async {}
+
   /// Events are all handled and cleared.
   Future<void> onEventsClear() async {}
+
   /// Events start to consume.
   Future<void> onEventsStartConsuming() async {}
 
   Future<void> _handleTimer(Timer timer) async {
-      if (_evts.isEmpty) {
-        return;
-      }
-      timer.cancel();
-      _timer = null;
-      // Handle the logic.
-      await onEventsStartConsuming();
-      while (_evts.isNotEmpty) {
-        final evt = _evts.first;
-        _evts.remove(evt);
-        await onPreConsume(evt);
-        await evt.consume();
-        await onPostConsume(evt);
-      }
-      await onEventsClear();
-      // Now events are all processed.
-      _timer = Timer.periodic(Duration(milliseconds: 100), _handleTimer);
+    if (_evts.isEmpty) {
+      return;
+    }
+    timer.cancel();
+    _timer = null;
+    // Handle the logic.
+    await onEventsStartConsuming();
+    while (_evts.isNotEmpty) {
+      final evt = _evts.first;
+      _evts.remove(evt);
+      await onPreConsume(evt);
+      await evt.consume();
+      await onPostConsume(evt);
+    }
+    await onEventsClear();
+    // Now events are all processed.
+    _timer = Timer.periodic(Duration(milliseconds: 100), _handleTimer);
   }
 
   Future<void> close() async {

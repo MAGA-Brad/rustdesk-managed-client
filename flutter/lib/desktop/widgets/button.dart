@@ -16,7 +16,7 @@ class Button extends StatefulWidget {
   final Color? borderColor;
 
   Button({
-    Key? key,
+    super.key,
     this.minWidth,
     this.isOutline = false,
     this.textSize,
@@ -26,7 +26,7 @@ class Button extends StatefulWidget {
     this.borderColor,
     required this.onTap,
     required this.text,
-  }) : super(key: key);
+  });
 
   @override
   State<Button> createState() => _ButtonState();
@@ -97,7 +97,7 @@ class FixedWidthButton extends StatefulWidget {
   final int? maxLines;
 
   FixedWidthButton({
-    Key? key,
+    super.key,
     required this.width,
     this.maxLines,
     this.isOutline = false,
@@ -108,7 +108,7 @@ class FixedWidthButton extends StatefulWidget {
     this.borderColor,
     required this.onTap,
     required this.text,
-  }) : super(key: key);
+  });
 
   @override
   State<FixedWidthButton> createState() => _FixedWidthButtonState();

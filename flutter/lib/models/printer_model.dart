@@ -13,7 +13,8 @@ class PrinterOptions {
       required this.printerName});
 
   static PrinterOptions load() {
-    var action = bind.mainGetLocalOption(key: kKeyPrinterIncomingJobAction);
+    var action = bind.crateFlutterFfiMainGetLocalOption(
+        key: kKeyPrinterIncomingJobAction);
     if (![
       kValuePrinterIncomingJobDismiss,
       kValuePrinterIncomingJobDefault,
@@ -23,11 +24,12 @@ class PrinterOptions {
     }
 
     final printerNames = getPrinterNames();
-    var selectedPrinterName = bind.mainGetLocalOption(key: kKeyPrinterSelected);
+    var selectedPrinterName =
+        bind.crateFlutterFfiMainGetLocalOption(key: kKeyPrinterSelected);
     if (!printerNames.contains(selectedPrinterName)) {
       if (action == kValuePrinterIncomingJobSelected) {
         action = kValuePrinterIncomingJobDefault;
-        bind.mainSetLocalOption(
+        bind.crateFlutterFfiMainSetLocalOption(
             key: kKeyPrinterIncomingJobAction,
             value: kValuePrinterIncomingJobDefault);
         if (printerNames.isEmpty) {
@@ -35,7 +37,7 @@ class PrinterOptions {
         } else {
           selectedPrinterName = printerNames.first;
         }
-        bind.mainSetLocalOption(
+        bind.crateFlutterFfiMainSetLocalOption(
             key: kKeyPrinterSelected, value: selectedPrinterName);
       }
     }

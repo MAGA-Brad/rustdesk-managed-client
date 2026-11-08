@@ -281,6 +281,18 @@ impl Encoder {
         if h265_useable {
             auto_codec = CodecFormat::H265;
         }
+        // Managed builds: AV1, then VP9, ahead of the hardware H.265/H.264 encoders, whose picture
+        // is visibly worse. Both are encoded in software here, so a machine with fewer than 4
+        // threads keeps the hardware order (and one with <= 4 GB of memory still drops to VP8 below).
+        if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+            && std::thread::available_parallelism().map_or(false, |n| n.get() >= 4)
+        {
+            auto_codec = if av1_useable && av1_test {
+                CodecFormat::AV1
+            } else {
+                CodecFormat::VP9
+            };
+        }
         if auto_codec == CodecFormat::VP9 || auto_codec == CodecFormat::AV1 {
             let mut system = System::new();
             system.refresh_memory();

@@ -20,7 +20,7 @@ use hbb_common::tokio::sync::mpsc::unbounded_channel;
 #[cfg(target_os = "windows")]
 use hbb_common::tokio::sync::Mutex as TokioMutex;
 use hbb_common::{
-    allow_err, bail,
+    allow_err,
     config::{option2bool, Config},
     log,
     protobuf::Message as _,
@@ -175,6 +175,21 @@ lazy_static::lazy_static! {
     static ref CLIENTS: RwLock<HashMap<i32, Client>> = Default::default();
 }
 
+fn update_client_permission_state(client: &mut Client, name: &str, enabled: bool) -> bool {
+    match name {
+        "keyboard" => client.keyboard = enabled,
+        "clipboard" => client.clipboard = enabled,
+        "audio" => client.audio = enabled,
+        "file" => client.file = enabled,
+        "restart" => client.restart = enabled,
+        "recording" => client.recording = enabled,
+        "block_input" => client.block_input = enabled,
+        "privacy_mode" => client.privacy_mode = enabled,
+        _ => return false,
+    }
+    true
+}
+
 static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Clone)]
@@ -198,6 +213,8 @@ pub trait InvokeUiCM: Send + Clone + 'static + Sized {
     fn update_voice_call_state(&self, client: &Client);
 
     fn file_transfer_log(&self, action: &str, log: &str);
+
+    fn switch_sides_prompt(&self, _id: i32) {}
 }
 
 impl<T: InvokeUiCM> Deref for ConnectionManager<T> {
@@ -267,6 +284,8 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             .unwrap()
             .retain(|_, c| !(c.disconnected && c.peer_id == client.peer_id));
         CLIENTS.write().unwrap().insert(id, client.clone());
+        #[cfg(target_os = "windows")]
+        sync_font_smoothing();
         self.ui_handler.add_connection(&client);
     }
 
@@ -296,6 +315,8 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
         {
             crate::clipboard::try_empty_clipboard_files(ClipboardSide::Host, id);
         }
+        #[cfg(target_os = "windows")]
+        sync_font_smoothing();
 
         #[cfg(any(target_os = "android"))]
         if CLIENTS
@@ -369,6 +390,8 @@ pub fn authorize(id: i32) {
         client.authorized = true;
         allow_err!(client.tx.send(Data::Authorize));
     };
+    #[cfg(target_os = "windows")]
+    sync_font_smoothing();
 }
 
 #[inline]
@@ -391,6 +414,22 @@ pub fn close_window(id: i32) {
 #[inline]
 pub fn remove(id: i32) {
     CLIENTS.write().unwrap().remove(&id);
+    #[cfg(target_os = "windows")]
+    sync_font_smoothing();
+}
+
+/// Grayscale text smoothing while an authorized desktop session is open (managed builds).
+#[cfg(target_os = "windows")]
+fn sync_font_smoothing() {
+    let active = CLIENTS.read().unwrap().values().any(|c| {
+        c.authorized
+            && !c.disconnected
+            && !c.is_file_transfer
+            && !c.is_terminal
+            && !c.is_view_camera
+            && c.port_forward.is_empty()
+    });
+    crate::platform::windows::font_smoothing::on_desktop_sessions_changed(active);
 }
 
 // server mode send chat to peer
@@ -423,7 +462,14 @@ pub fn switch_permission(id: i32, name: String, enabled: bool) {
         );
         return;
     }
-    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
+    if let Some(client) = CLIENTS.write().unwrap().get_mut(&id) {
+        if !update_client_permission_state(client, &name, enabled) {
+            log::warn!(
+                "cm switch_permission received unknown permission, conn_id={}, permission={}",
+                id,
+                name
+            );
+        }
         allow_err!(client.tx.send(Data::SwitchPermission { name, enabled }));
     };
 }
@@ -479,6 +525,15 @@ pub fn has_active_clients() -> bool {
 pub fn switch_back(id: i32) {
     if let Some(client) = CLIENTS.read().unwrap().get(&id) {
         allow_err!(client.tx.send(Data::SwitchSidesBack));
+    };
+}
+
+#[inline]
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn switch_sides_answer(id: i32, accept: bool) {
+    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
+        allow_err!(client.tx.send(Data::SwitchSidesAnswer(accept)));
     };
 }
 
@@ -585,23 +640,28 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     self.cm.new_message(self.conn_id, text);
                                 }
                                 Data::SwitchPermission { name, enabled } => {
-                                    // Keep this branch scoped to privacy mode rollback.
-                                    // Other CM permission toggles are updated optimistically by the UI itself.
-                                    // The backend currently sends SwitchPermission back to CM only when
-                                    // privacy-mode turn-off fails and the UI state must be restored.
-                                    if name == "privacy_mode" {
-                                        let client = {
-                                            let mut clients = CLIENTS.write().unwrap();
-                                            clients.get_mut(&self.conn_id).map(|c| {
-                                                c.privacy_mode = enabled;
-                                                c.clone()
-                                            })
-                                        };
-                                        if let Some(client) = client {
-                                            // This reuses add_connection(), and cm.tis only selectively updates
-                                            // existing rows (authorized/privacy_mode) for this fallback path.
-                                            self.cm.ui_handler.add_connection(&client);
-                                        }
+                                    // Backend permission state is authoritative. This path is used both
+                                    // for attended-view-only initialization and for permission rollback.
+                                    // Mirror every supported permission into CLIENTS and publish the updated
+                                    // Client so Flutter cannot display a stale optimistic value.
+                                    let client = {
+                                        let mut clients = CLIENTS.write().unwrap();
+                                        clients.get_mut(&self.conn_id).and_then(|c| {
+                                            if update_client_permission_state(c, &name, enabled) {
+                                                Some(c.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    };
+                                    if let Some(client) = client {
+                                        self.cm.ui_handler.add_connection(&client);
+                                    } else {
+                                        log::warn!(
+                                            "cm received unknown backend permission, conn_id={}, permission={}",
+                                            self.conn_id,
+                                            name
+                                        );
                                     }
                                 }
                                 Data::FS(mut fs) => {
@@ -672,6 +732,10 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 }
                                 Data::CloseVoiceCall(reason) => {
                                     self.cm.voice_call_closed(self.conn_id, reason.as_str());
+                                }
+                                #[cfg(feature = "flutter")]
+                                Data::SwitchSidesPrompt => {
+                                    self.cm.ui_handler.switch_sides_prompt(self.conn_id);
                                 }
                                 #[cfg(target_os = "windows")]
                                 Data::ClipboardNonFile(_) => {

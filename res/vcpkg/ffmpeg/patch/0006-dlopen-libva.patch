@@ -1,35 +1,32 @@
-From 95ebc0ad912447ba83cacb197f506b881f82179e Mon Sep 17 00:00:00 2001
 From: 21pages <sunboeasy@gmail.com>
-Date: Tue, 10 Dec 2024 15:29:21 +0800
-Subject: [PATCH 1/2] dlopen libva
+Subject: [PATCH] dlopen libva
 
-Signed-off-by: 21pages <sunboeasy@gmail.com>
----
- libavcodec/vaapi_decode.c      |  96 ++++++-----
- libavcodec/vaapi_encode.c      | 173 ++++++++++---------
- libavcodec/vaapi_encode_h264.c |   3 +-
- libavcodec/vaapi_encode_h265.c |   6 +-
- libavutil/hwcontext_vaapi.c    | 292 ++++++++++++++++++++++++---------
- libavutil/hwcontext_vaapi.h    |  96 +++++++++++
- 6 files changed, 477 insertions(+), 189 deletions(-)
+Ported to FFmpeg 9.0.2 for RDC. ff_vaapi_decode_make_param_buffer was rewritten
+upstream (growable param buffer array) and was converted by hand; the new
+vaapi_encode_surface_alignment() (VA-API >= 1.21) also calls libva directly
+and now goes through the dlopen table too. All other hunks moved by offset or
+fuzz only. Linux only, not compile-tested in this Windows experiment.
 
 diff --git a/libavcodec/vaapi_decode.c b/libavcodec/vaapi_decode.c
-index a59194340f..e202b673f4 100644
+index 4ac2df5..9679e16 100644
 --- a/libavcodec/vaapi_decode.c
 +++ b/libavcodec/vaapi_decode.c
-@@ -38,17 +38,18 @@ int ff_vaapi_decode_make_param_buffer(AVCodecContext *avctx,
+@@ -38,6 +38,7 @@ int ff_vaapi_decode_make_param_buffer(AVCodecContext *avctx,
                                        size_t size)
  {
      VAAPIDecodeContext *ctx = avctx->internal->hwaccel_priv_data;
 +    VAAPIDynLoadFunctions *vaf = ctx->hwctx->funcs;
      VAStatus vas;
-     VABufferID buffer;
  
-     av_assert0(pic->nb_param_buffers + 1 <= MAX_PARAM_BUFFERS);
+     av_assert0(pic->nb_param_buffers <= pic->nb_param_buffers_allocated);
+@@ -54,13 +55,13 @@ int ff_vaapi_decode_make_param_buffer(AVCodecContext *avctx,
+     }
+     av_assert0(pic->nb_param_buffers + 1 <= pic->nb_param_buffers_allocated);
  
 -    vas = vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
 +    vas = vaf->vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
-                          type, size, 1, (void*)data, &buffer);
+                          type, size, 1, (void*)data,
+                          &pic->param_buffers[pic->nb_param_buffers]);
      if (vas != VA_STATUS_SUCCESS) {
          av_log(avctx, AV_LOG_ERROR, "Failed to create parameter "
                 "buffer (type %d): %d (%s).\n",
@@ -38,7 +35,7 @@ index a59194340f..e202b673f4 100644
          return AVERROR(EIO);
      }
  
-@@ -69,6 +70,7 @@ int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
+@@ -81,6 +82,7 @@ int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
                                        size_t slice_size)
  {
      VAAPIDecodeContext *ctx = avctx->internal->hwaccel_priv_data;
@@ -46,7 +43,7 @@ index a59194340f..e202b673f4 100644
      VAStatus vas;
      int index;
  
-@@ -88,13 +90,13 @@ int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
+@@ -100,13 +102,13 @@ int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
  
      index = 2 * pic->nb_slices;
  
@@ -62,7 +59,7 @@ index a59194340f..e202b673f4 100644
          return AVERROR(EIO);
      }
  
-@@ -102,15 +104,15 @@ int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
+@@ -114,15 +116,15 @@ int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
             "is %#x.\n", pic->nb_slices, params_size,
             pic->slice_buffers[index]);
  
@@ -81,7 +78,7 @@ index a59194340f..e202b673f4 100644
                          pic->slice_buffers[index]);
          return AVERROR(EIO);
      }
-@@ -127,26 +129,27 @@ static void ff_vaapi_decode_destroy_buffers(AVCodecContext *avctx,
+@@ -139,26 +141,27 @@ static void ff_vaapi_decode_destroy_buffers(AVCodecContext *avctx,
                                              VAAPIDecodePicture *pic)
  {
      VAAPIDecodeContext *ctx = avctx->internal->hwaccel_priv_data;
@@ -113,7 +110,7 @@ index a59194340f..e202b673f4 100644
          }
      }
  }
-@@ -155,6 +158,7 @@ int ff_vaapi_decode_issue(AVCodecContext *avctx,
+@@ -167,6 +170,7 @@ int ff_vaapi_decode_issue(AVCodecContext *avctx,
                            VAAPIDecodePicture *pic)
  {
      VAAPIDecodeContext *ctx = avctx->internal->hwaccel_priv_data;
@@ -121,7 +118,7 @@ index a59194340f..e202b673f4 100644
      VAStatus vas;
      int err;
  
-@@ -166,37 +170,37 @@ int ff_vaapi_decode_issue(AVCodecContext *avctx,
+@@ -178,37 +182,37 @@ int ff_vaapi_decode_issue(AVCodecContext *avctx,
      av_log(avctx, AV_LOG_DEBUG, "Decode to surface %#x.\n",
             pic->output_surface);
  
@@ -167,7 +164,7 @@ index a59194340f..e202b673f4 100644
          err = AVERROR(EIO);
          if (CONFIG_VAAPI_1 || ctx->hwctx->driver_quirks &
              AV_VAAPI_DRIVER_QUIRK_RENDER_PARAM_BUFFERS)
-@@ -213,10 +217,10 @@ int ff_vaapi_decode_issue(AVCodecContext *avctx,
+@@ -225,10 +229,10 @@ int ff_vaapi_decode_issue(AVCodecContext *avctx,
      goto exit;
  
  fail_with_picture:
@@ -180,7 +177,7 @@ index a59194340f..e202b673f4 100644
      }
  fail:
      ff_vaapi_decode_destroy_buffers(avctx, pic);
-@@ -304,6 +308,7 @@ static int vaapi_decode_find_best_format(AVCodecContext *avctx,
+@@ -320,6 +324,7 @@ static int vaapi_decode_find_best_format(AVCodecContext *avctx,
                                           AVHWFramesContext *frames)
  {
      AVVAAPIDeviceContext *hwctx = device->hwctx;
@@ -188,7 +185,7 @@ index a59194340f..e202b673f4 100644
      VAStatus vas;
      VASurfaceAttrib *attr;
      enum AVPixelFormat source_format, best_format, format;
-@@ -313,11 +318,11 @@ static int vaapi_decode_find_best_format(AVCodecContext *avctx,
+@@ -329,11 +334,11 @@ static int vaapi_decode_find_best_format(AVCodecContext *avctx,
      source_format = avctx->sw_pix_fmt;
      av_assert0(source_format != AV_PIX_FMT_NONE);
  
@@ -202,7 +199,7 @@ index a59194340f..e202b673f4 100644
          return AVERROR(ENOSYS);
      }
  
-@@ -325,11 +330,11 @@ static int vaapi_decode_find_best_format(AVCodecContext *avctx,
+@@ -341,11 +346,11 @@ static int vaapi_decode_find_best_format(AVCodecContext *avctx,
      if (!attr)
          return AVERROR(ENOMEM);
  
@@ -216,7 +213,7 @@ index a59194340f..e202b673f4 100644
          av_freep(&attr);
          return AVERROR(ENOSYS);
      }
-@@ -471,6 +476,7 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
+@@ -490,6 +495,7 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
  
      AVHWDeviceContext    *device = (AVHWDeviceContext*)device_ref->data;
      AVVAAPIDeviceContext *hwctx = device->hwctx;
@@ -224,7 +221,7 @@ index a59194340f..e202b673f4 100644
  
      codec_desc = avcodec_descriptor_get(avctx->codec_id);
      if (!codec_desc) {
-@@ -478,7 +484,7 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
+@@ -497,7 +503,7 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
          goto fail;
      }
  
@@ -233,7 +230,7 @@ index a59194340f..e202b673f4 100644
      profile_list  = av_malloc_array(profile_count,
                                      sizeof(VAProfile));
      if (!profile_list) {
-@@ -486,11 +492,11 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
+@@ -505,11 +511,11 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
          goto fail;
      }
  
@@ -247,7 +244,7 @@ index a59194340f..e202b673f4 100644
          err = AVERROR(ENOSYS);
          goto fail;
      }
-@@ -550,12 +556,12 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
+@@ -569,12 +575,12 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
          }
      }
  
@@ -262,7 +259,7 @@ index a59194340f..e202b673f4 100644
          err = AVERROR(EIO);
          goto fail;
      }
-@@ -638,7 +644,7 @@ fail:
+@@ -658,7 +664,7 @@ fail:
      av_hwframe_constraints_free(&constraints);
      av_freep(&hwconfig);
      if (*va_config != VA_INVALID_ID) {
@@ -271,7 +268,7 @@ index a59194340f..e202b673f4 100644
          *va_config = VA_INVALID_ID;
      }
      av_freep(&profile_list);
-@@ -651,12 +657,14 @@ int ff_vaapi_common_frame_params(AVCodecContext *avctx,
+@@ -671,12 +677,14 @@ int ff_vaapi_common_frame_params(AVCodecContext *avctx,
      AVHWFramesContext *hw_frames = (AVHWFramesContext *)hw_frames_ctx->data;
      AVHWDeviceContext *device_ctx = hw_frames->device_ctx;
      AVVAAPIDeviceContext *hwctx;
@@ -286,7 +283,7 @@ index a59194340f..e202b673f4 100644
  
      err = vaapi_decode_make_config(avctx, hw_frames->device_ref, &va_config,
                                     hw_frames_ctx);
-@@ -664,7 +672,7 @@ int ff_vaapi_common_frame_params(AVCodecContext *avctx,
+@@ -684,7 +692,7 @@ int ff_vaapi_common_frame_params(AVCodecContext *avctx,
          return err;
  
      if (va_config != VA_INVALID_ID)
@@ -295,7 +292,7 @@ index a59194340f..e202b673f4 100644
  
      return 0;
  }
-@@ -672,6 +680,7 @@ int ff_vaapi_common_frame_params(AVCodecContext *avctx,
+@@ -692,6 +700,7 @@ int ff_vaapi_common_frame_params(AVCodecContext *avctx,
  int ff_vaapi_decode_init(AVCodecContext *avctx)
  {
      VAAPIDecodeContext *ctx = avctx->internal->hwaccel_priv_data;
@@ -303,7 +300,7 @@ index a59194340f..e202b673f4 100644
      VAStatus vas;
      int err;
  
-@@ -686,13 +695,18 @@ int ff_vaapi_decode_init(AVCodecContext *avctx)
+@@ -706,13 +715,18 @@ int ff_vaapi_decode_init(AVCodecContext *avctx)
      ctx->hwfc   = ctx->frames->hwctx;
      ctx->device = ctx->frames->device_ctx;
      ctx->hwctx  = ctx->device->hwctx;
@@ -323,7 +320,7 @@ index a59194340f..e202b673f4 100644
                            avctx->coded_width, avctx->coded_height,
                            VA_PROGRESSIVE,
                            ctx->hwfc->surface_ids,
-@@ -700,7 +714,7 @@ int ff_vaapi_decode_init(AVCodecContext *avctx)
+@@ -720,7 +734,7 @@ int ff_vaapi_decode_init(AVCodecContext *avctx)
                            &ctx->va_context);
      if (vas != VA_STATUS_SUCCESS) {
          av_log(avctx, AV_LOG_ERROR, "Failed to create decode "
@@ -332,7 +329,7 @@ index a59194340f..e202b673f4 100644
          err = AVERROR(EIO);
          goto fail;
      }
-@@ -718,22 +732,28 @@ fail:
+@@ -738,22 +752,28 @@ fail:
  int ff_vaapi_decode_uninit(AVCodecContext *avctx)
  {
      VAAPIDecodeContext *ctx = avctx->internal->hwaccel_priv_data;
@@ -366,7 +363,7 @@ index a59194340f..e202b673f4 100644
      }
  
 diff --git a/libavcodec/vaapi_encode.c b/libavcodec/vaapi_encode.c
-index 16a9a364f0..ccf6fa59d6 100644
+index 0e50602..1a6fb04 100644
 --- a/libavcodec/vaapi_encode.c
 +++ b/libavcodec/vaapi_encode.c
 @@ -43,6 +43,7 @@ static int vaapi_encode_make_packed_header(AVCodecContext *avctx,
@@ -683,7 +680,62 @@ index 16a9a364f0..ccf6fa59d6 100644
          err = AVERROR_EXTERNAL;
          goto fail;
      }
-@@ -1157,6 +1164,7 @@ static const VAAPIEncodeRCMode vaapi_encode_rc_modes[] = {
+@@ -1137,26 +1144,27 @@ static av_cold int vaapi_encode_surface_alignment(av_unused AVCodecContext *avct
+ {
+ #if VA_CHECK_VERSION(1, 21, 0)
+     VAAPIEncodeContext *ctx = avctx->priv_data;
++    VAAPIDynLoadFunctions *vaf = ctx->hwctx->funcs;
+     VASurfaceAttrib *attr_list = NULL;
+     unsigned int attr_count = 0;
+     VAConfigID va_config;
+     VAStatus vas;
+     int err = 0;
+ 
+-    vas = vaCreateConfig(ctx->hwctx->display,
++    vas = vaf->vaCreateConfig(ctx->hwctx->display,
+                          ctx->va_profile, ctx->va_entrypoint,
+                          NULL, 0, &va_config);
+     if (vas != VA_STATUS_SUCCESS) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to create temp encode pipeline "
+-               "configuration: %d (%s).\n", vas, vaErrorStr(vas));
++               "configuration: %d (%s).\n", vas, vaf->vaErrorStr(vas));
+         return AVERROR(EIO);
+     }
+ 
+-    vas = vaQuerySurfaceAttributes(ctx->hwctx->display, va_config,
++    vas = vaf->vaQuerySurfaceAttributes(ctx->hwctx->display, va_config,
+                                    0, &attr_count);
+     if (vas != VA_STATUS_SUCCESS) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to query surface attributes: "
+-               "%d (%s).\n", vas, vaErrorStr(vas));
++               "%d (%s).\n", vas, vaf->vaErrorStr(vas));
+         err = AVERROR_EXTERNAL;
+         goto fail;
+     }
+@@ -1167,11 +1175,11 @@ static av_cold int vaapi_encode_surface_alignment(av_unused AVCodecContext *avct
+         goto fail;
+     }
+ 
+-    vas = vaQuerySurfaceAttributes(ctx->hwctx->display, va_config,
++    vas = vaf->vaQuerySurfaceAttributes(ctx->hwctx->display, va_config,
+                                    attr_list, &attr_count);
+     if (vas != VA_STATUS_SUCCESS) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to query surface attributes: "
+-               "%d (%s).\n", vas, vaErrorStr(vas));
++               "%d (%s).\n", vas, vaf->vaErrorStr(vas));
+         err = AVERROR_EXTERNAL;
+         goto fail;
+     }
+@@ -1188,7 +1196,7 @@ static av_cold int vaapi_encode_surface_alignment(av_unused AVCodecContext *avct
+ 
+ fail:
+     av_freep(&attr_list);
+-    vaDestroyConfig(ctx->hwctx->display, va_config);
++    vaf->vaDestroyConfig(ctx->hwctx->display, va_config);
+     return err;
+ #else
+     return 0;
+@@ -1219,6 +1227,7 @@ static const VAAPIEncodeRCMode vaapi_encode_rc_modes[] = {
  static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
  {
      VAAPIEncodeContext *ctx = avctx->priv_data;
@@ -691,7 +743,7 @@ index 16a9a364f0..ccf6fa59d6 100644
      uint32_t supported_va_rc_modes;
      const VAAPIEncodeRCMode *rc_mode;
      int64_t rc_bits_per_second;
-@@ -1170,12 +1178,12 @@ static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
+@@ -1232,12 +1241,12 @@ static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
      VAStatus vas;
      char supported_rc_modes_string[64];
  
@@ -706,7 +758,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR_EXTERNAL;
      }
      if (rc_attr.value == VA_ATTRIB_NOT_SUPPORTED) {
-@@ -1516,6 +1524,7 @@ static av_cold int vaapi_encode_init_max_frame_size(AVCodecContext *avctx)
+@@ -1582,6 +1591,7 @@ static av_cold int vaapi_encode_init_max_frame_size(AVCodecContext *avctx)
  {
  #if VA_CHECK_VERSION(1, 5, 0)
      VAAPIEncodeContext  *ctx = avctx->priv_data;
@@ -714,7 +766,7 @@ index 16a9a364f0..ccf6fa59d6 100644
      VAConfigAttrib      attr = { VAConfigAttribMaxFrameSize };
      VAStatus vas;
  
-@@ -1526,14 +1535,14 @@ static av_cold int vaapi_encode_init_max_frame_size(AVCodecContext *avctx)
+@@ -1592,14 +1602,14 @@ static av_cold int vaapi_encode_init_max_frame_size(AVCodecContext *avctx)
          return AVERROR(EINVAL);
      }
  
@@ -731,7 +783,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR_EXTERNAL;
      }
  
-@@ -1573,18 +1582,19 @@ static av_cold int vaapi_encode_init_gop_structure(AVCodecContext *avctx)
+@@ -1639,18 +1649,19 @@ static av_cold int vaapi_encode_init_gop_structure(AVCodecContext *avctx)
  {
      FFHWBaseEncodeContext *base_ctx = avctx->priv_data;
      VAAPIEncodeContext         *ctx = avctx->priv_data;
@@ -753,7 +805,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR_EXTERNAL;
      }
  
-@@ -1602,13 +1612,13 @@ static av_cold int vaapi_encode_init_gop_structure(AVCodecContext *avctx)
+@@ -1668,13 +1679,13 @@ static av_cold int vaapi_encode_init_gop_structure(AVCodecContext *avctx)
      if (!(ctx->codec->flags & FF_HW_FLAG_INTRA_ONLY ||
          avctx->gop_size <= 1)) {
          attr = (VAConfigAttrib) { VAConfigAttribPredictionDirection };
@@ -769,7 +821,7 @@ index 16a9a364f0..ccf6fa59d6 100644
              return AVERROR_EXTERNAL;
          } else if (attr.value == VA_ATTRIB_NOT_SUPPORTED) {
              av_log(avctx, AV_LOG_VERBOSE, "Driver does not report any additional "
-@@ -1758,6 +1768,7 @@ static av_cold int vaapi_encode_init_slice_structure(AVCodecContext *avctx)
+@@ -1824,6 +1835,7 @@ static av_cold int vaapi_encode_init_slice_structure(AVCodecContext *avctx)
  {
      FFHWBaseEncodeContext *base_ctx = avctx->priv_data;
      VAAPIEncodeContext *ctx = avctx->priv_data;
@@ -777,7 +829,7 @@ index 16a9a364f0..ccf6fa59d6 100644
      VAConfigAttrib attr[3] = { { VAConfigAttribEncMaxSlices },
                                 { VAConfigAttribEncSliceStructure },
  #if VA_CHECK_VERSION(1, 1, 0)
-@@ -1789,13 +1800,13 @@ static av_cold int vaapi_encode_init_slice_structure(AVCodecContext *avctx)
+@@ -1855,13 +1867,13 @@ static av_cold int vaapi_encode_init_slice_structure(AVCodecContext *avctx)
          return 0;
      }
  
@@ -793,7 +845,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR_EXTERNAL;
      }
      max_slices      = attr[0].value;
-@@ -1849,16 +1860,17 @@ static av_cold int vaapi_encode_init_slice_structure(AVCodecContext *avctx)
+@@ -1915,16 +1927,17 @@ static av_cold int vaapi_encode_init_slice_structure(AVCodecContext *avctx)
  static av_cold int vaapi_encode_init_packed_headers(AVCodecContext *avctx)
  {
      VAAPIEncodeContext *ctx = avctx->priv_data;
@@ -813,7 +865,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR_EXTERNAL;
      }
  
-@@ -1910,17 +1922,18 @@ static av_cold int vaapi_encode_init_quality(AVCodecContext *avctx)
+@@ -1976,17 +1989,18 @@ static av_cold int vaapi_encode_init_quality(AVCodecContext *avctx)
  {
  #if VA_CHECK_VERSION(0, 36, 0)
      VAAPIEncodeContext *ctx = avctx->priv_data;
@@ -834,7 +886,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR_EXTERNAL;
      }
  
-@@ -1958,16 +1971,17 @@ static av_cold int vaapi_encode_init_roi(AVCodecContext *avctx)
+@@ -2024,16 +2038,17 @@ static av_cold int vaapi_encode_init_roi(AVCodecContext *avctx)
  #if VA_CHECK_VERSION(1, 0, 0)
      FFHWBaseEncodeContext *base_ctx = avctx->priv_data;
      VAAPIEncodeContext         *ctx = avctx->priv_data;
@@ -854,7 +906,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR_EXTERNAL;
      }
  
-@@ -1992,10 +2006,11 @@ static void vaapi_encode_free_output_buffer(FFRefStructOpaque opaque,
+@@ -2058,10 +2073,11 @@ static void vaapi_encode_free_output_buffer(AVRefStructOpaque opaque,
  {
      AVCodecContext   *avctx = opaque.nc;
      VAAPIEncodeContext *ctx = avctx->priv_data;
@@ -867,7 +919,7 @@ index 16a9a364f0..ccf6fa59d6 100644
  
      av_log(avctx, AV_LOG_DEBUG, "Freed output buffer %#x\n", buffer_id);
  }
-@@ -2005,6 +2020,7 @@ static int vaapi_encode_alloc_output_buffer(FFRefStructOpaque opaque, void *obj)
+@@ -2071,6 +2087,7 @@ static int vaapi_encode_alloc_output_buffer(AVRefStructOpaque opaque, void *obj)
      AVCodecContext   *avctx = opaque.nc;
      FFHWBaseEncodeContext *base_ctx = avctx->priv_data;
      VAAPIEncodeContext         *ctx = avctx->priv_data;
@@ -875,7 +927,7 @@ index 16a9a364f0..ccf6fa59d6 100644
      VABufferID *buffer_id = obj;
      VAStatus vas;
  
-@@ -2012,13 +2028,13 @@ static int vaapi_encode_alloc_output_buffer(FFRefStructOpaque opaque, void *obj)
+@@ -2078,13 +2095,13 @@ static int vaapi_encode_alloc_output_buffer(AVRefStructOpaque opaque, void *obj)
      // to hold the largest possible compressed frame.  We assume here
      // that the uncompressed frame plus some header data is an upper
      // bound on that.
@@ -891,7 +943,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          return AVERROR(ENOMEM);
      }
  
-@@ -2092,6 +2108,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
+@@ -2158,6 +2175,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
  {
      FFHWBaseEncodeContext *base_ctx = avctx->priv_data;
      VAAPIEncodeContext         *ctx = avctx->priv_data;
@@ -899,7 +951,7 @@ index 16a9a364f0..ccf6fa59d6 100644
      AVVAAPIFramesContext *recon_hwctx = NULL;
      VAStatus vas;
      int err;
-@@ -2107,6 +2124,12 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
+@@ -2173,6 +2191,12 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
  
      ctx->hwctx = base_ctx->device->hwctx;
  
@@ -912,7 +964,7 @@ index 16a9a364f0..ccf6fa59d6 100644
      err = vaapi_encode_profile_entrypoint(avctx);
      if (err < 0)
          goto fail;
-@@ -2157,13 +2180,13 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
+@@ -2227,13 +2251,13 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
              goto fail;
      }
  
@@ -928,7 +980,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          err = AVERROR(EIO);
          goto fail;
      }
-@@ -2173,7 +2196,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
+@@ -2243,7 +2267,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
          goto fail;
  
      recon_hwctx = base_ctx->recon_frames->hwctx;
@@ -937,7 +989,7 @@ index 16a9a364f0..ccf6fa59d6 100644
                            base_ctx->surface_width, base_ctx->surface_height,
                            VA_PROGRESSIVE,
                            recon_hwctx->surface_ids,
-@@ -2181,7 +2204,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
+@@ -2251,7 +2275,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
                            &ctx->va_context);
      if (vas != VA_STATUS_SUCCESS) {
          av_log(avctx, AV_LOG_ERROR, "Failed to create encode pipeline "
@@ -946,7 +998,7 @@ index 16a9a364f0..ccf6fa59d6 100644
          err = AVERROR(EIO);
          goto fail;
      }
-@@ -2255,14 +2278,16 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
+@@ -2325,14 +2349,16 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
  
  #if VA_CHECK_VERSION(1, 9, 0)
      // check vaSyncBuffer function
@@ -971,8 +1023,8 @@ index 16a9a364f0..ccf6fa59d6 100644
      }
  #endif
  
-@@ -2291,14 +2316,14 @@ av_cold int ff_vaapi_encode_close(AVCodecContext *avctx)
-     ff_refstruct_pool_uninit(&ctx->output_buffer_pool);
+@@ -2361,14 +2387,14 @@ av_cold int ff_vaapi_encode_close(AVCodecContext *avctx)
+     av_refstruct_pool_uninit(&ctx->output_buffer_pool);
  
      if (ctx->va_context != VA_INVALID_ID) {
 -        if (ctx->hwctx)
@@ -991,10 +1043,10 @@ index 16a9a364f0..ccf6fa59d6 100644
      }
  
 diff --git a/libavcodec/vaapi_encode_h264.c b/libavcodec/vaapi_encode_h264.c
-index fb87b68bec..6d4ce630ce 100644
+index 27f6551..ba1745e 100644
 --- a/libavcodec/vaapi_encode_h264.c
 +++ b/libavcodec/vaapi_encode_h264.c
-@@ -868,6 +868,7 @@ static int vaapi_encode_h264_init_slice_params(AVCodecContext *avctx,
+@@ -871,6 +871,7 @@ static int vaapi_encode_h264_init_slice_params(AVCodecContext *avctx,
  static av_cold int vaapi_encode_h264_configure(AVCodecContext *avctx)
  {
      VAAPIEncodeContext      *ctx = avctx->priv_data;
@@ -1002,7 +1054,7 @@ index fb87b68bec..6d4ce630ce 100644
      VAAPIEncodeH264Context *priv = avctx->priv_data;
      int err;
  
-@@ -919,7 +920,7 @@ static av_cold int vaapi_encode_h264_configure(AVCodecContext *avctx)
+@@ -922,7 +923,7 @@ static av_cold int vaapi_encode_h264_configure(AVCodecContext *avctx)
                 vaapi_encode_h264_sei_identifier_uuid,
                 sizeof(priv->sei_identifier.uuid_iso_iec_11578));
  
@@ -1012,7 +1064,7 @@ index fb87b68bec..6d4ce630ce 100644
              driver = "unknown driver";
  
 diff --git a/libavcodec/vaapi_encode_h265.c b/libavcodec/vaapi_encode_h265.c
-index 2283bcc0b4..7c624f99a9 100644
+index baf0d77..734019b 100644
 --- a/libavcodec/vaapi_encode_h265.c
 +++ b/libavcodec/vaapi_encode_h265.c
 @@ -899,6 +899,8 @@ static int vaapi_encode_h265_init_slice_params(AVCodecContext *avctx,
@@ -1043,7 +1095,7 @@ index 2283bcc0b4..7c624f99a9 100644
          if (vas != VA_STATUS_SUCCESS) {
              av_log(avctx, AV_LOG_ERROR, "Failed to query encoder "
 diff --git a/libavutil/hwcontext_vaapi.c b/libavutil/hwcontext_vaapi.c
-index 95aa38d9d2..13451e8ad7 100644
+index 98130f9..c344699 100644
 --- a/libavutil/hwcontext_vaapi.c
 +++ b/libavutil/hwcontext_vaapi.c
 @@ -48,6 +48,7 @@ typedef HRESULT (WINAPI *PFN_CREATE_DXGI_FACTORY)(REFIID riid, void **ppFactory)
@@ -1183,7 +1235,7 @@ index 95aa38d9d2..13451e8ad7 100644
  
  typedef struct VAAPIDevicePriv {
  #if HAVE_VAAPI_X11
-@@ -236,6 +359,7 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
+@@ -258,6 +381,7 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
  {
      VAAPIDeviceContext *ctx = hwdev->hwctx;
      AVVAAPIDeviceContext *hwctx = &ctx->p;
@@ -1191,7 +1243,7 @@ index 95aa38d9d2..13451e8ad7 100644
      const AVVAAPIHWConfig *config = hwconfig;
      VASurfaceAttrib *attr_list = NULL;
      VAStatus vas;
-@@ -246,11 +370,11 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
+@@ -268,11 +392,11 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
      if (config &&
          !(hwctx->driver_quirks & AV_VAAPI_DRIVER_QUIRK_SURFACE_ATTRIBUTES)) {
          attr_count = 0;
@@ -1205,7 +1257,7 @@ index 95aa38d9d2..13451e8ad7 100644
              err = AVERROR(ENOSYS);
              goto fail;
          }
-@@ -261,11 +385,11 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
+@@ -283,11 +407,11 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
              goto fail;
          }
  
@@ -1219,7 +1271,7 @@ index 95aa38d9d2..13451e8ad7 100644
              err = AVERROR(ENOSYS);
              goto fail;
          }
-@@ -396,6 +520,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
+@@ -418,6 +542,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
  {
      VAAPIDeviceContext *ctx = hwdev->hwctx;
      AVVAAPIDeviceContext *hwctx = &ctx->p;
@@ -1227,7 +1279,7 @@ index 95aa38d9d2..13451e8ad7 100644
      VAImageFormat *image_list = NULL;
      VAStatus vas;
      const char *vendor_string;
-@@ -403,7 +528,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
+@@ -425,7 +550,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
      enum AVPixelFormat pix_fmt;
      unsigned int fourcc;
  
@@ -1236,7 +1288,7 @@ index 95aa38d9d2..13451e8ad7 100644
      if (image_count <= 0) {
          err = AVERROR(EIO);
          goto fail;
-@@ -413,7 +538,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
+@@ -435,7 +560,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
          err = AVERROR(ENOMEM);
          goto fail;
      }
@@ -1245,7 +1297,7 @@ index 95aa38d9d2..13451e8ad7 100644
      if (vas != VA_STATUS_SUCCESS) {
          err = AVERROR(EIO);
          goto fail;
-@@ -440,7 +565,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
+@@ -463,7 +588,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
          }
      }
  
@@ -1254,7 +1306,7 @@ index 95aa38d9d2..13451e8ad7 100644
      if (vendor_string)
          av_log(hwdev, AV_LOG_VERBOSE, "VAAPI driver: %s.\n", vendor_string);
  
-@@ -493,15 +618,16 @@ static void vaapi_buffer_free(void *opaque, uint8_t *data)
+@@ -516,15 +641,16 @@ static void vaapi_buffer_free(void *opaque, uint8_t *data)
  {
      AVHWFramesContext     *hwfc = opaque;
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
@@ -1273,7 +1325,7 @@ index 95aa38d9d2..13451e8ad7 100644
      }
  }
  
-@@ -511,6 +637,7 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
+@@ -534,6 +660,7 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
      VAAPIFramesContext     *ctx = hwfc->hwctx;
      AVVAAPIFramesContext  *avfc = &ctx->p;
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
@@ -1281,7 +1333,7 @@ index 95aa38d9d2..13451e8ad7 100644
      VASurfaceID surface_id;
      VAStatus vas;
      AVBufferRef *ref;
-@@ -519,13 +646,13 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
+@@ -542,13 +669,13 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
          avfc->nb_surfaces >= hwfc->initial_pool_size)
          return NULL;
  
@@ -1297,7 +1349,7 @@ index 95aa38d9d2..13451e8ad7 100644
          return NULL;
      }
      av_log(hwfc, AV_LOG_DEBUG, "Created surface %#x.\n", surface_id);
-@@ -534,7 +661,7 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
+@@ -557,7 +684,7 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
                             sizeof(surface_id), &vaapi_buffer_free,
                             hwfc, AV_BUFFER_FLAG_READONLY);
      if (!ref) {
@@ -1306,24 +1358,24 @@ index 95aa38d9d2..13451e8ad7 100644
          return NULL;
      }
  
-@@ -554,6 +681,7 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
+@@ -577,6 +704,7 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
      VAAPIFramesContext     *ctx = hwfc->hwctx;
      AVVAAPIFramesContext  *avfc = &ctx->p;
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
 +    VAAPIDynLoadFunctions *vaf = hwctx->funcs;
-     const VAAPIFormatDescriptor *desc;
-     VAImageFormat *expected_format;
+     const VAAPIFormatDescriptor *desc = NULL;
+     VAImageFormat *expected_format = NULL;
      AVBufferRef *test_surface = NULL;
-@@ -669,7 +797,7 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
-     err = vaapi_get_image_format(hwfc->device_ctx,
-                                  hwfc->sw_format, &expected_format);
-     if (err == 0) {
+@@ -693,7 +821,7 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
+ 
+     ctx->derive_works = 0;
+     if (expected_format) {
 -        vas = vaDeriveImage(hwctx->display, test_surface_id, &test_image);
 +        vas = vaf->vaDeriveImage(hwctx->display, test_surface_id, &test_image);
          if (vas == VA_STATUS_SUCCESS) {
              if (expected_format->fourcc == test_image.format.fourcc) {
                  av_log(hwfc, AV_LOG_DEBUG, "Direct mapping possible.\n");
-@@ -680,11 +808,11 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
+@@ -704,11 +832,11 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
                         "expected format %08x.\n",
                         expected_format->fourcc, test_image.format.fourcc);
              }
@@ -1337,7 +1389,7 @@ index 95aa38d9d2..13451e8ad7 100644
          }
      } else {
          av_log(hwfc, AV_LOG_DEBUG, "Direct mapping disabled: "
-@@ -765,33 +893,34 @@ static void vaapi_unmap_frame(AVHWFramesContext *hwfc,
+@@ -789,33 +917,34 @@ static void vaapi_unmap_frame(AVHWFramesContext *hwfc,
  {
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
      VAAPIMapping           *map = hwmap->priv;
@@ -1378,7 +1430,7 @@ index 95aa38d9d2..13451e8ad7 100644
      }
  
      av_free(map);
-@@ -801,6 +930,7 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
+@@ -825,6 +954,7 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
                             AVFrame *dst, const AVFrame *src, int flags)
  {
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
@@ -1386,7 +1438,7 @@ index 95aa38d9d2..13451e8ad7 100644
      VAAPIFramesContext *ctx = hwfc->hwctx;
      VASurfaceID surface_id;
      const VAAPIFormatDescriptor *desc;
-@@ -839,10 +969,10 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
+@@ -863,10 +993,10 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
      map->flags = flags;
      map->image.image_id = VA_INVALID_ID;
  
@@ -1399,7 +1451,7 @@ index 95aa38d9d2..13451e8ad7 100644
          err = AVERROR(EIO);
          goto fail;
      }
-@@ -856,11 +986,11 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
+@@ -880,11 +1010,11 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
      // prefer not to be given direct-mapped memory if they request read access.
      if (ctx->derive_works && dst->format == hwfc->sw_format &&
          ((flags & AV_HWFRAME_MAP_DIRECT) || !(flags & AV_HWFRAME_MAP_READ))) {
@@ -1413,7 +1465,7 @@ index 95aa38d9d2..13451e8ad7 100644
              err = AVERROR(EIO);
              goto fail;
          }
-@@ -873,41 +1003,32 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
+@@ -897,41 +1027,32 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
          }
          map->flags |= AV_HWFRAME_MAP_DIRECT;
      } else {
@@ -1461,7 +1513,7 @@ index 95aa38d9d2..13451e8ad7 100644
          err = AVERROR(EIO);
          goto fail;
      }
-@@ -936,9 +1057,9 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
+@@ -960,9 +1081,9 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
  fail:
      if (map) {
          if (address)
@@ -1473,7 +1525,7 @@ index 95aa38d9d2..13451e8ad7 100644
          av_free(map);
      }
      return err;
-@@ -1080,12 +1201,12 @@ static void vaapi_unmap_from_drm(AVHWFramesContext *dst_fc,
+@@ -1098,12 +1219,12 @@ static void vaapi_unmap_from_drm(AVHWFramesContext *dst_fc,
                                   HWMapDescriptor *hwmap)
  {
      AVVAAPIDeviceContext *dst_dev = dst_fc->device_ctx->hwctx;
@@ -1488,7 +1540,7 @@ index 95aa38d9d2..13451e8ad7 100644
  }
  
  static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
-@@ -1100,6 +1221,7 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
+@@ -1118,6 +1239,7 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
      AVHWFramesContext      *dst_fc =
          (AVHWFramesContext*)dst->hw_frames_ctx->data;
      AVVAAPIDeviceContext  *dst_dev = dst_fc->device_ctx->hwctx;
@@ -1496,7 +1548,7 @@ index 95aa38d9d2..13451e8ad7 100644
      const AVDRMFrameDescriptor *desc;
      const VAAPIFormatDescriptor *format_desc;
      VASurfaceID surface_id;
-@@ -1216,7 +1338,7 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
+@@ -1234,7 +1356,7 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
           * Gallium seem to do the correct error checks, so lets just try the
           * PRIME_2 import first.
           */
@@ -1505,7 +1557,7 @@ index 95aa38d9d2..13451e8ad7 100644
                                 src->width, src->height, &surface_id, 1,
                                 prime_attrs, FF_ARRAY_ELEMS(prime_attrs));
          if (vas != VA_STATUS_SUCCESS)
-@@ -1267,7 +1389,7 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
+@@ -1285,7 +1407,7 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
              FFSWAP(uint32_t, buffer_desc.offsets[1], buffer_desc.offsets[2]);
          }
  
@@ -1514,7 +1566,7 @@ index 95aa38d9d2..13451e8ad7 100644
                                 src->width, src->height,
                                 &surface_id, 1,
                                 buffer_attrs, FF_ARRAY_ELEMS(buffer_attrs));
-@@ -1298,14 +1420,14 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
+@@ -1316,14 +1438,14 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
          FFSWAP(uint32_t, buffer_desc.offsets[1], buffer_desc.offsets[2]);
      }
  
@@ -1531,7 +1583,7 @@ index 95aa38d9d2..13451e8ad7 100644
          return AVERROR(EIO);
      }
      av_log(dst_fc, AV_LOG_DEBUG, "Create surface %#x.\n", surface_id);
-@@ -1343,6 +1465,7 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
+@@ -1361,6 +1483,7 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
                                  const AVFrame *src, int flags)
  {
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
@@ -1539,7 +1591,7 @@ index 95aa38d9d2..13451e8ad7 100644
      VASurfaceID surface_id;
      VAStatus vas;
      VADRMPRIMESurfaceDescriptor va_desc;
-@@ -1356,10 +1479,10 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
+@@ -1374,10 +1497,10 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
      if (flags & AV_HWFRAME_MAP_READ) {
          export_flags |= VA_EXPORT_SURFACE_READ_ONLY;
  
@@ -1552,7 +1604,7 @@ index 95aa38d9d2..13451e8ad7 100644
              return AVERROR(EIO);
          }
      }
-@@ -1367,14 +1490,14 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
+@@ -1385,14 +1508,14 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
      if (flags & AV_HWFRAME_MAP_WRITE)
          export_flags |= VA_EXPORT_SURFACE_WRITE_ONLY;
  
@@ -1569,7 +1621,7 @@ index 95aa38d9d2..13451e8ad7 100644
          return AVERROR(EIO);
      }
  
-@@ -1437,6 +1560,7 @@ static void vaapi_unmap_to_drm_abh(AVHWFramesContext *hwfc,
+@@ -1455,6 +1578,7 @@ static void vaapi_unmap_to_drm_abh(AVHWFramesContext *hwfc,
                                    HWMapDescriptor *hwmap)
  {
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
@@ -1577,7 +1629,7 @@ index 95aa38d9d2..13451e8ad7 100644
      VAAPIDRMImageBufferMapping *mapping = hwmap->priv;
      VASurfaceID surface_id;
      VAStatus vas;
-@@ -1448,19 +1572,19 @@ static void vaapi_unmap_to_drm_abh(AVHWFramesContext *hwfc,
+@@ -1466,19 +1590,19 @@ static void vaapi_unmap_to_drm_abh(AVHWFramesContext *hwfc,
      // DRM PRIME file descriptors are closed by vaReleaseBufferHandle(),
      // so we shouldn't close them separately.
  
@@ -1601,7 +1653,7 @@ index 95aa38d9d2..13451e8ad7 100644
      }
  
      av_free(mapping);
-@@ -1470,6 +1594,7 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
+@@ -1488,6 +1612,7 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
                                  const AVFrame *src, int flags)
  {
      AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
@@ -1609,7 +1661,7 @@ index 95aa38d9d2..13451e8ad7 100644
      VAAPIDRMImageBufferMapping *mapping = NULL;
      VASurfaceID surface_id;
      VAStatus vas;
-@@ -1483,12 +1608,12 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
+@@ -1501,12 +1626,12 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
      if (!mapping)
          return AVERROR(ENOMEM);
  
@@ -1624,7 +1676,7 @@ index 95aa38d9d2..13451e8ad7 100644
          err = AVERROR(EIO);
          goto fail;
      }
-@@ -1543,13 +1668,13 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
+@@ -1561,13 +1686,13 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
          }
      }
  
@@ -1640,7 +1692,7 @@ index 95aa38d9d2..13451e8ad7 100644
          err = AVERROR(EIO);
          goto fail_derived;
      }
-@@ -1578,9 +1703,9 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
+@@ -1596,9 +1721,9 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
      return 0;
  
  fail_mapped:
@@ -1652,7 +1704,7 @@ index 95aa38d9d2..13451e8ad7 100644
  fail:
      av_freep(&mapping);
      return err;
-@@ -1634,9 +1759,15 @@ static void vaapi_device_free(AVHWDeviceContext *ctx)
+@@ -1652,9 +1777,15 @@ static void vaapi_device_free(AVHWDeviceContext *ctx)
  {
      AVVAAPIDeviceContext *hwctx = ctx->hwctx;
      VAAPIDevicePriv      *priv  = ctx->user_opaque;
@@ -1670,7 +1722,7 @@ index 95aa38d9d2..13451e8ad7 100644
  
  #if HAVE_VAAPI_X11
      if (priv->x11_display)
-@@ -1669,20 +1800,21 @@ static int vaapi_device_connect(AVHWDeviceContext *ctx,
+@@ -1687,20 +1818,21 @@ static int vaapi_device_connect(AVHWDeviceContext *ctx,
                                  VADisplay display)
  {
      AVVAAPIDeviceContext *hwctx = ctx->hwctx;
@@ -1696,10 +1748,10 @@ index 95aa38d9d2..13451e8ad7 100644
          return AVERROR(EIO);
      }
      av_log(ctx, AV_LOG_VERBOSE, "Initialised VAAPI connection: "
-@@ -1698,6 +1830,16 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
+@@ -1716,6 +1848,16 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
      VADisplay display = NULL;
      const AVDictionaryEntry *ent;
-     int try_drm, try_x11, try_win32, try_all;
+     int try_drm, try_x11, try_win32, try_all av_unused;
 +    VAAPIDeviceContext *hwctx = ctx->hwctx;
 +    VAAPIDynLoadFunctions *vaf;
 +
@@ -1713,7 +1765,7 @@ index 95aa38d9d2..13451e8ad7 100644
  
      priv = av_mallocz(sizeof(*priv));
      if (!priv)
-@@ -1843,7 +1985,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
+@@ -1864,7 +2006,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
                  break;
          }
  
@@ -1722,7 +1774,7 @@ index 95aa38d9d2..13451e8ad7 100644
          if (!display) {
              av_log(ctx, AV_LOG_VERBOSE, "Cannot open a VA display "
                     "from DRM device %s.\n", device);
-@@ -1861,7 +2003,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
+@@ -1882,7 +2024,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
              av_log(ctx, AV_LOG_VERBOSE, "Cannot open X11 display "
                     "%s.\n", XDisplayName(device));
          } else {
@@ -1731,7 +1783,7 @@ index 95aa38d9d2..13451e8ad7 100644
              if (!display) {
                  av_log(ctx, AV_LOG_ERROR, "Cannot open a VA display "
                         "from X11 display %s.\n", XDisplayName(device));
-@@ -1950,11 +2092,11 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
+@@ -1971,11 +2113,11 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
      if (ent) {
  #if VA_CHECK_VERSION(0, 38, 0)
          VAStatus vas;
@@ -1746,7 +1798,7 @@ index 95aa38d9d2..13451e8ad7 100644
              return AVERROR_EXTERNAL;
          }
  #else
-@@ -1970,6 +2112,8 @@ static int vaapi_device_derive(AVHWDeviceContext *ctx,
+@@ -1991,6 +2133,8 @@ static int vaapi_device_derive(AVHWDeviceContext *ctx,
                                 AVHWDeviceContext *src_ctx,
                                 AVDictionary *opts, int flags)
  {
@@ -1755,7 +1807,7 @@ index 95aa38d9d2..13451e8ad7 100644
  #if HAVE_VAAPI_DRM
      if (src_ctx->type == AV_HWDEVICE_TYPE_DRM) {
          AVDRMDeviceContext *src_hwctx = src_ctx->hwctx;
-@@ -2041,7 +2185,7 @@ static int vaapi_device_derive(AVHWDeviceContext *ctx,
+@@ -2062,7 +2206,7 @@ static int vaapi_device_derive(AVHWDeviceContext *ctx,
          ctx->user_opaque = priv;
          ctx->free        = &vaapi_device_free;
  
@@ -1765,7 +1817,7 @@ index 95aa38d9d2..13451e8ad7 100644
              av_log(ctx, AV_LOG_ERROR, "Failed to open a VA display from "
                     "DRM device.\n");
 diff --git a/libavutil/hwcontext_vaapi.h b/libavutil/hwcontext_vaapi.h
-index 0b2e071cb3..2c51223d45 100644
+index 82e4194..3dbe5cb 100644
 --- a/libavutil/hwcontext_vaapi.h
 +++ b/libavutil/hwcontext_vaapi.h
 @@ -20,6 +20,100 @@
@@ -1878,6 +1930,3 @@ index 0b2e071cb3..2c51223d45 100644
  } AVVAAPIDeviceContext;
  
  /**
--- 
-2.34.1
-

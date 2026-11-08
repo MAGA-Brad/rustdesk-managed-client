@@ -796,6 +796,11 @@ pub mod server {
                                             crate::input_service::handle_key_(&evt);
                                         }
                                     }
+                                    LocalInputPriorityUntil(until_ms) => {
+                                        crate::input_service::apply_local_input_priority_until(
+                                            until_ms,
+                                        );
+                                    }
                                     _ => {}
                                 },
                                 _ => {}
@@ -1236,7 +1241,7 @@ pub mod client {
                 let base = shmem.as_ptr();
                 let para_ptr = base.add(ADDR_CAPTURER_PARA);
                 let para = para_ptr as *const CapturerPara;
-                if timeout.as_millis() != (*para).timeout_ms as _ {
+                if timeout.as_millis() != (*para).timeout_ms as u128 {
                     utils::set_para(
                         shmem,
                         CapturerPara {
@@ -1570,6 +1575,17 @@ pub mod client {
             handle_key_(evt).ok();
         } else {
             crate::input_service::handle_key_(evt);
+        }
+    }
+
+    pub fn apply_local_input_priority_until(until_ms: u64) {
+        if RUNNING.lock().unwrap().clone() {
+            ipc_send(Data::DataPortableService(
+                DataPortableService::LocalInputPriorityUntil(until_ms),
+            ))
+            .ok();
+        } else {
+            crate::input_service::apply_local_input_priority_until(until_ms);
         }
     }
 

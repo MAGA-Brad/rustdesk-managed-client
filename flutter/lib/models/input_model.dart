@@ -197,7 +197,7 @@ class ToReleaseRawKeys {
   RawKeyEvent? lastRCommandKeyEvent;
   RawKeyEvent? lastSuperKeyEvent;
 
-  reset() {
+  void reset() {
     lastLShiftKeyEvent = null;
     lastRShiftKeyEvent = null;
     lastLCtrlKeyEvent = null;
@@ -209,7 +209,7 @@ class ToReleaseRawKeys {
     lastSuperKeyEvent = null;
   }
 
-  updateKeyDown(LogicalKeyboardKey logicKey, RawKeyDownEvent e) {
+  void updateKeyDown(LogicalKeyboardKey logicKey, RawKeyDownEvent e) {
     if (e.isAltPressed) {
       if (logicKey == LogicalKeyboardKey.altLeft) {
         lastLAltKeyEvent = e;
@@ -239,7 +239,7 @@ class ToReleaseRawKeys {
     }
   }
 
-  updateKeyUp(LogicalKeyboardKey logicKey, RawKeyUpEvent e) {
+  void updateKeyUp(LogicalKeyboardKey logicKey, RawKeyUpEvent e) {
     if (e.isAltPressed) {
       if (logicKey == LogicalKeyboardKey.altLeft) {
         lastLAltKeyEvent = null;
@@ -269,7 +269,7 @@ class ToReleaseRawKeys {
     }
   }
 
-  release(KeyEventResult Function(RawKeyEvent e) handleRawKeyEvent) {
+  void release(KeyEventResult Function(RawKeyEvent e) handleRawKeyEvent) {
     for (final key in [
       lastLShiftKeyEvent,
       lastRShiftKeyEvent,
@@ -302,7 +302,7 @@ class ToReleaseKeys {
   KeyEvent? lastRCommandKeyEvent;
   KeyEvent? lastSuperKeyEvent;
 
-  reset() {
+  void reset() {
     lastLShiftKeyEvent = null;
     lastRShiftKeyEvent = null;
     lastLCtrlKeyEvent = null;
@@ -314,7 +314,7 @@ class ToReleaseKeys {
     lastSuperKeyEvent = null;
   }
 
-  release(KeyEventResult Function(KeyEvent e) handleKeyEvent) {
+  void release(KeyEventResult Function(KeyEvent e) handleKeyEvent) {
     for (final key in [
       lastLShiftKeyEvent,
       lastRShiftKeyEvent,
@@ -369,8 +369,10 @@ class InputModel {
               !model.isViewCamera) {
             _sideButtonDownModels[mb] = model;
             // Fire-and-forget to avoid blocking the platform channel handler.
-            unawaited(model._sendMouseUnchecked(type, mb).catchError((Object e) {
-              debugPrint('[InputModel] failed to send side button $type for $mb: $e');
+            unawaited(
+                model._sendMouseUnchecked(type, mb).catchError((Object e) {
+              debugPrint(
+                  '[InputModel] failed to send side button $type for $mb: $e');
             }));
           }
         } else {
@@ -380,8 +382,10 @@ class InputModel {
           // release always goes through even if permissions changed.
           final model = _sideButtonDownModels.remove(mb);
           if (model != null) {
-            unawaited(model._sendMouseUnchecked(type, mb).catchError((Object e) {
-              debugPrint('[InputModel] failed to send side button $type for $mb: $e');
+            unawaited(
+                model._sendMouseUnchecked(type, mb).catchError((Object e) {
+              debugPrint(
+                  '[InputModel] failed to send side button $type for $mb: $e');
             }));
           }
         }
@@ -455,6 +459,7 @@ class InputModel {
 
   bool _pointerMovedAfterEnter = false;
   bool _pointerInsideImage = false;
+  Timer? _peerControlPriorityTimer;
 
   // mouse
   final isPhysicalMouse = false.obs;
@@ -600,10 +605,11 @@ class InputModel {
 
   // This function must be called after the peer info is received.
   // Because `sessionGetKeyboardMode` relies on the peer version.
-  updateKeyboardMode() async {
+  Future<void> updateKeyboardMode() async {
     // * Currently mobile does not enable map mode
     if (isDesktop || isWebDesktop) {
-      keyboardMode = await bind.sessionGetKeyboardMode(sessionId: sessionId) ??
+      keyboardMode = await bind.crateFlutterFfiSessionGetKeyboardMode(
+              sessionId: sessionId) ??
           kKeyLegacyMode;
     }
   }
@@ -620,9 +626,9 @@ class InputModel {
   /// - Maximum: `kMaxTrackpadSpeed`
   /// - Default: `kDefaultTrackpadSpeed`
   Future<void> updateTrackpadSpeed() async {
-    _trackpadSpeed =
-        (await bind.sessionGetTrackpadSpeed(sessionId: sessionId) ??
-            kDefaultTrackpadSpeed);
+    _trackpadSpeed = (await bind.crateFlutterFfiSessionGetTrackpadSpeed(
+            sessionId: sessionId) ??
+        kDefaultTrackpadSpeed);
     if (_trackpadSpeed < kMinTrackpadSpeed ||
         _trackpadSpeed > kMaxTrackpadSpeed) {
       _trackpadSpeed = kDefaultTrackpadSpeed;
@@ -755,6 +761,10 @@ class InputModel {
       return KeyEventResult.handled;
     }
     if (isViewCamera) return KeyEventResult.handled;
+    if (e is RawKeyDownEvent &&
+        (parent.target?.cursorModel.isPeerControlProtected ?? false)) {
+      return KeyEventResult.handled;
+    }
     if (!isInputSourceFlutter) {
       if (isDesktop) {
         return KeyEventResult.handled;
@@ -851,6 +861,10 @@ class InputModel {
       return KeyEventResult.handled;
     }
     if (isViewCamera) return KeyEventResult.handled;
+    if ((e is KeyDownEvent || e is KeyRepeatEvent) &&
+        (parent.target?.cursorModel.isPeerControlProtected ?? false)) {
+      return KeyEventResult.handled;
+    }
     if (!isInputSourceFlutter) {
       if (isDesktop) {
         return KeyEventResult.handled;
@@ -975,14 +989,14 @@ class InputModel {
     _localFlutterShortcuts.recordForwardedKey(physical,
         down: down,
         release: () => mapMode
-            ? bind.sessionHandleFlutterKeyEvent(
+            ? bind.crateFlutterFfiSessionHandleFlutterKeyEvent(
                 sessionId: sessionId,
                 character: '',
                 usbHid: physical.usbHidUsage & 0xFFFF,
                 lockModes: _buildLockModes(false),
                 downOrUp: false,
               )
-            : bind.sessionInputKey(
+            : bind.crateFlutterFfiSessionInputKey(
                 sessionId: sessionId,
                 name: physicalKeyMap[physical.usbHidUsage] ??
                     logicalKeyMap[logical.keyId] ??
@@ -1051,7 +1065,7 @@ class InputModel {
         ? RawKeyboard.instance.keysPressed
         : HardwareKeyboard.instance.logicalKeysPressed;
     final swapCtrlCmd = peerPlatform == kPeerPlatformWindows &&
-        bind.sessionGetToggleOptionSync(
+        bind.crateFlutterFfiSessionGetToggleOptionSync(
             sessionId: sessionId, arg: 'allow_swap_key');
     final neutralizeMenu = _needsShortcutMenuGuard(pressed, swapCtrlCmd);
     if (neutralizeMenu)
@@ -1072,7 +1086,7 @@ class InputModel {
         _localFlutterShortcuts.recordReleasedModifiers([entry.value]);
       }
       if (isWebDesktop && keyboardMode == kKeyMapMode) {
-        releases.add(bind.sessionHandleFlutterKeyEvent(
+        releases.add(bind.crateFlutterFfiSessionHandleFlutterKeyEvent(
           sessionId: sessionId,
           character: '',
           usbHid: entry.value.usbHidUsage & 0xFFFF,
@@ -1081,7 +1095,7 @@ class InputModel {
         ));
       } else {
         final label = physicalKeyMap[entry.value.usbHidUsage] ?? entry.key.keyLabel;
-        releases.add(bind.sessionInputKey(
+        releases.add(bind.crateFlutterFfiSessionInputKey(
           sessionId: sessionId,
           name: label,
           down: false,
@@ -1130,7 +1144,7 @@ class InputModel {
       bool down, Set<LogicalKeyboardKey> pressed, bool swapCtrlCmd) {
     // Choose the pre-swap key that reaches Windows as Ctrl.
     if (isWebDesktop) {
-      return bind.sessionHandleFlutterKeyEvent(
+      return bind.crateFlutterFfiSessionHandleFlutterKeyEvent(
         sessionId: sessionId,
         character: '',
         usbHid: (swapCtrlCmd
@@ -1142,7 +1156,7 @@ class InputModel {
         downOrUp: down,
       );
     }
-    return bind.sessionInputKey(
+    return bind.crateFlutterFfiSessionInputKey(
       sessionId: sessionId,
       name: swapCtrlCmd ? 'Meta' : 'VK_CONTROL',
       down: down,
@@ -1241,7 +1255,7 @@ class InputModel {
   void newKeyboardMode(
       String character, int usbHid, bool down, bool iosCapsLock) {
     final lockModes = _buildLockModes(iosCapsLock);
-    bind.sessionHandleFlutterKeyEvent(
+    bind.crateFlutterFfiSessionHandleFlutterKeyEvent(
         sessionId: sessionId,
         character: character,
         usbHid: usbHid,
@@ -1288,7 +1302,7 @@ class InputModel {
   void inputRawKey(String name, int platformCode, int positionCode, bool down,
       bool iosCapsLock) {
     final lockModes = _buildLockModes(iosCapsLock);
-    bind.sessionHandleFlutterRawKeyEvent(
+    bind.crateFlutterFfiSessionHandleFlutterRawKeyEvent(
         sessionId: sessionId,
         name: name,
         platformCode: platformCode,
@@ -1342,7 +1356,7 @@ class InputModel {
   void inputKey(String name, {bool? down, bool? press}) {
     if (!keyboardPerm) return;
     if (isViewCamera) return;
-    bind.sessionInputKey(
+    bind.crateFlutterFfiSessionInputKey(
         sessionId: sessionId,
         name: name,
         down: down ?? false,
@@ -1416,7 +1430,7 @@ class InputModel {
   /// Send scroll event with scroll distance [y].
   Future<void> scroll(int y) async {
     if (isViewCamera) return;
-    await bind.sessionSendMouse(
+    await bind.crateFlutterFfiSessionSendMouse(
         sessionId: sessionId,
         msg: json
             .encode(modify({'id': id, 'type': 'wheel', 'y': y.toString()})));
@@ -1441,7 +1455,7 @@ class InputModel {
   /// Used for side button releases that must go through even if permissions
   /// changed after the matching down was sent.
   Future<void> _sendMouseUnchecked(String type, MouseButtons button) async {
-    await bind.sessionSendMouse(
+    await bind.crateFlutterFfiSessionSendMouse(
         sessionId: sessionId,
         msg: json.encode(modify({'type': type, 'buttons': button.value})));
   }
@@ -1451,6 +1465,35 @@ class InputModel {
     if (!keyboardPerm) return;
     if (isViewCamera) return;
     await _sendMouseUnchecked(type, button);
+  }
+
+  void onPeerMouseActivity() {
+    final firstActivity = _peerControlPriorityTimer == null;
+    _peerControlPriorityTimer?.cancel();
+
+    if (firstActivity) {
+      toReleaseKeys.release(handleKeyEvent);
+      toReleaseRawKeys.release(handleRawKeyEvent);
+      resetModifiers();
+      if (!isInputSourceFlutter) {
+        bind.crateFlutterFfiSessionEnterOrLeave(
+            sessionId: sessionId, enter: false);
+      }
+    }
+
+    _peerControlPriorityTimer =
+        Timer(Duration(milliseconds: kMouseControlTimeoutMSec), () {
+      _peerControlPriorityTimer = null;
+      final cursorModel = parent.target?.cursorModel;
+      if (!_pointerInsideImage ||
+          cursorModel == null ||
+          cursorModel.isPeerControlProtected ||
+          isInputSourceFlutter) {
+        return;
+      }
+      bind.crateFlutterFfiSessionEnterOrLeave(
+          sessionId: sessionId, enter: true);
+    });
   }
 
   void enterOrLeave(bool enter) {
@@ -1474,10 +1517,13 @@ class InputModel {
     _relativeMouse.onEnterOrLeaveImage(enter);
     _flingTimer?.cancel();
     if (!isInputSourceFlutter) {
-      bind.sessionEnterOrLeave(sessionId: sessionId, enter: enter);
+      final peerProtected =
+          parent.target?.cursorModel.isPeerControlProtected ?? false;
+      bind.crateFlutterFfiSessionEnterOrLeave(
+          sessionId: sessionId, enter: enter && !peerProtected);
     }
     if (!isWeb && enter) {
-      bind.setCurSessionId(sessionId: sessionId);
+      bind.crateFlutterFfiSetCurSessionId(sessionId: sessionId);
     }
   }
 
@@ -1487,7 +1533,7 @@ class InputModel {
     if (isViewCamera) return;
     var x2 = x.toInt();
     var y2 = y.toInt();
-    await bind.sessionSendMouse(
+    await bind.crateFlutterFfiSessionSendMouse(
         sessionId: sessionId,
         msg: json.encode(modify({'x': '$x2', 'y': '$y2'})));
   }
@@ -1510,7 +1556,7 @@ class InputModel {
     _mobileDeltaRemainderX -= x;
     _mobileDeltaRemainderY -= y;
     if (x == 0 && y == 0) return;
-    await bind.sessionSendMouse(
+    await bind.crateFlutterFfiSessionSendMouse(
         sessionId: sessionId,
         msg: json.encode(modify({
           'type': 'move_relative',
@@ -1562,7 +1608,7 @@ class InputModel {
     ];
 
     for (final key in modifiersToRelease) {
-      bind.sessionInputKey(
+      bind.crateFlutterFfiSessionInputKey(
         sessionId: sessionId,
         name: key,
         down: false,
@@ -1582,6 +1628,8 @@ class InputModel {
   }
 
   void disposeRelativeMouseMode() {
+    _peerControlPriorityTimer?.cancel();
+    _peerControlPriorityTimer = null;
     _relativeMouse.dispose();
     onRelativeMouseModeDisabled = null;
     // Cancel the relative mouse mode observer and clean up global state.
@@ -1651,7 +1699,7 @@ class InputModel {
       _lastScale = e.scale;
 
       if (scale != 0) {
-        bind.sessionSendPointer(
+        bind.crateFlutterFfiSessionSendPointer(
             sessionId: sessionId,
             msg: json.encode(
                 PointerEventToRust(kPointerEventKindTouch, 'scale', scale)
@@ -1690,7 +1738,7 @@ class InputModel {
             Offset(x.toDouble(), y.toDouble()));
       } else {
         if (isViewCamera) return;
-        bind.sessionSendMouse(
+        bind.crateFlutterFfiSessionSendMouse(
             sessionId: sessionId,
             msg: '{"type": "trackpad", "x": "$x", "y": "$y"}');
       }
@@ -1747,7 +1795,7 @@ class InputModel {
         return;
       }
 
-      bind.sessionSendMouse(
+      bind.crateFlutterFfiSessionSendMouse(
           sessionId: sessionId,
           msg: '{"type": "trackpad", "x": "$dx", "y": "$dy"}');
       _scheduleFling(x, y, delay);
@@ -1774,7 +1822,7 @@ class InputModel {
       return;
     }
 
-    bind.sessionSendPointer(
+    bind.crateFlutterFfiSessionSendPointer(
         sessionId: sessionId,
         msg: json.encode(
             PointerEventToRust(kPointerEventKindTouch, 'scale', 0).toJson()));
@@ -1978,7 +2026,8 @@ class InputModel {
     if (e is PointerScrollEvent) {
       final rawDx = e.scrollDelta.dx;
       final rawDy = e.scrollDelta.dy;
-      final dominantDelta = rawDx.abs() > rawDy.abs() ? rawDx.abs() : rawDy.abs();
+      final dominantDelta =
+          rawDx.abs() > rawDy.abs() ? rawDx.abs() : rawDy.abs();
       final isSmooth = dominantDelta < 1;
       final nowUs = DateTime.now().microsecondsSinceEpoch;
       final dtUs = _lastWheelTsUs == 0 ? 0 : nowUs - _lastWheelTsUs;
@@ -2015,7 +2064,7 @@ class InputModel {
       } else if (dy < 0) {
         dy = accel;
       }
-      bind.sessionSendMouse(
+      bind.crateFlutterFfiSessionSendMouse(
           sessionId: sessionId,
           msg: '{"type": "wheel", "x": "$dx", "y": "$dy"}');
     }
@@ -2100,7 +2149,7 @@ class InputModel {
 
     final evt = PointerEventToRust(kind, type, evtValue).toJson();
     if (isViewCamera) return;
-    bind.sessionSendPointer(
+    bind.crateFlutterFfiSessionSendPointer(
         sessionId: sessionId, msg: json.encode(modify(evt)));
   }
 
@@ -2117,15 +2166,7 @@ class InputModel {
     }
 
     if (!cursorModel.gotMouseControl) {
-      bool selfGetControl =
-          (x - lastMousePos.dx).abs() > kMouseControlDistance ||
-              (y - lastMousePos.dy).abs() > kMouseControlDistance;
-      if (selfGetControl) {
-        cursorModel.gotMouseControl = true;
-      } else {
-        lastMousePos = ui.Offset(x, y);
-        return true;
-      }
+      cursorModel.gotMouseControl = true;
     }
     lastMousePos = ui.Offset(x, y);
     return false;
@@ -2230,7 +2271,7 @@ class InputModel {
     final evtToPeer = processEventToPeer(evt, offset,
         onExit: onExit, moveCanvas: moveCanvas, edgeScroll: edgeScroll);
     if (evtToPeer != null) {
-      bind.sessionSendMouse(
+      bind.crateFlutterFfiSessionSendMouse(
           sessionId: sessionId, msg: json.encode(modify(evtToPeer)));
     }
     return evtToPeer;

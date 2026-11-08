@@ -24,6 +24,10 @@ pub fn get_cur_device_string() -> &'static str {
 }
 
 pub fn is_virtual_display_supported() -> bool {
+    // Managed builds ship no virtual display driver, so they never try to install one.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return false;
+    }
     #[cfg(target_os = "windows")]
     {
         is_windows_version_or_greater(10, 0, 19041, 0, 0)
@@ -45,6 +49,11 @@ pub fn plug_in_headless() -> ResultType<()> {
 pub fn get_platform_additions() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     if !crate::platform::windows::is_self_service_running() {
+        return map;
+    }
+    // Without "idd_impl" controllers hide the Virtual display menu and stop re-sending a saved
+    // virtual display request on each connection.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
         return map;
     }
     map.insert("idd_impl".into(), serde_json::json!(IDD_IMPL));

@@ -14,12 +14,11 @@ import 'chat_page.dart';
 
 class DraggableChatWindow extends StatelessWidget {
   const DraggableChatWindow(
-      {Key? key,
+      {super.key,
       this.position = Offset.zero,
       required this.width,
       required this.height,
-      required this.chatModel})
-      : super(key: key);
+      required this.chatModel});
 
   final Offset position;
   final double width;
@@ -122,7 +121,7 @@ class DraggableChatWindow extends StatelessWidget {
       decoration: BoxDecoration(
           border: Border(
               bottom: BorderSide(
-                  color: Theme.of(context).hintColor.withOpacity(0.4)))),
+                  color: Theme.of(context).hintColor.withValues(alpha: 0.4)))),
       height: 38,
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -157,8 +156,7 @@ class CustomAppBar extends StatelessWidget implements PreferredSizeWidget {
   final Widget appBar;
 
   const CustomAppBar(
-      {Key? key, required this.onPanUpdate, required this.appBar})
-      : super(key: key);
+      {super.key, required this.onPanUpdate, required this.appBar});
 
   @override
   Widget build(BuildContext context) {
@@ -204,7 +202,7 @@ class DraggableMobileActions extends StatelessWidget {
                   shadowColor: Colors.transparent,
                   child: Container(
                     decoration: BoxDecoration(
-                        color: MyTheme.accent.withOpacity(0.4),
+                        color: MyTheme.accent.withValues(alpha: 0.4),
                         borderRadius:
                             BorderRadius.all(Radius.circular(15 * scale))),
                     child: Row(
@@ -254,10 +252,10 @@ class DraggableKeyPosition {
   DraggableKeyPosition(this.key)
       : _pos = DraggablePositions.kInvalidDraggablePosition;
 
-  get pos => _pos;
+  Offset get pos => _pos;
 
-  _loadPosition(String k) {
-    final value = bind.getLocalFlutterOption(k: k);
+  Offset _loadPosition(String k) {
+    final value = bind.crateFlutterFfiGetLocalFlutterOption(k: k);
     if (value.isNotEmpty) {
       final parts = value.split(',');
       if (parts.length == 2) {
@@ -267,20 +265,20 @@ class DraggableKeyPosition {
     return DraggablePositions.kInvalidDraggablePosition;
   }
 
-  load() {
+  void load() {
     _pos = _loadPosition(key);
     _debouncerStore = Debouncer<int>(const Duration(milliseconds: 500),
         onChanged: (v) => _store(), initialValue: 0);
   }
 
-  update(Offset pos) {
+  void update(Offset pos) {
     _pos = pos;
     _triggerStore();
   }
 
   // Adjust position to keep it in the screen
   // Only used for desktop and web desktop
-  tryAdjust(double w, double h, double scale) {
+  void tryAdjust(double w, double h, double scale) {
     final size = MediaQuery.of(Get.context!).size;
     w = w * scale;
     h = h * scale;
@@ -304,13 +302,14 @@ class DraggableKeyPosition {
     }
   }
 
-  isInvalid() {
+  bool isInvalid() {
     return _pos == DraggablePositions.kInvalidDraggablePosition;
   }
 
-  _triggerStore() => _debouncerStore.value = _debouncerStore.value + 1;
-  _store() {
-    bind.setLocalFlutterOption(k: key, v: '${_pos.dx},${_pos.dy}');
+  int _triggerStore() => _debouncerStore.value = _debouncerStore.value + 1;
+  void _store() {
+    bind.crateFlutterFfiSetLocalFlutterOption(
+        k: key, v: '${_pos.dx},${_pos.dy}');
   }
 }
 
@@ -324,7 +323,7 @@ class DraggablePositions {
   final mobileActions = DraggableKeyPosition(kMobileActions);
   final iOSDraggable = DraggableKeyPosition(kIOSDraggable);
 
-  load() {
+  void load() {
     chatWindow.load();
     mobileActions.load();
     iOSDraggable.load();
@@ -335,15 +334,14 @@ DraggablePositions draggablePositions = DraggablePositions();
 
 class Draggable extends StatefulWidget {
   Draggable(
-      {Key? key,
+      {super.key,
       this.checkKeyboard = false,
       this.checkScreenSize = false,
       required this.position,
       required this.width,
       required this.height,
       this.chatModel,
-      required this.builder})
-      : super(key: key);
+      required this.builder});
 
   final bool checkKeyboard;
   final bool checkScreenSize;
@@ -367,7 +365,7 @@ class _DraggableState extends State<Draggable> {
     _chatModel = chatModel;
   }
 
-  get position => widget.position.pos;
+  dynamic get position => widget.position.pos;
 
   void onPanUpdate(DragUpdateDetails d) {
     final offset = d.delta;
@@ -396,12 +394,12 @@ class _DraggableState extends State<Draggable> {
     _chatModel?.setChatWindowPosition(position);
   }
 
-  checkScreenSize() {
+  void checkScreenSize() {
     // Ensure the draggable always stays within current screen bounds
     widget.position.tryAdjust(widget.width, widget.height, 1);
   }
 
-  checkKeyboard() {
+  void checkKeyboard() {
     final bottomHeight = MediaQuery.of(context).viewInsets.bottom;
     final currentVisible = bottomHeight != 0;
 
@@ -454,13 +452,12 @@ class _DraggableState extends State<Draggable> {
 
 class IOSDraggable extends StatefulWidget {
   const IOSDraggable(
-      {Key? key,
+      {super.key,
       this.chatModel,
       required this.position,
       required this.width,
       required this.height,
-      required this.builder})
-      : super(key: key);
+      required this.builder});
 
   final DraggableKeyPosition position;
   final ChatModel? chatModel;
@@ -489,7 +486,7 @@ class IOSDraggableState extends State<IOSDraggable> {
 
   DraggableKeyPosition get position => widget.position;
 
-  checkKeyboard() {
+  void checkKeyboard() {
     final bottomHeight = MediaQuery.of(context).viewInsets.bottom;
     final currentVisible = bottomHeight != 0;
 
@@ -607,8 +604,7 @@ class QualityMonitor extends StatelessWidget {
                           "Codec", qualityMonitorModel.data.codecFormat ?? '-'),
                       _row("Chroma", qualityMonitorModel.data.chroma ?? '-'),
                       if (qualityMonitorModel.webrtcTransport != null)
-                        _row("Transport",
-                            qualityMonitorModel.webrtcTransport!),
+                        _row("Transport", qualityMonitorModel.webrtcTransport!),
                     ],
                   ),
                 )

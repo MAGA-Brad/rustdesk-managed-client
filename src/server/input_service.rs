@@ -26,6 +26,9 @@ use std::{
     time::{self, Duration, Instant},
 };
 
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicI64;
+
 #[cfg(windows)]
 use winapi::um::winuser::WHEEL_DELTA;
 
@@ -110,6 +113,9 @@ struct Input {
 }
 
 const KEY_CHAR_START: u64 = 9999;
+
+#[cfg(target_os = "windows")]
+static REMOTE_KEY_INPUT_BLOCK_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
 
 // XKB keycode for Insert key (evdev KEY_INSERT code 110 + 8 for XKB offset)
 #[cfg(target_os = "linux")]
@@ -951,6 +957,29 @@ pub fn fix_key_down_timeout_at_exit() {
     log::info!("fix_key_down_timeout_at_exit");
 }
 
+#[cfg(target_os = "windows")]
+pub fn apply_local_input_priority_until(until_ms: u64) {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        return;
+    }
+
+    let now = get_time();
+    let until = i64::try_from(until_ms).unwrap_or(i64::MAX);
+    let previous_until = REMOTE_KEY_INPUT_BLOCK_UNTIL_MS.load(Ordering::SeqCst);
+    if until > previous_until {
+        REMOTE_KEY_INPUT_BLOCK_UNTIL_MS.store(until, Ordering::SeqCst);
+    }
+    if now >= previous_until && now < until {
+        fix_key_down_timeout(true);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn local_input_priority_blocks_remote_keys() -> bool {
+    option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+        && get_time() < REMOTE_KEY_INPUT_BLOCK_UNTIL_MS.load(Ordering::SeqCst)
+}
+
 #[inline]
 #[cfg(target_os = "linux")]
 pub fn clear_remapped_keycode() {
@@ -1538,6 +1567,12 @@ pub fn is_enter(evt: &KeyEvent) -> bool {
 }
 
 pub async fn lock_screen() {
+    // Managed builds never lock the computer for a remote session (Insert Lock, lock after session
+    // end, or an old client still asking); the user can still lock it from the Start menu.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        log::info!("Remote lock request ignored by managed policy");
+        return;
+    }
     cfg_if::cfg_if! {
     if #[cfg(target_os = "linux")] {
         // xdg_screensaver lock not work on Linux from our service somehow
@@ -2488,6 +2523,10 @@ pub fn handle_key_(evt: &KeyEvent) {
     if EXITING.load(Ordering::SeqCst) {
         return;
     }
+    #[cfg(target_os = "windows")]
+    if local_input_priority_blocks_remote_keys() {
+        return;
+    }
 
     #[cfg(target_os = "linux")]
     super::uinput::prepare_layout(evt);
@@ -2550,6 +2589,23 @@ pub fn handle_key_(evt: &KeyEvent) {
 #[tokio::main(flavor = "current_thread")]
 async fn lock_screen_2() {
     lock_screen().await;
+}
+
+// Plain-file trace for the Windows paths that run before any logger exists:
+// the SYSTEM --service-watchdog task and core_main.rs's managed silent
+// upgrade. Only the managed debug-log upload (hbbs_http/debug_log.rs) reads
+// and clears it, so non-managed builds of this crate don't write it (the AIO
+// launcher in libs/portable keeps its own capped writer).
+#[cfg(target_os = "windows")]
+pub(crate) fn diag_write(msg: &str) {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        return;
+    }
+    let line = format!("[{:?}] {}\n", std::time::SystemTime::now(), msg);
+    crate::common::append_capped_diag_line(
+        "C:\\ProgramData\\rustdesk-ctrlaltdel-diag.txt",
+        &line,
+    );
 }
 
 #[cfg(windows)]

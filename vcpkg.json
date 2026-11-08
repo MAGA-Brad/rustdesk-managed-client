@@ -23,7 +23,12 @@
     {
       "name": "libsodium",
       "host": false,
-      "platform": "windows & arm64"
+      "platform": "(windows & (x64 | arm64)) | android"
+    },
+    {
+      "name": "openssl",
+      "host": false,
+      "platform": "android"
     },
     {
       "name": "opus",
@@ -58,6 +63,26 @@
       "name": "mfx-dispatch",
       "host": false,
       "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
+    },
+    {
+      "name": "amd-amf",
+      "host": true,
+      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
+    },
+    {
+      "name": "amd-amf",
+      "host": false,
+      "platform": "(((windows & !arm) | linux) & static)"
+    },
+    {
+      "name": "ffnvcodec",
+      "host": true,
+      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
+    },
+    {
+      "name": "ffnvcodec",
+      "host": false,
+      "platform": "(((windows & !arm) | linux) & static)"
     },
     {
       "name": "ffmpeg",
@@ -87,7 +112,7 @@
   "vcpkg-configuration": {
     "default-registry": {
       "kind": "builtin",
-      "baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+      "baseline": "9eec002df1cd109f8f104cd966a763daf9751489"
     },
     "overlay-ports": [
       "./res/vcpkg"
@@ -103,7 +128,11 @@
     },
     {
       "name": "amd-amf",
-      "version": "1.4.35"
+      "version": "1.5.2"
+    },
+    {
+      "name": "libjpeg-turbo",
+      "version": "3.2.1"
     }
   ]
 }

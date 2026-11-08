@@ -80,12 +80,17 @@ lazy_static::lazy_static! {
 }
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Managed builds: when the GUI last reported its count. It re-sends every minute
+/// (flutter.rs send_live_session_count), so an older one belongs to a window that is gone.
+static CONTROLLING_COUNT_AT: Mutex<Option<Instant>> = Mutex::new(None);
+#[cfg(any(not(target_os = "windows"), feature = "flutter"))]
+const CONTROLLING_COUNT_TTL: Duration = Duration::from_secs(180);
 
 /// Initial wait after startup before the first update check (30 seconds).
 pub const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 
-/// One full day — default interval between update checks.
-pub const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+/// Default interval between update checks (30 minutes).
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 30);
 
 /// Minimum interval between consecutive update checks (10 minutes).
 pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
@@ -95,6 +100,16 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 30);
 
 pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
+    *CONTROLLING_COUNT_AT.lock().unwrap() = Some(Instant::now());
+}
+
+#[cfg(any(not(target_os = "windows"), feature = "flutter"))]
+fn controlling_count_stale() -> bool {
+    option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+        && CONTROLLING_COUNT_AT
+            .lock()
+            .unwrap()
+            .map_or(false, |at| at.elapsed() > CONTROLLING_COUNT_TTL)
 }
 
 #[allow(dead_code)]
@@ -107,6 +122,68 @@ pub fn manually_check_update() -> ResultType<()> {
     let sender = TX_MSG.lock().unwrap();
     sender.send(UpdateMsg::CheckUpdate)?;
     Ok(())
+}
+
+/// For the managed-client "Update Now" button. Runs check_update() directly
+/// on a fresh thread instead of going through the mpsc channel, so it isn't
+/// subject to the background loop's MIN_INTERVAL throttle - a user clicking
+/// this expects it to act immediately, not silently no-op if the scheduled
+/// check happened to run a few minutes ago.
+pub fn trigger_managed_update_now() {
+    std::thread::spawn(|| {
+        if let Err(e) = check_update(true) {
+            log::error!("Error applying managed update on demand: {}", e);
+        }
+    });
+}
+
+/// RDS reported a newer managed build for this device. Like the scheduled check, it neither
+/// downloads nor applies during a live session: it waits for the session to end instead of the
+/// next scheduled check. Throttled so a burst of reports cannot queue several checks.
+#[cfg(windows)]
+pub fn on_update_pushed() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.is_some_and(|at| at.elapsed() < Duration::from_secs(120)) {
+        return;
+    }
+    *last = Some(Instant::now());
+    log::info!("RDS reports a newer managed build; checking for it once no session is active");
+    std::thread::spawn(|| {
+        while !has_no_active_conns() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        if let Err(e) = check_update(true) {
+            log::error!("Error applying the managed update RDS reported: {}", e);
+        }
+    });
+}
+
+/// Managed update checks come from the schedule, "Update Now" and RDS's push; one at a time, so
+/// two cannot write the same download, and the installer is launched once rather than per caller.
+#[cfg(windows)]
+static MANAGED_UPDATE_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+#[cfg(windows)]
+const MANAGED_UPDATE_RELAUNCH_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// A verified managed update found during a session installs as soon as the session ends, not at
+/// the next scheduled check up to 30 minutes later.
+#[cfg(windows)]
+fn install_managed_update_when_idle() {
+    static WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WAITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    log::info!("Managed update downloaded; installing once no session is active");
+    std::thread::spawn(|| {
+        while !has_no_active_conns() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        WAITING.store(false, Ordering::SeqCst);
+        if let Err(e) = check_update(true) {
+            log::error!("Error applying the managed update after the session ended: {}", e);
+        }
+    });
 }
 
 #[allow(dead_code)]
@@ -125,7 +202,33 @@ pub fn has_no_active_conns() -> bool {
 
 #[cfg(any(not(target_os = "windows"), feature = "flutter"))]
 fn has_no_controlling_conns() -> bool {
-    CONTROLLING_SESSION_COUNT.load(Ordering::SeqCst) == 0
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
+    if controlling_count_unreported() {
+        return false;
+    }
+    CONTROLLING_SESSION_COUNT.load(Ordering::SeqCst) == 0 || controlling_count_stale()
+}
+
+/// Managed builds: a fresh --server has no count until the GUI's next refresh (every minute), so
+/// "nothing reported" is not "no session" at first. With nobody signed in nothing ever reports,
+/// and updates go ahead after the wait as before.
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+const CONTROLLING_COUNT_FIRST_WAIT: Duration = Duration::from_secs(120);
+
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+fn controlling_count_unreported() -> bool {
+    static FIRST_ASKED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let since_first_asked = FIRST_ASKED.get_or_init(Instant::now).elapsed();
+    awaiting_first_controlling_count(
+        option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some(),
+        CONTROLLING_COUNT_AT.lock().unwrap().is_some(),
+        since_first_asked,
+    )
+}
+
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+fn awaiting_first_controlling_count(managed: bool, reported: bool, since_first_asked: Duration) -> bool {
+    managed && !reported && since_first_asked < CONTROLLING_COUNT_FIRST_WAIT
 }
 
 #[cfg(not(any(not(target_os = "windows"), feature = "flutter")))]
@@ -159,7 +262,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
     }
 
     let mut last_check_time = Instant::now();
-    let mut check_interval = DUR_ONE_DAY;
+    let mut check_interval = CHECK_INTERVAL;
     loop {
         let recv_res = rx_msg.recv_timeout(check_interval);
         match &recv_res {
@@ -178,7 +281,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
                     check_interval = RETRY_INTERVAL;
                 } else {
                     last_check_time = Instant::now();
-                    check_interval = DUR_ONE_DAY;
+                    check_interval = CHECK_INTERVAL;
                 }
             }
             Ok(UpdateMsg::Exit) => break,
@@ -187,6 +290,40 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 fn check_update(manually: bool) -> ResultType<()> {
+    #[cfg(target_os = "windows")]
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        let mut launched_at = MANAGED_UPDATE_CHECK.lock().unwrap();
+        if launched_at.is_some_and(|at| at.elapsed() < MANAGED_UPDATE_RELAUNCH_AFTER) {
+            log::info!("Managed update installer already launched; not launching it again");
+            return Ok(());
+        }
+        if let Some(candidate) =
+            crate::hbbs_http::directory_enrollment::managed_update_check_and_download()?
+        {
+            log::info!(
+                "Verified managed update build {} version {}",
+                candidate.build_number,
+                candidate.version
+            );
+            // Force-applied, no user prompt: the background scheduled check
+            // (manually=false) and an explicit manual check both apply a
+            // verified update as soon as one is found, gated only on not
+            // interrupting a currently active remote session. Previously
+            // this only notified and waited for an explicit "Update Now"
+            // click - reverted per user feedback that a silent, forced
+            // update (the original managed-client behavior) is preferred
+            // over a prompt.
+            if has_no_active_conns() {
+                crate::hbbs_http::directory_enrollment::note_managed_update_launched();
+                update_new_version_managed(&candidate.version, &candidate.file_path);
+                *launched_at = Some(Instant::now());
+            } else {
+                install_managed_update_when_idle();
+            }
+        }
+        return Ok(());
+    }
+
     // On macOS, auto-update is handled by check_update_as_root() in the service process.
     // The shared check_update() path is only used for manual update checks from the GUI.
     #[cfg(target_os = "macos")]
@@ -381,6 +518,81 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
     }
 }
 
+/// Managed builds: build 48's launch of the installer managed_update_check_and_download verified
+/// against RDS's signed manifest. update_new_version's protected verified copy needs the manifest's
+/// SHA-256, which ManagedUpdateCandidate does not carry.
+#[cfg(target_os = "windows")]
+fn update_new_version_managed(version: &str, file_path: &PathBuf) {
+    log::debug!(
+        "New version is downloaded, update begin, update msi: false, version: {version}, file: {:?}",
+        file_path.to_str()
+    );
+    if let Some(p) = file_path.to_str() {
+        if let Some(session_id) = crate::platform::get_current_process_session_id() {
+            let custom_client_staging_dir = if crate::is_custom_client() {
+                let custom_client_staging_dir = crate::platform::get_custom_client_staging_dir();
+                if let Err(e) = crate::platform::handle_custom_client_staging_dir_before_update(
+                    &custom_client_staging_dir,
+                ) {
+                    log::error!(
+                        "Failed to handle custom client staging dir before update: {}",
+                        e
+                    );
+                    std::fs::remove_file(&file_path).ok();
+                    return;
+                }
+                Some(custom_client_staging_dir)
+            } else {
+                // Clean up any residual staging directory from previous custom client
+                let staging_dir = crate::platform::get_custom_client_staging_dir();
+                hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(
+                    &staging_dir
+                ));
+                None
+            };
+            let update_launched = match crate::platform::launch_privileged_process(
+                session_id,
+                &format!("{} --update", p),
+            ) {
+                Ok(h) => {
+                    if h.is_null() {
+                        log::error!("Failed to update to the new version: {}", version);
+                        false
+                    } else {
+                        log::debug!("New version \"{}\" is launched.", version);
+                        true
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to run the new version: {}", e);
+                    false
+                }
+            };
+            if !update_launched {
+                if let Some(dir) = custom_client_staging_dir {
+                    hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(&dir));
+                }
+                if crate::hbbs_http::directory_enrollment::note_managed_update_launch_blocked() {
+                    return;
+                }
+                std::fs::remove_file(&file_path).ok();
+            }
+        } else {
+            log::error!(
+                "Failed to get the current process session id, Error {}",
+                std::io::Error::last_os_error()
+            );
+            std::fs::remove_file(&file_path).ok();
+        }
+    } else {
+        // unreachable!()
+        log::error!(
+            "Failed to convert the file path to string: {}",
+            file_path.display()
+        );
+    }
+}
+
 /// Queries all active connections (remote, file-transfer, port-forward, camera, terminal)
 /// from every logged-in user's --server process via IPC.
 /// The root service cannot read connection state directly since connections
@@ -478,7 +690,7 @@ pub fn start_auto_update_macos() {
             log::info!("[root-update] Auto-update scheduler thread started.");
             std::thread::sleep(INITIAL_CHECK_DELAY);
             wait_for_failed_update_retry();
-            let mut interval = DUR_ONE_DAY;
+            let mut interval = CHECK_INTERVAL;
             loop {
                 log::info!("[root-update] Running scheduled update check...");
                 let no_active_conns = has_no_active_conns_ipc();
@@ -494,7 +706,7 @@ pub fn start_auto_update_macos() {
                                 // failure interval until the new daemon replaces us.
                                 interval = RETRY_INTERVAL;
                             } else {
-                                interval = DUR_ONE_DAY;
+                                interval = CHECK_INTERVAL;
                             }
                         }
                         Err(e) => {
@@ -633,4 +845,35 @@ pub fn check_update_as_root() -> ResultType<bool> {
         );
     }
     result.map(|_| true)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(not(target_os = "windows"), feature = "flutter"))]
+    #[test]
+    fn a_controlling_count_no_window_refreshes_stops_blocking_managed_updates() {
+        use super::*;
+        update_controlling_session_count(1);
+        assert!(!has_no_controlling_conns(), "a fresh count of 1 is a live session");
+        *CONTROLLING_COUNT_AT.lock().unwrap() =
+            Instant::now().checked_sub(CONTROLLING_COUNT_TTL + Duration::from_secs(1));
+        let managed = option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some();
+        assert_eq!(has_no_controlling_conns(), managed, "only managed builds expire the count");
+        update_controlling_session_count(0);
+        assert!(has_no_controlling_conns());
+    }
+
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
+    #[test]
+    fn a_fresh_managed_server_waits_for_the_first_controlling_count() {
+        use super::*;
+        let soon = Duration::from_secs(5);
+        assert!(awaiting_first_controlling_count(true, false, soon));
+        assert!(!awaiting_first_controlling_count(true, true, soon), "a reported count decides");
+        assert!(
+            !awaiting_first_controlling_count(true, false, CONTROLLING_COUNT_FIRST_WAIT),
+            "with no GUI reporting, updates go ahead after the wait"
+        );
+        assert!(!awaiting_first_controlling_count(false, false, soon), "managed builds only");
+    }
 }

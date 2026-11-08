@@ -24,7 +24,7 @@ else()
     vcpkg_from_git(
         OUT_SOURCE_PATH SOURCE_PATH
         URL "https://aomedia.googlesource.com/aom"
-        REF 03087864cf4bea6abb0d28f95cf7843511413d8f # 3.14.1
+        REF b141d9c45db236335351c8a4b2a14b3ade27c937 # 3.15.3
         PATCHES
             aom-uninitialized-pointer.diff
     )
@@ -34,6 +34,14 @@ set(aom_target_cpu "")
 if(VCPKG_TARGET_IS_UWP OR (VCPKG_TARGET_IS_WINDOWS AND VCPKG_TARGET_ARCHITECTURE MATCHES "^arm"))
     # UWP + aom's assembler files result in weirdness and build failures
     # Also, disable assembly on ARM and ARM64 Windows to fix compilation issues.
+    set(aom_target_cpu "-DAOM_TARGET_CPU=generic")
+elseif(VCPKG_TARGET_IS_ANDROID)
+    # aom's CMake ASM language detection looks for a bare "as" on PATH, which
+    # doesn't exist with the NDK's Clang toolchain (it's its own integrated
+    # assembler, invoked as clang) - configure fails with "CMAKE_ASM_COMPILER:
+    # as is not a full path and was not found in the PATH" before any actual
+    # compiling happens. Same class of problem as the Windows/ARM case above;
+    # same fix.
     set(aom_target_cpu "-DAOM_TARGET_CPU=generic")
 endif()
 
@@ -45,6 +53,7 @@ vcpkg_cmake_configure(
     SOURCE_PATH ${SOURCE_PATH}
     OPTIONS
         ${aom_target_cpu}
+        -DENABLE_APPS=OFF
         -DENABLE_DOCS=OFF
         -DENABLE_EXAMPLES=OFF
         -DENABLE_TESTDATA=OFF

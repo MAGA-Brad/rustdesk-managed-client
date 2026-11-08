@@ -134,6 +134,36 @@ pub fn global_init() -> bool {
 
 pub fn global_clean() {}
 
+// Backs server/input_service.rs's diag_write. Plain-file diagnostic writers
+// used to append forever with no cap - a since-removed rejected-IPC dump grew
+// past 80MB on a machine stuck in a rejection loop - so any plain-file
+// diagnostic writer should go through this instead of its own
+// OpenOptions::new().create(true).append(true). libs/portable keeps a copy of
+// the same check, being a separate crate.
+//
+// Cheap by design: checks size via a stat, not by reading the file, so
+// this is safe to call on every single write regardless of frequency.
+#[cfg(windows)]
+pub(crate) fn append_capped_diag_line(path: &str, line: &str) {
+    use std::io::Write;
+    const MAX_DIAG_BYTES: u64 = 5 * 1024 * 1024;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > MAX_DIAG_BYTES {
+            // Drop and start over rather than trying to tail-trim a plain
+            // append-only file in place - these are best-effort debug
+            // traces, not something anything else depends on reading
+            // continuously, so losing the oldest entries on rotation is
+            // fine and much simpler than a rolling truncate.
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 #[inline]
 pub fn set_server_running(b: bool) {
     *SERVER_RUNNING.write().unwrap() = b;
@@ -753,6 +783,11 @@ async fn test_nat_type_() -> ResultType<bool> {
         let server = if i == 0 { &*server1 } else { &*server2 };
         let mut socket =
             socket_client::connect_tcp_local(server, local_addr, CONNECT_TIMEOUT).await?;
+        // Managed builds talk to the rendezvous port only after its key exchange (the NAT port
+        // has none yet). Same connection, so the port the server observes is unchanged.
+        if i == 0 && rendezvous_encryption_required() {
+            secure_tcp_required(&mut socket, &crate::get_key(true).await).await?;
+        }
         if i == 0 {
             // reuse the local addr is required for nat test
             local_addr = Some(socket.local_addr());
@@ -970,7 +1005,7 @@ pub fn get_sysinfo() -> serde_json::Value {
     let cpu_name = cpus.first().map(|x| x.brand()).unwrap_or_default();
     let cpu_name = cpu_name.trim_end();
     let cpu_freq = cpus.first().map(|x| x.frequency()).unwrap_or_default();
-    let cpu_freq = (cpu_freq as f64 / 1024. * 100.).round() / 100.;
+    let cpu_freq = (cpu_freq as f64 / 1000. * 100.).round() / 100.;
     let cpu = if cpu_freq > 0. {
         format!("{}, {}GHz, ", cpu_name, cpu_freq)
     } else {
@@ -1013,6 +1048,20 @@ pub fn check_port<T: std::string::ToString>(host: T, port: i32) -> String {
 #[inline]
 pub fn increase_port<T: std::string::ToString>(host: T, offset: i32) -> String {
     hbb_common::socket_client::increase_port(host, offset)
+}
+
+/// A relay uuid arrives from the network and is sent on to the relay address, so bound what it
+/// may carry; it is an opaque pairing key, so do not pin today's UUID format.
+pub fn check_relay_uuid(uuid: &str) -> ResultType<()> {
+    if uuid.is_empty()
+        || uuid.len() > 128
+        || !uuid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid relay uuid (length {})", uuid.len());
+    }
+    Ok(())
 }
 
 pub const POSTFIX_SERVICE: &'static str = "_service";
@@ -1332,6 +1381,9 @@ pub fn get_ipv6_punch_enabled() -> bool {
 }
 
 pub fn get_webrtc_enabled() -> bool {
+    if let Some(on) = crate::client::managed_webrtc_enabled() {
+        return on;
+    }
     config::option2bool(
         keys::OPTION_ENABLE_WEBRTC,
         &get_local_option(keys::OPTION_ENABLE_WEBRTC),
@@ -1357,6 +1409,15 @@ pub fn get_local_option(key: &str) -> String {
 }
 
 pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
+    // Managed builds have no RustDesk Pro API server: with no explicit
+    // api-server the derived default (http://<rendezvous-host>:21114) is
+    // served by nothing, so every audit post timed out and was retried for
+    // minutes; the api-server they do carry (the directory's client host) has
+    // no /api/audit, so every post got a 404. Session start/end reach the
+    // directory via session-heartbeat.
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return "".to_owned();
+    }
     let url = get_api_server(api, custom);
     if url.is_empty() || is_public(&url) {
         return "".to_owned();
@@ -1746,6 +1807,8 @@ async fn post_request_(
     danger_accept_invalid_cert: Option<bool>,
     original_danger_accept_invalid_cert: Option<bool>,
 ) -> ResultType<reqwest::Response> {
+    let danger_accept_invalid_cert =
+        crate::hbbs_http::forbid_invalid_cert(url, danger_accept_invalid_cert);
     let mut req = create_http_client_async(
         tls_type.unwrap_or(TlsType::Rustls),
         danger_accept_invalid_cert.unwrap_or(false),
@@ -1846,6 +1909,8 @@ async fn get_http_response_async(
     danger_accept_invalid_cert: Option<bool>,
     original_danger_accept_invalid_cert: Option<bool>,
 ) -> ResultType<reqwest::Response> {
+    let danger_accept_invalid_cert =
+        crate::hbbs_http::forbid_invalid_cert(url, danger_accept_invalid_cert);
     let http_client = create_http_client_async(
         tls_type.unwrap_or(TlsType::Rustls),
         danger_accept_invalid_cert.unwrap_or(false),
@@ -2275,13 +2340,27 @@ pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
     false
 }
 
+/// Managed builds require the rendezvous server's signed key exchange on every TCP connection to
+/// it: a server that can't sign with our key gets nothing, and hbbs can then refuse unencrypted
+/// clients (RDS Config -> Remote Connections -> Rendezvous encryption: Required).
+pub fn rendezvous_encryption_required() -> bool {
+    option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some()
+}
+
 async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> ResultType<()> {
+    // managed_ws_fallback exchanges keys as part of connecting.
+    if conn.is_secured() {
+        return Ok(());
+    }
     // Skip additional encryption when using WebSocket connections (wss://)
     // as WebSocket Secure (wss://) already provides transport layer encryption.
     // This doesn't affect the end-to-end encryption between clients,
     // it only avoids redundant encryption between client and server.
     if use_ws() {
         return Ok(());
+    }
+    if rendezvous_encryption_required() {
+        return secure_tcp_required(conn, key).await;
     }
     key_exchange(conn, key, log_on_success).await.map(|_| ())
 }
@@ -2309,6 +2388,8 @@ async fn key_exchange(conn: &mut Stream, key: &str, log_on_success: bool) -> Res
                         // The signed X25519 high bit marks servers that sign their parameters.
                         // X25519 ignores that bit, so old clients use the key unchanged; keep
                         // the bytes as signed, since the transcript and KxParams carry them so.
+                        #[cfg_attr(not(any(windows, target_os = "android", feature = "rdc_gateway")), allow(unused_mut, unused_variables, unused_assignments))]
+                        let mut caps = 0u32;
                         if their_pk_b[31] & 0x80 != 0 || !ex.signed_params.is_empty() {
                             let params = sign::verify(&ex.signed_params, &rs_pk)
                                 .ok()
@@ -2323,6 +2404,7 @@ async fn key_exchange(conn: &mut Stream, key: &str, log_on_success: bool) -> Res
                             if params.pk[..] != their_pk_b[..] || params.version != ex.version {
                                 bail!("Key exchange version or public key does not match its signature");
                             }
+                            caps = params.managed_capabilities;
                         }
                         let (asymmetric_value, symmetric_value, key) =
                             create_symmetric_key_msg(their_pk_b);
@@ -2346,6 +2428,20 @@ async fn key_exchange(conn: &mut Stream, key: &str, log_on_success: bool) -> Res
                         )?;
                         if log_on_success {
                             log::info!("Connection secured");
+                        }
+                        // sec8: prove this device on the connection when hbbs asks for it.
+                        #[cfg(any(windows, target_os = "android", feature = "rdc_gateway"))]
+                        if caps & crate::managed_passport::KX_CAP_DEVICE_AUTH != 0
+                            && rendezvous_encryption_required()
+                        {
+                            crate::managed_passport::send_device_auth(
+                                conn,
+                                &rs_pk.0,
+                                &asymmetric_value,
+                                &their_pk_b,
+                                picked,
+                            )
+                            .await;
                         }
                         return Ok(true);
                     }
@@ -2372,6 +2468,9 @@ async fn secure_tcp_silent(conn: &mut Stream, key: &str) -> ResultType<()> {
 /// `secure_tcp` keeps tolerating such a server, which the paths from before the exchange depend
 /// on. WebSocket is treated as `secure_tcp` treats it, as a transport that is encrypted already.
 pub async fn secure_tcp_required(conn: &mut Stream, key: &str) -> ResultType<()> {
+    if conn.is_secured() {
+        return Ok(());
+    }
     if use_ws() {
         return Ok(());
     }
@@ -2492,7 +2591,151 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+fn load_managed_client_defaults() {
+    let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+
+    if let Some(server) = option_env!("RUSTDESK_MANAGED_SERVER")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        defaults
+            .entry("custom-rendezvous-server".to_owned())
+            .or_insert_with(|| server.to_owned());
+    }
+
+    if let Some(key) = option_env!("RUSTDESK_MANAGED_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        defaults
+            .entry("key".to_owned())
+            .or_insert_with(|| key.to_owned());
+    }
+}
+
+// Managed builds: settings the company decides, pinned so no UI, CLI, IPC or stale config
+// file can change them. A pinned key reads its pinned value and refuses writes.
+fn load_managed_client_pins() {
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_none() {
+        return;
+    }
+    let pin = |map: &std::sync::RwLock<HashMap<String, String>>, pins: &[(&str, &str)]| {
+        let mut map = map.write().unwrap();
+        for (k, v) in pins {
+            map.insert(k.to_string(), v.to_string());
+        }
+    };
+    pin(
+        &config::OVERWRITE_SETTINGS,
+        &[
+            (keys::OPTION_ENABLE_ABR, "Y"),
+            (keys::OPTION_ALLOW_REMOVE_WALLPAPER, "Y"),
+            (keys::OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER, "N"),
+            (keys::OPTION_ENABLE_DIRECTX_CAPTURE, "Y"),
+            (keys::OPTION_ENABLE_HWCODEC, "Y"),
+            // "" = accept sessions via both password and click; use both passwords.
+            (keys::OPTION_APPROVE_MODE, ""),
+            (keys::OPTION_VERIFICATION_METHOD, ""),
+            (keys::OPTION_ALLOW_AUTO_DISCONNECT, "N"),
+            (keys::OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS, "Y"),
+            (keys::OPTION_MANAGED_LOCAL_INPUT_PRIORITY_MS, ""),
+            (keys::OPTION_ALLOW_AUTO_RECORD_INCOMING, "N"),
+            (keys::OPTION_ENABLE_RECORD_SESSION, "N"),
+            (keys::OPTION_ENABLE_REMOTE_RESTART, "N"),
+            (keys::OPTION_ALLOW_AUTO_UPDATE, "N"),
+            ("audio-input", ""),
+            // WebSocket only as managed_ws_fallback uses it (key exchange inside), and its TLS
+            // never accepts an invalid certificate.
+            (keys::OPTION_ALLOW_WEBSOCKET, "N"),
+            (keys::OPTION_WEBSOCKET_PORT, ""),
+            (keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK, "N"),
+        ],
+    );
+    if let Some(ice) = option_env!("RUSTDESK_MANAGED_ICE_SERVERS")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        pin(&config::OVERWRITE_SETTINGS, &[(keys::OPTION_ICE_SERVERS, ice)]);
+    }
+    // What an installed fleet device runs with (install sets only the server and key; relay and
+    // API addresses derive from the server), pinned so a settings QR code or a config import can't
+    // swap the servers or the server key. No LAN direct-access listener.
+    pin(&config::OVERWRITE_SETTINGS, &[(keys::OPTION_DIRECT_SERVER, "N")]);
+    // The gateway has no settings UI, and its server addresses are left as they are.
+    #[cfg(not(feature = "rdc_gateway"))]
+    {
+        pin(
+            &config::OVERWRITE_SETTINGS,
+            &[(keys::OPTION_RELAY_SERVER, ""), (keys::OPTION_API_SERVER, "")],
+        );
+        if let Some(server) = option_env!("RUSTDESK_MANAGED_SERVER")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            pin(
+                &config::OVERWRITE_SETTINGS,
+                &[(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER, server)],
+            );
+        }
+        if let Some(key) = option_env!("RUSTDESK_MANAGED_KEY")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            pin(&config::OVERWRITE_SETTINGS, &[(keys::OPTION_KEY, key)]);
+        }
+    }
+    pin(
+        &config::OVERWRITE_LOCAL_SETTINGS,
+        &[
+            (keys::OPTION_ENABLE_TCP_PUNCH, "Y"),
+            (keys::OPTION_ENABLE_UDP_PUNCH, "N"),
+            (keys::OPTION_ENABLE_IPV6_PUNCH, "N"),
+            (keys::OPTION_RELAY_FALLBACK_DELAY, ""),
+            (keys::OPTION_ENABLE_CONFIRM_CLOSING_TABS, "Y"),
+            ("allow-multi-edge-toolbar-dock", "N"),
+            (keys::OPTION_ENABLE_OPEN_NEW_CONNECTIONS_IN_TABS, "Y"),
+            (keys::OPTION_ENABLE_PORT_FORWARD_MUX, "Y"),
+            (keys::OPTION_TEXTURE_RENDER, "Y"),
+            (keys::OPTION_ALLOW_D3D_RENDER, "N"),
+            (keys::OPTION_ENABLE_CHECK_UPDATE, "N"),
+            (keys::OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS, "Y"),
+            ("allow-monitor-switch-main-toolbar", "N"),
+            ("allow-monitor-switch-min-toolbar", "N"),
+            (keys::OPTION_THEME, ""),
+            // English only (Brad 2026-11-07): not the device language, and no choice.
+            (keys::OPTION_LANGUAGE, "en"),
+            (keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING, "N"),
+            (keys::OPTION_HIDE_RECORDING_BUTTON, "Y"),
+            (keys::OPTION_PRINTER_INCOMING_JOB_ACTION, "dismiss"),
+            (keys::OPTION_PRINTER_ALLOW_AUTO_PRINT, "N"),
+        ],
+    );
+    pin(
+        &config::OVERWRITE_DISPLAY_SETTINGS,
+        &[
+            (keys::OPTION_CODEC_PREFERENCE, "auto"),
+            (keys::OPTION_SHOW_REMOTE_CURSOR, "Y"),
+            (keys::OPTION_PRIVACY_MODE, "N"),
+            (keys::OPTION_I444, "N"),
+        ],
+    );
+    pin(
+        &config::BUILTIN_SETTINGS,
+        &[
+            (keys::OPTION_HIDE_REMOTE_PRINTER_SETTINGS, "Y"),
+            (keys::OPTION_DISABLE_UNLOCK_PIN, "Y"),
+            // Lets the Flutter UI hide pinned controls without an IPC round-trip.
+            ("managed-client", "Y"),
+        ],
+    );
+    // Managed Android and the RustDWeb gateway are controllers only: nothing can connect in.
+    #[cfg(any(target_os = "android", feature = "rdc_gateway"))]
+    pin(&config::HARD_SETTINGS, &[("conn-type", "outgoing")]);
+}
+
 pub fn load_custom_client() {
+    load_managed_client_defaults();
+    load_managed_client_pins();
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
@@ -2591,6 +2834,8 @@ pub fn get_dst_align_rgba() -> usize {
 }
 
 pub fn read_custom_client(config: &str) {
+    load_managed_client_defaults();
+    load_managed_client_pins();
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
         return;
@@ -2661,6 +2906,8 @@ pub fn read_custom_client(config: &str) {
                 .insert(k, v.to_owned());
         };
     }
+    // A signed custom.txt override must never beat a managed pin.
+    load_managed_client_pins();
 }
 
 #[inline]
@@ -2786,6 +3033,11 @@ async fn test_bind_ipv6() -> ResultType<SocketAddr> {
 }
 
 pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
+    // Managed builds never punch over IPv6, so they never ask third-party STUN servers for an
+    // address (our STUN server is the only one they talk to).
+    if option_env!("RUSTDESK_MANAGED_DIRECTORY_BASE").is_some() {
+        return None;
+    }
     {
         // One look and one claim of the minute, under one lock: two connections arriving
         // together would otherwise both find it over and both probe.
@@ -3088,6 +3340,22 @@ mod tests {
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn relay_uuid_rejects_control_bytes_but_not_other_id_formats() {
+        for uuid in [
+            "e4c181d0-41c7-4ae6-8ef0-36581b6b2b12",
+            "E4C181D0-41C7-4AE6-8EF0-36581B6B2B12",
+            "01890a5d-ac96-774b-bcce-b302099a8057",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ] {
+            assert!(check_relay_uuid(uuid).is_ok(), "rejected {uuid:?}");
+        }
+        let too_long = "a".repeat(129);
+        for uuid in ["", "\r\nPING\r\n", "a b", "a\0", too_long.as_str()] {
+            assert!(check_relay_uuid(uuid).is_err(), "accepted {uuid:?}");
+        }
+    }
 
     #[test]
     fn parses_stable_rustdesk_release_url() {
@@ -3398,10 +3666,14 @@ mod tests {
         let mut conn = connect(&host).await;
         assert!(secure_tcp_required(&mut conn, &key).await.is_err());
         assert!(!conn.is_secured());
-        // The legacy call tolerates the same server, and the stream stays in the clear.
+        // The legacy call tolerates the same server, and the stream stays in the clear; managed
+        // builds make it strict as well (rendezvous_encryption_required).
         let host = rendezvous_stub(serve).await;
         let mut conn = connect(&host).await;
-        secure_tcp(&mut conn, &key).await.unwrap();
+        assert_eq!(
+            secure_tcp(&mut conn, &key).await.is_ok(),
+            !rendezvous_encryption_required()
+        );
         assert!(!conn.is_secured());
     }
 

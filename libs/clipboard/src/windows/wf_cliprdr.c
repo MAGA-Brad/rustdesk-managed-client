@@ -3666,7 +3666,7 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 	HRESULT hRet = S_OK;
 	FORMATETC vFormatEtc;
 	LPDATAOBJECT pDataObj = NULL;
-	STGMEDIUM vStgMedium;
+	STGMEDIUM vStgMedium = { 0 };
 	BOOL bIsStreamFile = TRUE;
 	static LPSTREAM pStreamStc = NULL;
 	static UINT32 uStreamIdStc = 0;

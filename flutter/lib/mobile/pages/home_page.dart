@@ -4,7 +4,6 @@ import 'package:flutter_hbb/mobile/pages/settings_page.dart';
 import 'package:flutter_hbb/web/settings_page.dart';
 import 'package:get/get.dart';
 import '../../common.dart';
-import '../../common/widgets/chat_page.dart';
 import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
 import 'connection_page.dart';
@@ -28,7 +27,7 @@ class HomePageState extends State<HomePage> {
   var _selectedIndex = 0;
   int get selectedIndex => _selectedIndex;
   final List<PageShape> _pages = [];
-  int _chatPageTabIndex = -1;
+  final int _chatPageTabIndex = -1;
   bool get isChatPageCurrentTab => isAndroid
       ? _selectedIndex == _chatPageTabIndex
       : false; // change this when ios have chat page
@@ -47,14 +46,13 @@ class HomePageState extends State<HomePage> {
 
   void initPages() {
     _pages.clear();
-    if (!bind.isIncomingOnly()) {
+    if (!bind.crateFlutterFfiIsIncomingOnly()) {
       _pages.add(ConnectionPage(
         appBarActions: [],
       ));
     }
-    if (isAndroid && !bind.isOutgoingOnly()) {
-      _chatPageTabIndex = _pages.length;
-      _pages.addAll([ChatPage(type: ChatPageType.mobileMain), ServerPage()]);
+    if (isAndroid && !bind.crateFlutterFfiIsOutgoingOnly()) {
+      _pages.addAll([ServerPage()]);
     }
     _pages.add(SettingsPage());
   }
@@ -150,7 +148,9 @@ class HomePageState extends State<HomePage> {
         ],
       );
     }
-    return Text(bind.mainGetAppNameSync());
+    // Managed Android builds are RDC; the Rust app name (config paths, IPC) stays RustDesk.
+    if (isAndroid && isManagedClientBuild()) return const Text('RDC');
+    return Text(bind.crateFlutterFfiMainGetAppNameSync());
   }
 }
 
@@ -166,14 +166,14 @@ class WebHomePage extends StatelessWidget {
       // backgroundColor: MyTheme.grayBg,
       appBar: AppBar(
         centerTitle: true,
-        title: Text("${bind.mainGetAppNameSync()} (Preview)"),
+        title: Text("${bind.crateFlutterFfiMainGetAppNameSync()} (Preview)"),
         actions: connectionPage.appBarActions,
       ),
       body: connectionPage,
     );
   }
 
-  handleUnilink(BuildContext context) {
+  void handleUnilink(BuildContext context) {
     if (webInitialLink.isEmpty) {
       return;
     }
@@ -245,11 +245,11 @@ class WebHomePage extends StatelessWidget {
       }
     }
     if (id != null) {
-      connect(context, id, 
-        isFileTransfer: isFileTransfer, 
-        isViewCamera: isViewCamera, 
-        isTerminal: isTerminal,
-        password: password);
+      connect(context, id,
+          isFileTransfer: isFileTransfer,
+          isViewCamera: isViewCamera,
+          isTerminal: isTerminal,
+          password: password);
     }
   }
 }

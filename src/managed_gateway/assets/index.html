@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>RustDWeb</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<main id="signin" class="center" hidden>
+  <form id="signinForm" class="card signin-card" autocomplete="on">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">RD</span>
+      <div>
+        <h1>RustDWeb</h1>
+        <p class="muted">Remote access to your organization's computers</p>
+      </div>
+    </div>
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <label for="totp">Authenticator code</label>
+    <input id="totp" name="totp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="6 digits" required>
+    <button id="signinButton" type="submit" class="primary">Sign in</button>
+    <p id="signinError" class="error" role="alert"></p>
+  </form>
+</main>
+
+<div id="home" class="app" hidden>
+  <header class="bar">
+    <div class="brand small">
+      <span class="mark" aria-hidden="true">RD</span>
+      <strong>RustDWeb</strong>
+    </div>
+    <input id="search" type="search" placeholder="Search computers" aria-label="Search computers" autocomplete="off">
+    <div class="who">
+      <span id="whoName"></span>
+      <button id="signoutButton" type="button" class="ghost">Sign out</button>
+    </div>
+  </header>
+  <section class="content">
+    <div class="list-head">
+      <h2>Computers</h2>
+      <span id="deviceCount" class="muted"></span>
+    </div>
+    <ul id="devices" class="devices"></ul>
+    <p id="devicesEmpty" class="empty" hidden></p>
+  </section>
+</div>
+
+<dialog id="connectDialog">
+  <form id="connectForm" method="dialog" class="dialog">
+    <h2 id="connectTitle">Connect</h2>
+    <p class="muted">Enter the computer's own RDC password and authenticator code for full access, or leave them empty to ask the person at the computer to accept.</p>
+    <label for="pcPassword">Computer password <span class="muted">(optional)</span></label>
+    <input id="pcPassword" type="password" autocomplete="off">
+    <label for="pcTotp">Computer authenticator code <span class="muted">(optional)</span></label>
+    <input id="pcTotp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" placeholder="6 digits">
+    <div class="actions">
+      <button id="connectCancel" type="button" class="ghost">Cancel</button>
+      <button id="connectGo" type="submit" class="primary">Connect</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="session" class="app" hidden>
+  <header class="bar session-bar">
+    <button id="disconnectButton" type="button" class="danger">Disconnect</button>
+    <div class="session-title">
+      <strong id="sessionName"></strong>
+      <span id="sessionStatus" class="muted"></span>
+    </div>
+    <div class="tools">
+      <label class="toggle" title="Use the touch screen like a laptop trackpad: drag to move the pointer, tap to click, two-finger tap to right-click, two fingers to scroll"><input id="trackpadToggle" type="checkbox"> Trackpad mode</label>
+      <select id="displaySelect" aria-label="Screen" hidden></select>
+      <button id="keyboardButton" type="button" class="ghost" title="Show or hide the on-screen keyboard" aria-pressed="false" hidden>Keyboard</button>
+      <button id="cadButton" type="button" class="ghost" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
+      <button id="fitButton" type="button" class="ghost" aria-pressed="true">Fit to window</button>
+      <button id="fullscreenButton" type="button" class="ghost">Full screen</button>
+    </div>
+  </header>
+  <div id="stage" class="stage fit">
+    <canvas id="screen" tabindex="0" aria-label="Remote screen"></canvas>
+    <div id="rcursor" class="rcursor" hidden></div>
+    <textarea id="kbd" class="kbd" aria-label="Type on the remote computer" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="enter"></textarea>
+    <div id="overlay" class="overlay">
+      <div class="card overlay-card">
+        <h2 id="overlayTitle"></h2>
+        <p id="overlayText" class="muted"></p>
+        <form id="overlayForm" hidden>
+          <div id="overlayPasswordRow">
+            <label for="overlayPassword">Computer password</label>
+            <input id="overlayPassword" type="password" autocomplete="off">
+          </div>
+          <div id="overlayCodeRow">
+            <label for="overlayCode">Computer authenticator code</label>
+            <input id="overlayCode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" placeholder="6 digits">
+          </div>
+          <button id="overlaySubmit" type="submit" class="primary">Continue</button>
+        </form>
+        <button id="overlayBack" type="button" class="ghost" hidden>Back to computers</button>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
